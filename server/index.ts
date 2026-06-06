@@ -307,18 +307,38 @@ server.registerTool(
       "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
     inputSchema: {
       content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      source: z.string().optional().describe("Optional source override: 'gmail', 'slack', 'voice-memo', 'notion-meetings', 'cli', 'claude-iphone', etc. Defaults to 'mcp' if omitted."),
+      type: z.string().optional().describe("Optional type: 'email', 'meeting', 'note', 'decision', 'task', etc."),
+      subject: z.string().optional().describe("Optional subject/title (email subject, meeting title, doc title, etc.)."),
+      gmail_thread_id: z.string().optional().describe("Optional Gmail thread id for emails."),
+      sender: z.string().optional().describe("Optional sender name/email for emails."),
+      date: z.string().optional().describe("Optional original date (ISO 8601)."),
+      participants: z.array(z.string()).optional().describe("Optional list of participants."),
     },
   },
-  async ({ content }) => {
+  async ({ content, source, type, subject, gmail_thread_id, sender, date, participants }) => {
     try {
-      const [embedding, metadata] = await Promise.all([
+      const [embedding, autoMetadata] = await Promise.all([
         getEmbedding(content),
         extractMetadata(content),
       ]);
 
+      // Caller-provided fields take precedence over auto-extracted ones.
+      const callerOverrides: Record<string, unknown> = {};
+      if (source) callerOverrides.source = source;
+      if (type) callerOverrides.type = type;
+      if (subject) callerOverrides.subject = subject;
+      if (gmail_thread_id) callerOverrides.gmail_thread_id = gmail_thread_id;
+      if (sender) callerOverrides.sender = sender;
+      if (date) callerOverrides.date = date;
+      if (participants && participants.length) callerOverrides.participants = participants;
+
+      const finalMetadata = { ...autoMetadata, ...callerOverrides };
+      if (!finalMetadata.source) finalMetadata.source = "mcp";
+
       const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
         p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
+        p_payload: { metadata: finalMetadata },
       });
 
       if (upsertError) {
@@ -341,7 +361,7 @@ server.registerTool(
         };
       }
 
-      const meta = metadata as Record<string, unknown>;
+      const meta = finalMetadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
       if (Array.isArray(meta.topics) && meta.topics.length)
         confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
