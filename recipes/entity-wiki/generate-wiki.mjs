@@ -236,7 +236,22 @@ async function fetchLinkedThoughts(sb, entityId, limit = 200) {
       mention_role: r.mention_role,
       link_confidence: r.confidence,
       link_source: r.source,
-    }));
+      metadata: r.thoughts.metadata ?? {},
+    }))
+    .filter((t) => !shouldExcludeFromEntityWiki(t));
+}
+
+function shouldExcludeFromEntityWiki(thought) {
+  const metadata = thought.metadata || {};
+  const source = String(metadata.source || metadata.source_type || "").toLowerCase();
+  const type = String(metadata.type || thought.type || "").toLowerCase();
+  const content = String(thought.content || "");
+  return (
+    metadata.exclude_from_entity_wiki === true ||
+    source === "system_health" ||
+    type === "health_alert" ||
+    content.includes("OPEN BRAIN HEALTH ALERT")
+  );
 }
 
 async function fetchTypedEdges(sb, entityId, perDirection = 200) {
@@ -437,7 +452,7 @@ function buildSynthesisInput(entity, linked, semantic, nameMap, maxLinked, maxSe
 
   return {
     entity: `${entity.canonical_name} (${entity.entity_type})`,
-    entity_metadata: entity.metadata || {},
+    entity_metadata: sanitizeEntityMetadata(entity.metadata || {}),
     typed_edges_by_relation: typedByRelation,
     linked_thoughts: linkedSnippets,
     semantic_matches: semanticSnippets,
@@ -448,6 +463,14 @@ function buildSynthesisInput(entity, linked, semantic, nameMap, maxLinked, maxSe
   };
 }
 
+function sanitizeEntityMetadata(metadata) {
+  const clean = { ...metadata };
+  // Prior generated wiki pages are cached outputs, not source evidence. Feeding
+  // them back into the LLM causes citation drift and recursive summarization.
+  delete clean.wiki_page;
+  return clean;
+}
+
 const SYSTEM_PROMPT = `You write wiki pages for a personal knowledge graph.
 The subject is a single entity (person, project, topic, organization, tool, or place).
 Output well-structured markdown with these sections in order:
@@ -456,6 +479,8 @@ Output well-structured markdown with these sections in order:
 ## Relationships, ## Open Questions (3-5 genuine gaps).
 
 Ground every claim in the input snippets. Cite thought ids in square brackets like [#id].
+Copy citation IDs exactly from STRUCTURE.provenance.linked_ids or STRUCTURE.provenance.semantic_ids.
+Never invent, shorten, reformat, or correct UUIDs.
 Skip sections with no material rather than filling with generic text.
 
 For the Relationships section specifically:
@@ -575,7 +600,51 @@ function slugify(name, entityType) {
   return `${entityType}-${base}`;
 }
 
+function computeConfidence(sourceCounts) {
+  // Heuristic: confidence rises with # of unique thoughts referencing the entity.
+  // Use total = linked + semantic. Below 3 = "low" — the wiki may overstate its case.
+  const total = (sourceCounts.linked ?? 0) + (sourceCounts.semantic ?? 0);
+  if (total >= 8) return "high";
+  if (total >= 3) return "medium";
+  return "low";
+}
+
+const CITATION_ID_RE =
+  /\[#([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]/gi;
+
+function auditWikiCitations(wiki, provenance) {
+  const allowed = new Set(provenance.map((id) => String(id).toLowerCase()));
+  const cited = new Set();
+  for (const match of String(wiki || "").matchAll(CITATION_ID_RE)) {
+    cited.add(match[1].toLowerCase());
+  }
+  const unknown = Array.from(cited).filter((id) => !allowed.has(id));
+  return {
+    total: cited.size,
+    unknown,
+    allowed: allowed.size,
+  };
+}
+
+function assertValidWikiCitations(wiki, provenance, entity) {
+  const audit = auditWikiCitations(wiki, provenance);
+  if (provenance.length > 0 && audit.total === 0) {
+    throw new Error(
+      `[wiki] citation validation failed for #${entity.id} ${entity.canonical_name}: ` +
+        `generated page contains no thought citations despite ${provenance.length} source thought(s).`,
+    );
+  }
+  if (audit.unknown.length > 0) {
+    throw new Error(
+      `[wiki] citation validation failed for #${entity.id} ${entity.canonical_name}: ` +
+        `unknown citation id(s): ${audit.unknown.slice(0, 5).join(", ")}`,
+    );
+  }
+  return audit;
+}
+
 function buildFrontmatter(entity, sourceCounts, provenance) {
+  const confidence = computeConfidence(sourceCounts);
   const lines = [
     "---",
     `title: ${JSON.stringify(`${entity.canonical_name} Wiki`)}`,
@@ -586,8 +655,9 @@ function buildFrontmatter(entity, sourceCounts, provenance) {
     `generated_at: ${new Date().toISOString()}`,
     `linked_thought_count: ${sourceCounts.linked}`,
     `semantic_match_count: ${sourceCounts.semantic}`,
+    `confidence: ${confidence}`,
     `derived_from_ids: ${JSON.stringify(provenance)}`,
-    "tags: [wiki, generated]",
+    `tags: [wiki, generated, confidence-${confidence}]`,
     "---",
     "",
   ];
@@ -641,7 +711,16 @@ function writeFile(wiki, entity, sourceCounts, provenance, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
   const baseSlug = slugify(entity.canonical_name, entity.entity_type);
   const filepath = resolveOutputPath(outDir, baseSlug, entity);
-  fs.writeFileSync(filepath, buildFrontmatter(entity, sourceCounts, provenance) + wiki + "\n", "utf8");
+  const confidence = computeConfidence(sourceCounts);
+  const banner =
+    confidence === "low"
+      ? `> ⚠️ **Low-confidence wiki** — synthesized from only ${sourceCounts.linked} linked thought(s). Treat assertions with skepticism; verify against source thoughts before acting.\n\n`
+      : "";
+  fs.writeFileSync(
+    filepath,
+    buildFrontmatter(entity, sourceCounts, provenance) + banner + wiki + "\n",
+    "utf8",
+  );
   return filepath;
 }
 
@@ -816,6 +895,11 @@ async function generateForEntity(sb, env, entity, args) {
   const wiki = await synthesize(env, model, payload);
   const sourceCounts = { linked: linked.length, semantic: semantic.length };
   const provenance = [...payload.provenance.linked_ids, ...payload.provenance.semantic_ids];
+  const citationAudit = assertValidWikiCitations(wiki, provenance, entity);
+  console.log(
+    `[wiki] citation audit #${entity.id}: ${citationAudit.total} cited / ` +
+      `${citationAudit.allowed} allowed`,
+  );
 
   if (args.dryRun) {
     console.log("───── WIKI ─────");

@@ -52,6 +52,8 @@ const CWD = process.cwd();
 const DEFAULT_OUT_DIR = join(CWD, "output", "wiki");
 
 const PAGE_SIZE = 1000;
+const MAX_YEAR_ENTRIES = 180;
+const MAX_ENTRY_CHARS = 800;
 
 // ── Synthesizer catalogue ─────────────────────────────────────────────────
 
@@ -69,11 +71,17 @@ SYNTHESIZERS.autobiography = {
       sourceType: sourceTypeFilter,
       pageLimit: args.pageLimit ?? 50,
     });
-    log(`  ${all.length} thoughts fetched${sourceTypeFilter ? ` (source_type=${sourceTypeFilter})` : ""}`);
+    const eligible = all.filter((t) => !shouldExcludeFromTopicWiki(t));
+    const excluded = all.length - eligible.length;
+    log(
+      `  ${eligible.length} thoughts fetched` +
+        `${sourceTypeFilter ? ` (source_type=${sourceTypeFilter})` : ""}` +
+        `${excluded ? `; excluded ${excluded} operational/noise thought(s)` : ""}`,
+    );
 
     // Bucket by life-date year
     const byYear = new Map();
-    for (const t of all) {
+    for (const t of eligible) {
       const lifeAt = pickLifeDate(t) ?? t.created_at;
       if (!lifeAt || lifeAt.length < 4) continue;
       const year = lifeAt.slice(0, 4);
@@ -94,20 +102,21 @@ SYNTHESIZERS.autobiography = {
     for (const year of years) {
       const entries = byYear.get(year);
       entries.sort((a, b) => a.lifeAt.localeCompare(b.lifeAt));
-      const sample = entries
-        .slice(0, 300) // cap per-year prompt size
-        .map((e) => `- [${e.lifeAt.slice(0, 10)}] ${String(e.content || "").replace(/\s+/g, " ")}`)
-        .join("\n");
+      const sampleEntries = selectRepresentativeEntries(entries, MAX_YEAR_ENTRIES);
+      const sample = sampleEntries.map(formatEntryForPrompt).join("\n");
 
       const prompt = autobiographyYearPrompt(subjectName, year, sample, entries.length);
 
       if (args.dryRun) {
-        log(`  [dry] year=${year} — would synthesize from ${entries.length} entries (prompt ${sample.length} chars)`);
+        log(
+          `  [dry] year=${year} — would synthesize from ${entries.length} entries ` +
+            `(${sampleEntries.length} sampled, prompt ${sample.length} chars)`,
+        );
         sections.push(`## ${year}\n\n_(dry-run placeholder — run without --dry-run to generate)_\n`);
         continue;
       }
 
-      log(`  Year ${year} (${entries.length} entries) -> calling LLM...`);
+      log(`  Year ${year} (${entries.length} entries, ${sampleEntries.length} sampled) -> calling LLM...`);
       const text = await callLLM({
         baseUrl: env.LLM_BASE_URL,
         apiKey: env.LLM_API_KEY,
@@ -127,7 +136,8 @@ SYNTHESIZERS.autobiography = {
       "type: wiki-autobiography",
       `subject: ${yamlString(subjectName)}`,
       `generated_at: ${new Date().toISOString()}`,
-      `source_count: ${all.length}`,
+      `source_count: ${eligible.length}`,
+      excluded ? `excluded_source_count: ${excluded}` : null,
       `year_count: ${years.length}`,
       scopeYear ? `scope_year: ${scopeYear}` : null,
       args.dryRun ? "dry_run: true" : null,
@@ -137,7 +147,7 @@ SYNTHESIZERS.autobiography = {
       "",
       scopeYear
         ? `> Scope: year=${scopeYear}. Generated from ${byYear.get(String(scopeYear))?.length ?? 0} entries.`
-        : `> Generated from ${all.length} entries across ${years.length} years.`,
+        : `> Generated from ${eligible.length} entries across ${years.length} years.`,
       "",
       ...sections,
     ]
@@ -360,6 +370,40 @@ function pickLifeDate(t) {
     }
   }
   return null;
+}
+
+function shouldExcludeFromTopicWiki(thought) {
+  const metadata = thought.metadata || {};
+  const source = String(thought.source_type || metadata.source_type || metadata.source || "").toLowerCase();
+  const type = String(metadata.type || thought.type || "").toLowerCase();
+  const content = String(thought.content || "");
+  return (
+    metadata.exclude_from_topic_wiki === true ||
+    metadata.exclude_from_entity_wiki === true ||
+    source === "system_health" ||
+    type === "health_alert" ||
+    content.includes("OPEN BRAIN HEALTH ALERT")
+  );
+}
+
+function selectRepresentativeEntries(entries, maxEntries) {
+  if (entries.length <= maxEntries) return entries;
+  const selected = [];
+  const last = entries.length - 1;
+  for (let i = 0; i < maxEntries; i++) {
+    selected.push(entries[Math.round((i * last) / (maxEntries - 1))]);
+  }
+  return selected;
+}
+
+function formatEntryForPrompt(entry) {
+  const content = truncateForPrompt(String(entry.content || "").replace(/\s+/g, " "), MAX_ENTRY_CHARS);
+  return `- [${entry.lifeAt.slice(0, 10)}] ${content}`;
+}
+
+function truncateForPrompt(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
 function regenerateIndex(outDir) {

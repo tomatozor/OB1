@@ -214,9 +214,14 @@ async function triggerEntityExtraction(args, env) {
   if (args.dryRun) url.searchParams.set("dry_run", "true");
 
   console.log(`[wiki-compiler] triggering entity extraction worker: ${url.toString()}`);
+  const headers = { "x-brain-key": accessKey };
+  if (env.OPEN_BRAIN_SERVICE_KEY) {
+    headers.apikey = env.OPEN_BRAIN_SERVICE_KEY;
+    headers.Authorization = `Bearer ${env.OPEN_BRAIN_SERVICE_KEY}`;
+  }
   const response = await fetch(url, {
     method: "POST",
-    headers: { "x-brain-key": accessKey },
+    headers,
   });
   const bodyText = await response.text();
   let payload = null;
