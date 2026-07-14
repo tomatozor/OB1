@@ -66,8 +66,12 @@ server never substitutes core `thoughts` behavior or silently skips the write.
 - `memory_recall(workspace_id, query?, project_id?, channel_id?, task_type?, entities?, limits?{max_results, recency_days, max_tokens}, restrict_scope?)`
   recalls only memories visible inside the requested workspace and context,
   then writes `agent_memory_recall_traces`, `agent_memory_recall_items`, and
-  audit events. A non-empty `query` uses the live three-argument
-  `match_thoughts` RPC and ranks semantic candidates first. Without `query`,
+  audit events. A non-empty `query` embeds the query and calls
+  `agent_memory_match(p_workspace_id, p_query_embedding, p_limit, p_threshold)`;
+  the returned `memory_id` values are joined back to `agent_memories` under the
+  same explicit workspace filter and ranked by similarity first. The server
+  fails closed when this RPC is missing or outdated and never falls back to
+  `match_thoughts`/`thought_id`. Without `query`,
   ordering is deterministic: `confidence DESC`, newest of
   `last_confirmed_at/created_at DESC`, then `id ASC`. `restrict_scope` is an
   exact visibility filter and therefore only narrows the otherwise eligible
@@ -81,7 +85,12 @@ server never substitutes core `thoughts` behavior or silently skips the write.
   `requires_user_confirmation=true`, and `review_status=pending`. The server
   hashes the canonical normalized payload with SHA-256 and delegates memory,
   source-reference, artifact, idempotency, and audit writes to the single
-  `agent_memory_writeback_tx` transaction. Idempotency is scoped by
+  `agent_memory_writeback_tx` transaction. Before that transaction, it embeds
+  `memory.content` and passes the validated 1536-number vector as
+  `p_embedding`. Embedding failure aborts the operation before any memory
+  write; the server never creates a silently non-recallable memory. There is no
+  legacy retry without `p_embedding`: an old RPC signature fails with
+  `Agent Memory schema outdated — re-apply schemas/agent-memory`. Idempotency is scoped by
   `(workspace_id, idempotency_key)`; identical canonical content returns the
   existing row, while changed content is rejected. A missing transactional RPC
   fails closed with instructions to apply `schemas/agent-memory`.
@@ -93,15 +102,26 @@ server never substitutes core `thoughts` behavior or silently skips the write.
   oldest first with `has_more` pagination.
 - `memory_review(memory_id, workspace_id, action, actor_id, notes?, related_memory_id?, content?, summary?, visibility?)`
   delegates the transition, memory update, review action, optional relation,
-  and audit to the single `agent_memory_review_tx` transaction. Actions are
-  `approve` (an alias
-  persisted as REST `confirm`), `confirm`, `edit`, `evidence_only`,
-  `restrict_scope`, `mark_stale`, `merge`, `reject`, `dispute`, and
-  `supersede`. Lifecycle actions require notes; merge/supersede require a
-  related memory in the same workspace; edit requires content or summary; and
+  and audit to the single `agent_memory_review_tx` transaction with
+  `p_actor_kind='agent'`. MCP may only perform `reject`, `dispute`,
+  `mark_stale`, `evidence_only`, `restrict_scope`, and `edit`. The promoting
+  actions `approve`, `confirm`, `merge`, and `supersede` are rejected before
+  any RPC call and must use the authenticated Agent Memory REST reviewer
+  interface. Edit requires content or summary and is explicitly returned as a
+  demotion to pending/evidence-only. Lifecycle actions require notes.
   `restrict_scope` follows the monotone
-  `workspace -> project -> channel -> personal` order. No action deletes a
-  database row.
+  `workspace -> project -> channel -> personal` order: requesting the current
+  visibility again is allowed, narrowing is allowed, and widening is refused.
+  No action deletes a database row.
+
+### Retrieval and API bounds
+
+- Agent Memory recall scans at most 1,000 workspace-filtered memory rows before
+  applying context, freshness, policy, token, and result limits.
+- Server-side candidate collection is capped at 2,500 rows; the installed SQL
+  retrieval functions cap their candidate pools at 5,000 rows.
+- The Agent Memory REST interface returns at most 100 records per call; callers
+  must paginate for larger result sets.
 
 OpenRouter embedding and metadata calls use a 15-second timeout. Embeddings
 retry twice, with bounded jitter, only for timeouts, HTTP 429, and HTTP 5xx;

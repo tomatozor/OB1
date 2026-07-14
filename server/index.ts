@@ -21,6 +21,10 @@ const AGENT_MEMORY_SCHEMA_ERROR =
   "Agent Memory schema not installed — see schemas/agent-memory";
 const AGENT_MEMORY_TRANSACTIONAL_RPC_ERROR =
   "Agent Memory transactional RPCs not installed — apply schemas/agent-memory";
+const AGENT_MEMORY_WRITEBACK_SCHEMA_OUTDATED_ERROR =
+  "Agent Memory schema outdated — re-apply schemas/agent-memory";
+const AGENT_MEMORY_MATCH_RPC_ERROR =
+  "Agent Memory semantic recall RPC not installed/outdated — re-apply schemas/agent-memory";
 const DELETE_RPC_ERROR =
   "soft_delete_thought RPC not installed — apply schemas/hybrid-recall before using delete_thought";
 const EMBEDDING_DIMENSIONS = 1536;
@@ -448,6 +452,15 @@ function agentMemoryTransactionalRpcError(
     return actionable(detail);
   }
   return new Error(`${rpcName} failed: ${detail}`);
+}
+
+function isOutdatedAgentMemoryWritebackSignature(error: unknown): boolean {
+  const detail = errorText(error).toLowerCase();
+  return detail.includes("agent_memory_writeback_tx") &&
+    detail.includes("p_embedding") &&
+    (detail.includes("does not exist") ||
+      detail.includes("could not find") ||
+      detail.includes("schema cache"));
 }
 
 export function isMissingEnhancedThoughtsError(error: unknown): boolean {
@@ -1053,7 +1066,7 @@ function registerAgentMemoryTools(server: McpServer): void {
     {
       title: "Recall Governed Agent Memory",
       description:
-        "Recall strictly scoped Agent Memory records. A non-empty query uses match_thoughts semantic candidates; otherwise results use confidence/freshness/id deterministic ordering. Every response is traced.",
+        "Recall strictly scoped Agent Memory records. A non-empty query uses workspace-bound agent_memory_match semantic candidates; otherwise results use confidence/freshness/id deterministic ordering. Every response is traced.",
       annotations: { readOnlyHint: false, openWorldHint: false },
       inputSchema: {
         workspace_id: z.string().trim().min(1).max(256),
@@ -1087,8 +1100,8 @@ function registerAgentMemoryTools(server: McpServer): void {
       try {
         const maxResults = limits?.max_results ?? 10;
         const maxTokens = limits?.max_tokens ?? 4_000;
-        const similarityByThought = new Map<string, number>();
-        let thoughtIds: string[] | null = null;
+        const similarityByMemory = new Map<string, number>();
+        let memoryIds: string[] | null = null;
 
         if (query) {
           const semanticText = [
@@ -1099,20 +1112,29 @@ function registerAgentMemoryTools(server: McpServer): void {
             ),
           ].filter(Boolean).join("\n");
           const embedding = await getEmbedding(semanticText);
-          const { data, error } = await supabase.rpc("match_thoughts", {
-            query_embedding: embedding,
-            match_threshold: 0.25,
-            match_count: Math.max(maxResults * 8, 50),
+          const { data, error } = await supabase.rpc("agent_memory_match", {
+            p_workspace_id: workspace_id,
+            p_query_embedding: embedding,
+            p_limit: Math.min(2_500, Math.max(maxResults * 8, 50)),
+            p_threshold: 0.25,
           });
           if (error) {
-            throw new Error(`match_thoughts failed: ${error.message}`);
+            if (isMissingDatabaseObjectError(error, "agent_memory_match")) {
+              throw actionable(AGENT_MEMORY_MATCH_RPC_ERROR);
+            }
+            throw new Error(
+              `agent_memory_match failed: ${errorText(error)}`,
+            );
           }
           for (const row of (data ?? []) as Array<JsonObject>) {
-            if (typeof row.id === "string") {
-              similarityByThought.set(row.id, Number(row.similarity ?? 0));
+            if (typeof row.memory_id === "string") {
+              similarityByMemory.set(
+                row.memory_id,
+                Number(row.similarity ?? 0),
+              );
             }
           }
-          thoughtIds = [...similarityByThought.keys()];
+          memoryIds = [...similarityByMemory.keys()];
         }
 
         let memoryQuery = supabase
@@ -1127,11 +1149,11 @@ function registerAgentMemoryTools(server: McpServer): void {
           .order("created_at", { ascending: false })
           .order("id", { ascending: true })
           .limit(1_000);
-        if (thoughtIds) {
-          memoryQuery = thoughtIds.length
-            ? memoryQuery.in("thought_id", thoughtIds)
+        if (memoryIds) {
+          memoryQuery = memoryIds.length
+            ? memoryQuery.in("id", memoryIds)
             : memoryQuery.eq(
-              "thought_id",
+              "id",
               "00000000-0000-4000-8000-000000000000",
             );
         }
@@ -1159,9 +1181,8 @@ function registerAgentMemoryTools(server: McpServer): void {
           .filter((memory) => agentMemoryFreshness(memory) >= recencyCutoff)
           .sort((left, right) => {
             if (query) {
-              const similarity =
-                (similarityByThought.get(right.thought_id ?? "") ?? 0) -
-                (similarityByThought.get(left.thought_id ?? "") ?? 0);
+              const similarity = (similarityByMemory.get(right.id) ?? 0) -
+                (similarityByMemory.get(left.id) ?? 0);
               if (similarity) return similarity;
             }
             return Number(right.confidence) - Number(left.confidence) ||
@@ -1230,11 +1251,9 @@ function registerAgentMemoryTools(server: McpServer): void {
               trace_id: trace.id,
               memory_id: memory.id,
               rank: index + 1,
-              similarity: query
-                ? similarityByThought.get(memory.thought_id ?? "") ?? 0
-                : null,
+              similarity: query ? similarityByMemory.get(memory.id) ?? 0 : null,
               ranking_score: query
-                ? similarityByThought.get(memory.thought_id ?? "") ?? 0
+                ? similarityByMemory.get(memory.id) ?? 0
                 : Number(memory.confidence),
               use_policy_snapshot: {
                 can_use_as_instruction: memory.can_use_as_instruction,
@@ -1319,7 +1338,7 @@ function registerAgentMemoryTools(server: McpServer): void {
     {
       title: "Write Governed Agent Memory",
       description:
-        "Write one evidence-only pending Agent Memory record with workspace-scoped idempotency and an audit event.",
+        "Embed and atomically write one evidence-only pending Agent Memory record with workspace-scoped idempotency and an audit event.",
       annotations: {
         readOnlyHint: false,
         openWorldHint: false,
@@ -1374,6 +1393,16 @@ function registerAgentMemoryTools(server: McpServer): void {
         };
         const normalizedProvenance = { status: provenance.status };
         const artifacts: JsonObject[] = [];
+        let embedding: number[];
+        try {
+          embedding = await getEmbedding(memory.content);
+        } catch (error) {
+          throw actionable(
+            `embedding generation failed — memory was not written: ${
+              errorText(error)
+            }`,
+          );
+        }
         const contentHash = await sha256Hex(canonicalJson({
           memory: normalizedMemory,
           provenance: normalizedProvenance,
@@ -1394,8 +1423,12 @@ function registerAgentMemoryTools(server: McpServer): void {
             runtime_name: AGENT_MEMORY_RUNTIME,
             schema_version: "openbrain.agent_memory.mcp_writeback.v1",
           },
+          p_embedding: embedding,
         });
         if (result.error) {
+          if (isOutdatedAgentMemoryWritebackSignature(result.error)) {
+            throw actionable(AGENT_MEMORY_WRITEBACK_SCHEMA_OUTDATED_ERROR);
+          }
           throw agentMemoryTransactionalRpcError(
             result.error,
             "agent_memory_writeback_tx",
@@ -1610,7 +1643,7 @@ function registerAgentMemoryTools(server: McpServer): void {
     {
       title: "Review Agent Memory",
       description:
-        "Apply a logical review transition with an explicit actor. approve is stored as the REST contract's confirm action; no action physically deletes a row.",
+        "Apply a non-promoting logical review transition as an agent. Promotion requires the authenticated REST reviewer interface; no action physically deletes a row.",
       annotations: {
         readOnlyHint: false,
         openWorldHint: false,
@@ -1642,6 +1675,13 @@ function registerAgentMemoryTools(server: McpServer): void {
     }) => {
       try {
         if (
+          ["approve", "confirm", "merge", "supersede"].includes(action)
+        ) {
+          return toolError(
+            "memory_review error: promotion requires an authenticated human reviewer — use the Agent Memory REST reviewer interface. MCP actions are limited to reject, dispute, mark_stale, evidence_only, restrict_scope, and edit (demotes to pending).",
+          );
+        }
+        if (
           ["mark_stale", "merge", "reject", "dispute", "supersede"].includes(
             action,
           ) && !notes
@@ -1671,7 +1711,6 @@ function registerAgentMemoryTools(server: McpServer): void {
             "memory_review error: A memory cannot be related to itself",
           );
         }
-        const normalizedAction = action === "approve" ? "confirm" : action;
         if (content) {
           const unsafe = unsafeAgentMemoryReasons(content);
           if (unsafe.length) {
@@ -1685,13 +1724,14 @@ function registerAgentMemoryTools(server: McpServer): void {
         const result = await supabase.rpc("agent_memory_review_tx", {
           p_memory_id: memory_id,
           p_workspace_id: workspace_id,
-          p_action: normalizedAction,
+          p_action: action,
           p_actor_id: actor_id,
           p_notes: notes ?? null,
           p_related_memory_id: related_memory_id ?? null,
           p_content: content ?? null,
           p_summary: summary ?? null,
           p_visibility: visibility ?? null,
+          p_actor_kind: "agent",
         });
         if (result.error) {
           throw agentMemoryTransactionalRpcError(
@@ -1708,6 +1748,7 @@ function registerAgentMemoryTools(server: McpServer): void {
         }
         return toolJson({
           memory: agentMemoryResponse(memoryResult as AgentMemoryRecord),
+          demoted_to_pending: action === "edit",
         });
       } catch (error) {
         return internalToolError("memory_review", error);

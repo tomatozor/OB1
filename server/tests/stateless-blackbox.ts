@@ -300,8 +300,31 @@ globalThis.fetch = (async (
     }
     return json(200, [{ id: "semantic-visible", similarity: 0.91 }]);
   }
+  if (rpc === "agent_memory_match") {
+    const payload = JSON.parse(rawBody);
+    if (payload.p_workspace_id === "match-rpc-absent") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.agent_memory_match in the schema cache",
+      });
+    }
+    return json(
+      200,
+      payload.p_workspace_id === "workspace-a"
+        ? [{ memory_id: MEMORY_A_ID, similarity: 0.93 }]
+        : [],
+    );
+  }
   if (rpc === "agent_memory_writeback_tx") {
     const payload = JSON.parse(rawBody);
+    if (payload.p_workspace_id === "rpc-outdated") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.agent_memory_writeback_tx(p_workspace_id, p_embedding) in the schema cache; p_embedding does not exist",
+      });
+    }
     if (payload.p_workspace_id === "rpc-absent") {
       return json(404, {
         code: "PGRST202",
@@ -370,6 +393,12 @@ globalThis.fetch = (async (
         message: "Memory not found in workspace",
       });
     }
+    if (payload.p_actor_kind !== "agent") {
+      return json(400, {
+        code: "P0001",
+        message: "MCP review actor_kind must be agent",
+      });
+    }
     if (payload.p_action === "confirm") {
       if (memory.review_status === "confirmed") {
         return json(400, {
@@ -382,6 +411,17 @@ globalThis.fetch = (async (
         provenance_status: "user_confirmed",
         can_use_as_instruction: true,
         requires_user_confirmation: false,
+      });
+    }
+    if (payload.p_action === "edit") {
+      Object.assign(memory, {
+        content: payload.p_content ?? memory.content,
+        summary: payload.p_summary ?? memory.summary,
+        review_status: "pending",
+        provenance_status: "generated",
+        can_use_as_instruction: false,
+        can_use_as_evidence: true,
+        requires_user_confirmation: true,
       });
     }
     return json(200, memory);
@@ -451,12 +491,13 @@ globalThis.fetch = (async (
           rows = rows.filter((row) => String(row[key] ?? "") === expected);
         }
       }
-      const thoughtIds = url.searchParams.get("thought_id");
-      if (thoughtIds?.startsWith("in.(")) {
+      for (const key of ["id", "thought_id"]) {
+        const values = url.searchParams.get(key);
+        if (!values?.startsWith("in.(")) continue;
         const allowed = new Set(
-          thoughtIds.slice(4, -1).split(",").map(decodeURIComponent),
+          values.slice(4, -1).split(",").map(decodeURIComponent),
         );
-        rows = rows.filter((row) => allowed.has(row.thought_id));
+        rows = rows.filter((row) => allowed.has(row[key]));
       }
       const order = url.searchParams.get("order") ?? "";
       if (order.includes("created_at.asc")) {
@@ -1269,6 +1310,45 @@ assert(
   ),
   "memory_recall persists returned recall items",
 );
+const beforeSemanticRecall = requests.length;
+const semanticMemoryRecall = await mcp("tools/call", {
+  name: "memory_recall",
+  arguments: { workspace_id: "workspace-a", query: "Workspace A decision" },
+});
+const semanticMemoryRecallResult = toolResult(semanticMemoryRecall.body!);
+const semanticMatchRequest = requests.slice(beforeSemanticRecall).find((
+  entry,
+) => entry.url.includes("/rpc/agent_memory_match"));
+assert(
+  semanticMatchRequest &&
+    JSON.parse(semanticMatchRequest.body).p_workspace_id === "workspace-a" &&
+    Array.isArray(JSON.parse(semanticMatchRequest.body).p_query_embedding),
+  "memory_recall query calls agent_memory_match with the exact workspace and embedding",
+);
+assert(
+  semanticMemoryRecall.body?.result?.isError !== true &&
+    semanticMemoryRecallResult.memories.map((row: { id: string }) => row.id)
+        .join(",") === MEMORY_A_ID &&
+    requests.slice(beforeSemanticRecall).some((entry) =>
+      entry.url.includes("/agent_memories?") &&
+      entry.url.includes(`id=in.%28${MEMORY_A_ID}`)
+    ),
+  "memory_recall joins semantic memory_id results to workspace-scoped memories",
+);
+const missingSemanticRecall = await mcp("tools/call", {
+  name: "memory_recall",
+  arguments: {
+    workspace_id: "match-rpc-absent",
+    query: "fail closed semantic recall",
+  },
+});
+assert(
+  missingSemanticRecall.body?.result?.isError === true &&
+    missingSemanticRecall.body.result.content[0].text.includes(
+      "not installed/outdated",
+    ),
+  "memory_recall query fails closed when agent_memory_match is absent",
+);
 const failedTraceRecall = await mcp("tools/call", {
   name: "memory_recall",
   arguments: { workspace_id: "trace-write-fail" },
@@ -1331,8 +1411,10 @@ assert(
     firstWritebackPayload.p_memory.content ===
       writebackArguments.memory.content &&
     Array.isArray(firstWritebackPayload.p_source_refs) &&
-    Array.isArray(firstWritebackPayload.p_artifacts),
-  "memory_writeback sends normalized content hash and the full pinned RPC contract",
+    Array.isArray(firstWritebackPayload.p_artifacts) &&
+    Array.isArray(firstWritebackPayload.p_embedding) &&
+    firstWritebackPayload.p_embedding.length === 1536,
+  "memory_writeback sends a non-null content embedding and the full pinned RPC contract",
 );
 assert(
   !requests.slice(beforeWriteback).some((entry) =>
@@ -1357,6 +1439,40 @@ assert(
       "already used with different content",
     ),
   "memory_writeback rejects changed content under a reused key",
+);
+const beforeFailedEmbeddingWriteback = requests.length;
+const failedEmbeddingWriteback = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: {
+    ...writebackArguments,
+    idempotency_key: "failed-embedding-key",
+    memory: { ...writebackArguments.memory, content: "bad-embedding" },
+  },
+});
+assert(
+  failedEmbeddingWriteback.body?.result?.isError === true &&
+    failedEmbeddingWriteback.body.result.content[0].text.includes(
+      "embedding generation failed — memory was not written",
+    ) &&
+    !requests.slice(beforeFailedEmbeddingWriteback).some((entry) =>
+      entry.url.includes("/rpc/agent_memory_writeback_tx")
+    ),
+  "memory_writeback embedding failure performs no memory write",
+);
+const outdatedWriteback = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: {
+    ...writebackArguments,
+    workspace_id: "rpc-outdated",
+    idempotency_key: "rpc-outdated-key",
+  },
+});
+assert(
+  outdatedWriteback.body?.result?.isError === true &&
+    outdatedWriteback.body.result.content[0].text.includes(
+      "Agent Memory schema outdated — re-apply schemas/agent-memory",
+    ),
+  "memory_writeback rejects the legacy RPC signature without p_embedding",
 );
 const writebackRpcAbsent = await mcp("tools/call", {
   name: "memory_writeback",
@@ -1431,46 +1547,64 @@ const approvedMemory = await mcp("tools/call", {
   },
 });
 assert(
-  approvedMemory.body?.result?.isError !== true &&
-    toolResult(approvedMemory.body!).memory.can_use_as_instruction === true &&
-    agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.review_status ===
-      "confirmed",
-  "memory_review maps approve to confirm and promotes instruction use",
+  approvedMemory.body?.result?.isError === true &&
+    approvedMemory.body.result.content[0].text.includes(
+      "promotion requires an authenticated human reviewer",
+    ) &&
+    approvedMemory.body.result.content[0].text.includes(
+      "Agent Memory REST reviewer interface",
+    ),
+  "memory_review refuses MCP promotion with human-reviewer guidance",
 );
 assert(
-  requests.slice(beforeReview).filter((entry) =>
-        entry.url.includes("/rpc/agent_memory_review_tx")
-      ).length === 1 &&
-    !requests.slice(beforeReview).some((entry) =>
-      entry.method === "PATCH" ||
-      entry.url.includes("agent_memory_review_actions") ||
-      entry.url.includes("agent_memory_relations")
-    ),
-  "memory_review uses one transactional RPC and no legacy writes",
+  !requests.slice(beforeReview).some((entry) =>
+    entry.url.includes("/rpc/agent_memory_review_tx")
+  ),
+  "memory_review promotion gate runs before every review RPC",
 );
-const invalidReviewTransition = await mcp("tools/call", {
+const beforeEditReview = requests.length;
+const editedMemory = await mcp("tools/call", {
   name: "memory_review",
   arguments: {
     memory_id: MEMORY_PENDING_ID,
     workspace_id: "workspace-a",
-    action: "approve",
-    actor_id: "reviewer-2",
+    action: "edit",
+    actor_id: "agent-editor",
+    content: "Edited evidence that must return to pending review.",
   },
 });
+const editReviewPayload = JSON.parse(
+  requests.slice(beforeEditReview).find((entry) =>
+    entry.url.includes("/rpc/agent_memory_review_tx")
+  )!.body,
+);
 assert(
-  invalidReviewTransition.body?.result?.isError === true &&
-    invalidReviewTransition.body.result.content[0].text.includes(
-      "Invalid transition",
+  editedMemory.body?.result?.isError !== true &&
+    toolResult(editedMemory.body!).demoted_to_pending === true &&
+    agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.review_status ===
+      "pending" &&
+    editReviewPayload.p_actor_kind === "agent",
+  "memory_review edit is agent-authored and signals demotion to pending",
+);
+assert(
+  requests.slice(beforeEditReview).filter((entry) =>
+        entry.url.includes("/rpc/agent_memory_review_tx")
+      ).length === 1 &&
+    !requests.slice(beforeEditReview).some((entry) =>
+      entry.method === "PATCH" ||
+      entry.url.includes("agent_memory_review_actions") ||
+      entry.url.includes("agent_memory_relations")
     ),
-  "memory_review preserves actionable transactional transition errors",
+  "memory_review edit uses one transactional RPC and no legacy writes",
 );
 const reviewRpcAbsent = await mcp("tools/call", {
   name: "memory_review",
   arguments: {
     memory_id: MEMORY_PENDING_ID,
     workspace_id: "rpc-absent",
-    action: "approve",
+    action: "reject",
     actor_id: "reviewer-3",
+    notes: "Reject through an allowed non-promoting MCP action.",
   },
 });
 assert(
