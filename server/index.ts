@@ -1253,4 +1253,8 @@ app.all("*", async (context) => {
   return response;
 });
 
-if (import.meta.main) Deno.serve(app.fetch);
+// PORT est ignoré par l'Edge Runtime Supabase mais permet aux tests locaux
+// de démarrer le serveur sur un port éphémère.
+if (import.meta.main) {
+  Deno.serve({ port: Number(Deno.env.get("PORT") ?? "8000") }, app.fetch);
+}

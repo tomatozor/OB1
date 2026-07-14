@@ -61,10 +61,11 @@ const postgrest = createServer(async (request, response) => {
   if (rpc === "brain_stats_aggregate") return json(response, 200, { total: 7, types: { idea: 7 } });
   if (url.pathname === "/rest/v1/thoughts" && request.method === "GET") {
     if (url.searchParams.get("select")?.includes("updated_at")) {
-      return json(response, 200, [{
+      // .single() côté supabase-js attend un OBJET (Accept: pgrst.object+json), pas un tableau.
+      return json(response, 200, {
         id: ID, content: "original", metadata: { topics: ["launch"] },
         created_at: "2026-07-01T00:00:00.000Z", updated_at: "2026-07-10T12:00:00.000Z",
-      }]);
+      });
     }
     return json(response, 200, [
       { id: "recall-new", content: "new visible", metadata: {}, created_at: "2026-07-14T00:00:00.000Z", importance: 5, type: "idea" },
@@ -105,7 +106,14 @@ async function waitForServer() {
 }
 async function mcp(method, params = {}, headers = BASE_HEADERS, url = base) {
   const response = await fetch(url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
-  return { response, body: await response.json() };
+  const raw = await response.text();
+  // Le transport MCP streamable répond en SSE (event: message / data: {...})
+  // ou en JSON brut selon le cas — accepter les deux.
+  let body = null;
+  const dataLine = raw.split("\n").find((line) => line.startsWith("data: "));
+  const payload = dataLine ? dataLine.slice(6) : raw;
+  try { body = JSON.parse(payload); } catch { body = null; }
+  return { response, body };
 }
 function toolResult(body) { return JSON.parse(body.result.content[0].text); }
 
