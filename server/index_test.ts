@@ -3,9 +3,12 @@ Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
 Deno.env.set("OPENROUTER_API_KEY", "test-openrouter-key");
 Deno.env.set("MCP_ACCESS_KEY", "test-mcp-key");
 
-const { fuseRrf, isMissingHybridRpcError, retrieveHybrid } = await import(
-  "./index.ts"
-);
+const {
+  fuseRrf,
+  isMissingDatabaseObjectError,
+  isMissingHybridRpcError,
+  retrieveHybrid,
+} = await import("./index.ts");
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -118,5 +121,48 @@ Deno.test("hybrid retrieval does not mask non-missing RPC failures", async () =>
   assert(
     !isMissingHybridRpcError({ code: "42501", message: "permission denied" }),
     "permission failure was misclassified",
+  );
+});
+
+Deno.test("missing database object detection accepts PostgREST and SQL absence only", () => {
+  assert(
+    isMissingDatabaseObjectError(
+      {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.capture_thought_atomic in the schema cache",
+      },
+      "capture_thought_atomic",
+    ),
+    "PGRST202 function absence was not detected",
+  );
+  assert(
+    isMissingDatabaseObjectError(
+      {
+        code: "42883",
+        message:
+          "function public.soft_delete_thought(uuid, text, boolean) does not exist",
+      },
+      "soft_delete_thought",
+    ),
+    "SQL function absence was not detected",
+  );
+  assert(
+    isMissingDatabaseObjectError(
+      {
+        code: "PGRST205",
+        message:
+          "Could not find the table public.thought_edges in the schema cache",
+      },
+      "thought_edges",
+    ),
+    "PGRST205 table absence was not detected",
+  );
+  assert(
+    !isMissingDatabaseObjectError(
+      { code: "42501", message: "permission denied for thought_edges" },
+      "thought_edges",
+    ),
+    "permission error was misclassified as an absent object",
   );
 });

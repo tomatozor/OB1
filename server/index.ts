@@ -11,7 +11,8 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
+  "https://openrouter.ai/api/v1";
 const RRF_K = 60;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -92,7 +93,8 @@ function metadataExcerpt(metadata: unknown): JsonObject {
 }
 
 function isDeleted(row: Pick<ThoughtRecord, "metadata">): boolean {
-  return asMetadata(row.metadata).deleted === true;
+  const deleted = asMetadata(row.metadata).deleted;
+  return deleted === true || deleted === "true";
 }
 
 function rowType(row: ThoughtRecord): string | null {
@@ -101,9 +103,22 @@ function rowType(row: ThoughtRecord): string | null {
 }
 
 function rowSourceType(row: ThoughtRecord): string | null {
-  const metadataSourceType = asMetadata(row.metadata).source_type;
+  const metadataSourceType = asMetadata(row.metadata).source;
   return row.source_type ??
     (typeof metadataSourceType === "string" ? metadataSourceType : null);
+}
+
+function parseDateInput(name: string, value?: string): string | undefined {
+  if (value === undefined) return undefined;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error(
+      `Invalid ${name}: expected a date parseable by Date.parse, received ${
+        JSON.stringify(value)
+      }`,
+    );
+  }
+  return new Date(timestamp).toISOString();
 }
 
 function rowImportance(row: ThoughtRecord): number {
@@ -247,6 +262,23 @@ export function isMissingHybridRpcError(error: unknown): boolean {
   return text.includes("hybrid_search_thoughts") &&
     (text.includes("does not exist") ||
       text.includes("could not find the function") ||
+      text.includes("schema cache"));
+}
+
+export function isMissingDatabaseObjectError(
+  error: unknown,
+  objectName: string,
+): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as JsonObject).code;
+    if (code === "PGRST202" || code === "PGRST205") return true;
+  }
+  const text = errorText(error).toLowerCase();
+  const normalizedName = objectName.toLowerCase();
+  return text.includes(normalizedName) &&
+    (text.includes("does not exist") ||
+      text.includes("could not find the function") ||
+      text.includes("could not find the table") ||
       text.includes("schema cache"));
 }
 
@@ -412,6 +444,31 @@ async function excludeDeletedConnections(
   );
 }
 
+async function excludeSupersededThoughts(
+  rows: ThoughtRecord[],
+): Promise<ThoughtRecord[]> {
+  const ids = [...new Set(rows.map((row) => row.id).filter(Boolean))];
+  if (!ids.length) return [];
+
+  const { data, error } = await supabase
+    .from("thought_edges")
+    .select("to_thought_id")
+    .eq("relation", "supersedes")
+    .is("valid_until", null)
+    .in("to_thought_id", ids);
+  if (error) {
+    if (isMissingDatabaseObjectError(error, "thought_edges")) return rows;
+    throw new Error(`supersedes filtering failed: ${error.message}`);
+  }
+
+  const superseded = new Set(
+    ((data ?? []) as Array<{ to_thought_id?: string | null }>)
+      .map((edge) => edge.to_thought_id)
+      .filter((id): id is string => typeof id === "string"),
+  );
+  return superseded.size ? rows.filter((row) => !superseded.has(row.id)) : rows;
+}
+
 function searchFilterPayload(filters: SearchFilters): JsonObject {
   const payload: JsonObject = {};
   if (filters.type) payload.type = filters.type;
@@ -432,14 +489,15 @@ async function runSearch(params: {
   threshold: number;
   filters: SearchFilters;
 }): Promise<JsonObject> {
-  const needed = params.offset + params.limit + 1;
+  const pageSize = params.limit + 1;
+  const needed = params.offset + pageSize;
   let rows: ThoughtRecord[];
   let source: string = params.mode;
 
   if (params.mode === "text") {
     rows = (await textCandidates(params.query, needed, params.filters)).slice(
       params.offset,
-      params.offset + params.limit,
+      params.offset + pageSize,
     );
   } else {
     const embedding = await getEmbedding(params.query);
@@ -451,7 +509,7 @@ async function runSearch(params: {
           needed,
           params.filters,
         )
-      ).slice(params.offset, params.offset + params.limit);
+      ).slice(params.offset, params.offset + pageSize);
     } else {
       const candidateCount = Math.min(
         1000,
@@ -461,7 +519,7 @@ async function runSearch(params: {
         {
           query: params.query,
           queryEmbedding: embedding,
-          limit: params.limit,
+          limit: pageSize,
           offset: params.offset,
           filter: searchFilterPayload(params.filters),
           includeRestricted: params.filters.include_restricted,
@@ -480,7 +538,7 @@ async function runSearch(params: {
           semantic: async () =>
             await semanticCandidates(
               embedding,
-              0.3,
+              params.threshold,
               candidateCount,
               params.filters,
             ),
@@ -494,14 +552,16 @@ async function runSearch(params: {
   }
 
   rows = rows.filter((row) => matchesSearchFilters(row, params.filters));
+  const page = rows.slice(0, params.limit);
   return {
     mode: params.mode,
     source,
-    results: rows.map(serializeSearchRow),
+    results: page.map(serializeSearchRow),
     pagination: {
       offset: params.offset,
       limit: params.limit,
-      returned: rows.length,
+      returned: page.length,
+      has_more: rows.length > params.limit,
     },
   };
 }
@@ -652,6 +712,8 @@ function buildServer(): McpServer {
       threshold = 0.5,
     }) => {
       try {
+        const normalizedStartDate = parseDateInput("start_date", start_date);
+        const normalizedEndDate = parseDateInput("end_date", end_date);
         return toolJson(
           await runSearch({
             query,
@@ -663,8 +725,8 @@ function buildServer(): McpServer {
               type,
               source_type,
               min_importance,
-              start_date,
-              end_date,
+              start_date: normalizedStartDate,
+              end_date: normalizedEndDate,
               include_restricted,
             },
           }),
@@ -708,7 +770,7 @@ function buildServer(): McpServer {
           .order("importance", { ascending: false, nullsFirst: false })
           .order("created_at", { ascending: false })
           .order("id", { ascending: true })
-          .limit(limit);
+          .limit(Math.min(limit * 2, 100));
         if (!include_restricted) {
           query = query.or(
             "sensitivity_tier.is.null,sensitivity_tier.neq.restricted",
@@ -729,7 +791,10 @@ function buildServer(): McpServer {
 
         const { data, error } = await query;
         if (error) throw new Error(error.message);
-        const results = ((data ?? []) as ThoughtRecord[]).map((row) => ({
+        const visibleRows = await excludeSupersededThoughts(
+          (data ?? []) as ThoughtRecord[],
+        );
+        const results = visibleRows.slice(0, limit).map((row) => ({
           id: row.id,
           date: row.created_at,
           type: rowType(row),
@@ -933,9 +998,44 @@ function buildServer(): McpServer {
           getEmbedding(content),
           extractMetadata(content),
         ]);
+        const payload = { metadata: { ...metadata, source: "mcp" } };
+        const embeddingValue = `[${embedding.join(",")}]`;
+        const atomicResult = await supabase.rpc("capture_thought_atomic", {
+          p_content: content,
+          p_payload: payload,
+          p_embedding: embeddingValue,
+        });
+        if (!atomicResult.error) {
+          const result = asMetadata(atomicResult.data);
+          const thoughtId = result.id;
+          if (typeof thoughtId !== "string") {
+            return toolError(
+              "Failed to capture: capture_thought_atomic returned no id",
+            );
+          }
+          return toolJson({
+            ...result,
+            id: thoughtId,
+            captured: true,
+            metadata,
+            atomic: true,
+            via: "capture_thought_atomic",
+          });
+        }
+        if (
+          !isMissingDatabaseObjectError(
+            atomicResult.error,
+            "capture_thought_atomic",
+          )
+        ) {
+          return toolError(
+            `Failed to capture atomically: ${atomicResult.error.message}`,
+          );
+        }
+
         const { data, error } = await supabase.rpc("upsert_thought", {
           p_content: content,
-          p_payload: { metadata: { ...metadata, source: "mcp" } },
+          p_payload: payload,
         });
         if (error) return toolError(`Failed to capture: ${error.message}`);
         const thoughtId = (data as JsonObject | null)?.id;
@@ -944,14 +1044,20 @@ function buildServer(): McpServer {
         }
         const embeddingResult = await supabase
           .from("thoughts")
-          .update({ embedding: `[${embedding.join(",")}]` })
+          .update({ embedding: embeddingValue })
           .eq("id", thoughtId);
         if (embeddingResult.error) {
           return toolError(
             `Failed to save embedding: ${embeddingResult.error.message}`,
           );
         }
-        return toolJson({ id: thoughtId, captured: true, metadata });
+        return toolJson({
+          id: thoughtId,
+          captured: true,
+          metadata,
+          atomic: false,
+          via: "fallback_non_atomic",
+        });
       } catch (error) {
         return toolError(`capture_thought error: ${(error as Error).message}`);
       }
@@ -1092,6 +1198,31 @@ function buildServer(): McpServer {
         );
       }
       try {
+        const atomicResult = await supabase.rpc("soft_delete_thought", {
+          p_id: id,
+          p_actor: "mcp",
+          p_confirm: true,
+        });
+        if (!atomicResult.error) {
+          return toolJson({
+            ...asMetadata(atomicResult.data),
+            id,
+            deleted: true,
+            atomic: true,
+            via: "soft_delete_thought",
+          });
+        }
+        if (
+          !isMissingDatabaseObjectError(
+            atomicResult.error,
+            "soft_delete_thought",
+          )
+        ) {
+          return toolError(
+            `delete_thought error: ${atomicResult.error.message}`,
+          );
+        }
+
         const { data: existing, error: fetchError } = await supabase
           .from("thoughts")
           .select("id, content, metadata, created_at, updated_at")
@@ -1101,8 +1232,14 @@ function buildServer(): McpServer {
           return toolError(`delete_thought error: thought ${id} not found`);
         }
         const priorMetadata = asMetadata(existing.metadata);
-        if (priorMetadata.deleted === true) {
-          return toolJson({ id, deleted: true, already_deleted: true });
+        if (isDeleted({ metadata: priorMetadata })) {
+          return toolJson({
+            id,
+            deleted: true,
+            already_deleted: true,
+            atomic: false,
+            via: "fallback_non_atomic",
+          });
         }
 
         const deletedAt = new Date().toISOString();
@@ -1153,6 +1290,8 @@ function buildServer(): McpServer {
           deleted: true,
           deleted_at: deletedAt,
           deleted_by: "mcp",
+          atomic: false,
+          via: "fallback_non_atomic",
         });
       } catch (error) {
         return toolError(`delete_thought error: ${(error as Error).message}`);
@@ -1197,7 +1336,7 @@ export function timingSafeEqualStrings(a: string, b: string): boolean {
   return difference === 0;
 }
 
-const app = new Hono();
+export const app = new Hono();
 
 app.options("*", (context) => context.text("ok", 200, corsHeaders));
 
