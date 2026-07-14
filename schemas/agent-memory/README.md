@@ -130,17 +130,19 @@ agent_memory_match(
 ) returns table(memory_id uuid, similarity double precision)
 
 agent_memory_review_tx(
-  uuid, text, text, text, text, uuid, text, text, text, text
+  uuid, text, text, text, text, uuid, text, text, text, text, vector(1536)
 ) returns jsonb
 ```
 
 In declaration order, writeback accepts `p_workspace_id`, `p_idempotency_key`, `p_content_hash`, `p_memory`, `p_provenance`, `p_source_refs DEFAULT '[]'`, `p_artifacts DEFAULT '[]'`, `p_created_by DEFAULT NULL`, `p_request_context DEFAULT '{}'`, and `p_embedding vector(1536) DEFAULT NULL`. The default exists only for call-signature compatibility: a null embedding raises `embedding required — a writeback must be semantically recallable` before any memory, child, or audit write. A supplied embedding is stored atomically with the memory. Equal workspace/key pairs are serialized; same-hash replay returns the existing embedded row, while a different hash conflicts. New rows remain evidence-only and pending review, and writeback provenance is limited to `observed`, `inferred`, or `generated`.
 
-Batch writeback accepts a JSON array of `{idempotency_key, content_hash, memory, provenance, source_refs?, artifacts?, embedding}` items. Every new item requires an array of exactly 1,536 numbers. A same-hash replay may omit it because the existing stored embedding governs the replay. The loop calls the single-item RPC inside one database function; any item failure rolls back every memory, child, and audit row created by the batch.
+Batch writeback accepts a JSON array of `{idempotency_key, content_hash, memory, provenance, source_refs?, artifacts?, embedding}` items. Every item, including a same-hash replay, requires an array of exactly 1,536 finite numbers before replay lookup; after validation, the existing stored embedding governs a replay and is never overwritten. The loop calls the single-item RPC inside one database function; any item failure rolls back every memory, child, and audit row created by the batch.
+
+Every review edit that changes `content` must supply `p_embedding vector(1536)`; content, content hash, and embedding are updated atomically, while summary-only and visibility-only edits do not re-embed.
 
 `agent_memory_match` computes cosine similarity only over non-null embeddings in the requested workspace and excludes `rejected` and `superseded` memories. Its optional threshold is applied before the ordered, capped result is returned; a request can never return a row from another workspace.
 
-Review accepts `p_memory_id`, `p_workspace_id`, `p_action`, `p_actor_id`, `p_notes DEFAULT NULL`, `p_related_memory_id DEFAULT NULL`, `p_content DEFAULT NULL`, `p_summary DEFAULT NULL`, `p_visibility DEFAULT NULL`, and `p_actor_kind DEFAULT 'agent'`. Actor kind is restricted to `agent|human`; `confirm`/`approve`, `merge`, and `supersede` require `human`. An agent edit of a confirmed or instruction-grade memory atomically resets it to pending evidence (`can_use_as_instruction=false`, `requires_user_confirmation=true`) and audits the downgrade. A human edit preserves confirmed state. The row lock and related-memory lookup remain workspace-bounded.
+Review accepts `p_memory_id`, `p_workspace_id`, `p_action`, `p_actor_id`, `p_notes DEFAULT NULL`, `p_related_memory_id DEFAULT NULL`, `p_content DEFAULT NULL`, `p_summary DEFAULT NULL`, `p_visibility DEFAULT NULL`, `p_actor_kind DEFAULT 'agent'`, and final `p_embedding vector(1536) DEFAULT NULL`. Actor kind is restricted to `agent|human`; `confirm`/`approve`, `merge`, and `supersede` require `human`. An agent edit of a confirmed or instruction-grade memory atomically resets it to pending evidence (`can_use_as_instruction=false`, `requires_user_confirmation=true`) and audits the downgrade. A human edit preserves confirmed state. The row lock and related-memory lookup remain workspace-bounded.
 
 `PUBLIC` and `authenticated` have no execution privilege on these four RPCs; execution is granted only to `service_role`. Keep the service key server-side.
 
@@ -153,7 +155,7 @@ Applying this schema to the `origin/main` Agent Memory installation performs a r
 - legacy `visibility='organization'` rows become `workspace` before the four-level visibility check is installed;
 - `agent_memories.embedding vector(1536)` is added without rewriting or deleting existing memory rows;
 - the old nine-argument writeback RPC is dropped transactionally and replaced by the ten-argument embedding signature;
-- the old nine-argument review RPC is dropped transactionally and replaced by the ten-argument actor-authority signature;
+- the old nine-argument and ten-argument review RPCs are dropped transactionally and replaced by the eleven-argument actor-authority plus embedding signature;
 - semantic match and atomic batch writeback RPCs are installed with service-role-only execution;
 - `DELETE` is explicitly revoked from `service_role` on all eight tables, undoing the earlier grant rather than assuming a narrower later `GRANT` revokes it;
 - existing memory and child rows are retained. The migration does not remove or rewrite `thoughts` columns.

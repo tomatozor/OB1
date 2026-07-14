@@ -376,6 +376,13 @@ globalThis.fetch = (async (
   }
   if (rpc === "agent_memory_review_tx") {
     const payload = JSON.parse(rawBody);
+    if (payload.p_workspace_id === "rpc-outdated-review") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.agent_memory_review_tx(p_embedding) in the schema cache; p_embedding does not exist",
+      });
+    }
     if (payload.p_workspace_id === "rpc-absent") {
       return json(404, {
         code: "PGRST202",
@@ -414,9 +421,16 @@ globalThis.fetch = (async (
       });
     }
     if (payload.p_action === "edit") {
+      if (payload.p_content && !Array.isArray(payload.p_embedding)) {
+        return json(400, {
+          code: "22023",
+          message: "embedding required when editing content",
+        });
+      }
       Object.assign(memory, {
         content: payload.p_content ?? memory.content,
         summary: payload.p_summary ?? memory.summary,
+        embedding: payload.p_content ? payload.p_embedding : memory.embedding,
         review_status: "pending",
         provenance_status: "generated",
         can_use_as_instruction: false,
@@ -1583,8 +1597,12 @@ assert(
     toolResult(editedMemory.body!).demoted_to_pending === true &&
     agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.review_status ===
       "pending" &&
-    editReviewPayload.p_actor_kind === "agent",
-  "memory_review edit is agent-authored and signals demotion to pending",
+    editReviewPayload.p_actor_kind === "agent" &&
+    Array.isArray(editReviewPayload.p_embedding) &&
+    editReviewPayload.p_embedding.length === 1536 &&
+    agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.embedding
+        ?.length === 1536,
+  "memory_review content edit transmits embedding and signals demotion",
 );
 assert(
   requests.slice(beforeEditReview).filter((entry) =>
@@ -1596,6 +1614,44 @@ assert(
       entry.url.includes("agent_memory_relations")
     ),
   "memory_review edit uses one transactional RPC and no legacy writes",
+);
+const beforeFailedEditEmbedding = requests.length;
+const failedEditEmbedding = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "workspace-a",
+    action: "edit",
+    actor_id: "agent-editor",
+    content: "bad-embedding",
+  },
+});
+assert(
+  failedEditEmbedding.body?.result?.isError === true &&
+    failedEditEmbedding.body.result.content[0].text.includes(
+      "embedding generation failed — memory was not edited",
+    ) &&
+    !requests.slice(beforeFailedEditEmbedding).some((entry) =>
+      entry.url.includes("/rpc/agent_memory_review_tx")
+    ),
+  "memory_review embedding failure performs no review RPC",
+);
+const outdatedReview = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "rpc-outdated-review",
+    action: "edit",
+    actor_id: "agent-editor",
+    content: "Content edit against outdated review RPC.",
+  },
+});
+assert(
+  outdatedReview.body?.result?.isError === true &&
+    outdatedReview.body.result.content[0].text.includes(
+      "Agent Memory schema outdated — re-apply schemas/agent-memory",
+    ),
+  "memory_review rejects the legacy RPC signature without p_embedding",
 );
 const reviewRpcAbsent = await mcp("tools/call", {
   name: "memory_review",

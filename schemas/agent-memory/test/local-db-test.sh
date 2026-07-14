@@ -244,8 +244,29 @@ echo "PASS seeded origin/main rows and previous transactional RPC signatures"
 
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade < "$SCHEMA" >/dev/null
 echo "PASS upgraded origin/main schema to current schema"
+
+docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade >/dev/null <<'SQL'
+DROP FUNCTION public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, vector
+);
+CREATE FUNCTION public.agent_memory_review_tx(
+  p_memory_id UUID,
+  p_workspace_id TEXT,
+  p_action TEXT,
+  p_actor_id TEXT,
+  p_notes TEXT DEFAULT NULL,
+  p_related_memory_id UUID DEFAULT NULL,
+  p_content TEXT DEFAULT NULL,
+  p_summary TEXT DEFAULT NULL,
+  p_visibility TEXT DEFAULT NULL,
+  p_actor_kind TEXT DEFAULT 'agent'
+)
+RETURNS JSONB LANGUAGE SQL AS $$ SELECT '{}'::jsonb $$;
+SQL
+echo "PASS seeded pre-embedding ten-argument review RPC signature"
+
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade < "$SCHEMA" >/dev/null
-echo "PASS upgraded schema reapply (idempotent)"
+echo "PASS upgraded schema replaces pre-embedding review RPC signature"
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade < "$UPGRADE_TEST"
 echo "PASS origin/main upgrade assertions"
 

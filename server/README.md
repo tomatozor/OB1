@@ -108,7 +108,9 @@ server never substitutes core `thoughts` behavior or silently skips the write.
   actions `approve`, `confirm`, `merge`, and `supersede` are rejected before
   any RPC call and must use the authenticated Agent Memory REST reviewer
   interface. Edit requires content or summary and is explicitly returned as a
-  demotion to pending/evidence-only. Lifecycle actions require notes.
+  demotion to pending/evidence-only. Every content edit is embedded before the
+  RPC so content, content hash, and embedding update atomically; summary-only
+  edits do not re-embed. Lifecycle actions require notes.
   `restrict_scope` follows the monotone
   `workspace -> project -> channel -> personal` order: requesting the current
   visibility again is allowed, narrowing is allowed, and widening is refused.

@@ -463,6 +463,15 @@ function isOutdatedAgentMemoryWritebackSignature(error: unknown): boolean {
       detail.includes("schema cache"));
 }
 
+function isOutdatedAgentMemoryReviewSignature(error: unknown): boolean {
+  const detail = errorText(error).toLowerCase();
+  return detail.includes("agent_memory_review_tx") &&
+    detail.includes("p_embedding") &&
+    (detail.includes("does not exist") ||
+      detail.includes("could not find") ||
+      detail.includes("schema cache"));
+}
+
 export function isMissingEnhancedThoughtsError(error: unknown): boolean {
   if (error && typeof error === "object") {
     const code = (error as JsonObject).code;
@@ -1721,6 +1730,18 @@ function registerAgentMemoryTools(server: McpServer): void {
             );
           }
         }
+        let embedding: number[] | null = null;
+        if (content) {
+          try {
+            embedding = await getEmbedding(content);
+          } catch (error) {
+            throw actionable(
+              `embedding generation failed — memory was not edited: ${
+                errorText(error)
+              }`,
+            );
+          }
+        }
         const result = await supabase.rpc("agent_memory_review_tx", {
           p_memory_id: memory_id,
           p_workspace_id: workspace_id,
@@ -1732,8 +1753,12 @@ function registerAgentMemoryTools(server: McpServer): void {
           p_summary: summary ?? null,
           p_visibility: visibility ?? null,
           p_actor_kind: "agent",
+          p_embedding: embedding,
         });
         if (result.error) {
+          if (isOutdatedAgentMemoryReviewSignature(result.error)) {
+            throw actionable(AGENT_MEMORY_WRITEBACK_SCHEMA_OUTDATED_ERROR);
+          }
           throw agentMemoryTransactionalRpcError(
             result.error,
             "agent_memory_review_tx",

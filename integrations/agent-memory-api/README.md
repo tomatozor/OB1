@@ -55,7 +55,7 @@ GENERATED DURING SETUP
 
 Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql).
 
-   **Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist and PostgREST exposes `agent_memory_writeback_batch_tx`, `agent_memory_writeback_tx` with `p_embedding vector(1536)`, `agent_memory_review_tx` with `p_actor_kind`, and `agent_memory_match`.
+   **Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist and PostgREST exposes `agent_memory_writeback_batch_tx`, `agent_memory_writeback_tx` with `p_embedding vector(1536)`, `agent_memory_review_tx` with final `p_embedding vector(1536)`, and `agent_memory_match`.
 
    > [!CAUTION]
    > Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. Existing installations must re-apply the current schema upgrade. The sidecar tables remain isolated from existing thought content.
@@ -198,6 +198,8 @@ Agent write-back accepts only `observed`, `inferred`, or `generated` provenance 
 Lifecycle-changing review actions (`mark_stale`, `merge`, `reject`, `dispute`, and `supersede`) require a reviewer identity and notes. `merge` and `supersede` also require a related memory in the same workspace. These actions update `lifecycle_status`; there is no physical-delete endpoint. Accepted write-backs and every review transition are committed through transactional RPCs: memory metadata, sources, artifacts, review action, relation, and audit either commit together or roll back together. The API fails closed with `503` when those RPCs are not installed.
 
 Outbound calls are bounded: OpenRouter embedding requests time out after 15 seconds and PostgREST requests after 10 seconds. Embeddings are rejected unless they contain exactly 1536 finite numbers. Unexpected server errors return only a generic message and a short correlation id; detailed diagnostics remain in function logs.
+
+`PATCH /memories/:id/review` re-embeds every content edit before invoking the transactional RPC, so content, content hash, and embedding change atomically; summary-only edits do not re-embed.
 
 Query recall calls only the workspace-aware Agent Memory RPC:
 

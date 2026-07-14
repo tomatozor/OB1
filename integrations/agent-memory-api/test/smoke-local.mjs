@@ -272,6 +272,14 @@ class MemoryStore {
             message: `injected batch item failure at index ${index}`,
           });
         }
+        if (
+          !Array.isArray(item.embedding) || item.embedding.length !== 1536 ||
+          item.embedding.some((value) =>
+            typeof value !== "number" || !Number.isFinite(value)
+          )
+        ) {
+          return rollback({ code: "22023", message: "invalid item embedding" });
+        }
         const existing = this.tables.agent_memories.find((memory) =>
           memory.workspace_id === args.p_workspace_id &&
           memory.idempotency_key === item.idempotency_key
@@ -286,14 +294,6 @@ class MemoryStore {
           }
           results.push({ memory: structuredClone(existing), replayed: true });
           continue;
-        }
-        if (
-          !Array.isArray(item.embedding) || item.embedding.length !== 1536 ||
-          item.embedding.some((value) =>
-            typeof value !== "number" || !Number.isFinite(value)
-          )
-        ) {
-          return rollback({ code: "22023", message: "invalid item embedding" });
         }
 
         const now = new Date().toISOString();
@@ -445,7 +445,17 @@ class MemoryStore {
           visibility: args.p_visibility,
         });
       } else if (args.p_action === "edit") {
+        if (args.p_content && !args.p_embedding) {
+          return {
+            data: null,
+            error: {
+              code: "22023",
+              message: "embedding required when editing content",
+            },
+          };
+        }
         if (args.p_content) after.content = args.p_content;
+        if (args.p_content) after.embedding = structuredClone(args.p_embedding);
         if (args.p_summary) after.summary = args.p_summary;
         if (args.p_actor_kind === "agent") {
           Object.assign(after, {
@@ -1176,11 +1186,49 @@ const editedByAgent = await expectStatus(
   },
 );
 assert(
-  "agent edit response signals demotion and actor_kind agent",
+  "agent content edit transmits embedding and signals demotion",
   editedByAgent.memory.review_status === "pending" &&
     editedByAgent.memory.can_use_as_instruction === false &&
     editedByAgent.memory.requires_user_confirmation === true &&
-    store.rpcCalls.at(-1).args.p_actor_kind === "agent",
+    store.rpcCalls.at(-1).args.p_actor_kind === "agent" &&
+    store.rpcCalls.at(-1).args.p_embedding.length === 1536 &&
+    editedByAgent.memory.embedding.length === 1536,
+);
+
+const failedEditCandidate = seedMemory({
+  workspace_id: "review-embedding-failure",
+  content: "Content must remain unchanged after embedding failure.",
+});
+const failedEditRpcCallsBefore = store.rpcCalls.length;
+configureAgentMemoryTestDependencies({
+  getEmbedding: async () => {
+    throw new Error("synthetic review embedding failure");
+  },
+});
+const failedEdit = await expectStatus(
+  "review content embedding failure aborts before RPC",
+  500,
+  `/memories/${failedEditCandidate.id}/review`,
+  {
+    method: "PATCH",
+    body: {
+      workspace_id: "review-embedding-failure",
+      action: "edit",
+      actor_label: "local smoke agent",
+      content: "This edit must never be written.",
+    },
+  },
+);
+configureAgentMemoryTestDependencies({
+  getEmbedding: async () => queryEmbedding(),
+});
+assert(
+  "review embedding failure is generic and performs no write",
+  failedEdit.error === "Internal server error" &&
+    /^[a-f0-9]{10}$/.test(failedEdit.correlation_id) &&
+    store.rpcCalls.length === failedEditRpcCallsBefore &&
+    failedEditCandidate.content ===
+      "Content must remain unchanged after embedding failure.",
 );
 
 const missingReviewRpcCandidate = seedMemory({
@@ -1212,6 +1260,38 @@ assert(
       "agent_memory_review_tx RPC not installed — re-apply schemas/agent-memory (upgrade)" &&
     missingReviewRpcCandidate.review_status === "pending" &&
     missingReviewRpcCandidate.can_use_as_instruction === false,
+);
+
+const outdatedReviewCandidate = seedMemory({
+  workspace_id: "outdated-review-rpc",
+  content: "Pre-embedding review signature content.",
+});
+store.rpcFaults.set("agent_memory_review_tx", {
+  code: "42883",
+  message:
+    "function public.agent_memory_review_tx(p_embedding => vector) does not exist",
+});
+const outdatedReviewRpc = await expectStatus(
+  "review RPC without p_embedding signature requires schema upgrade",
+  503,
+  `/memories/${outdatedReviewCandidate.id}/review`,
+  {
+    method: "PATCH",
+    body: {
+      workspace_id: "outdated-review-rpc",
+      action: "edit",
+      actor_label: "local smoke agent",
+      content: "Re-embedded edit requires the upgraded RPC.",
+    },
+  },
+);
+store.rpcFaults.delete("agent_memory_review_tx");
+assert(
+  "review old signature returns explicit upgrade error without mutation",
+  outdatedReviewRpc.error ===
+      "agent_memory_review_tx RPC not installed — re-apply schemas/agent-memory (upgrade)" &&
+    outdatedReviewCandidate.content ===
+      "Pre-embedding review signature content.",
 );
 
 const promotionCandidate = seedMemory({

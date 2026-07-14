@@ -100,12 +100,17 @@ BEGIN
     RAISE EXCEPTION 'legacy review_tx signature survived upgrade';
   END IF;
   IF to_regprocedure(
+    'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'pre-embedding review_tx signature survived upgrade';
+  END IF;
+  IF to_regprocedure(
     'public.agent_memory_writeback_tx(text,text,text,jsonb,jsonb,jsonb,jsonb,text,jsonb,vector)'
   ) IS NULL
     OR to_regprocedure('public.agent_memory_writeback_batch_tx(text,jsonb,text,jsonb)') IS NULL
     OR to_regprocedure('public.agent_memory_match(text,vector,integer,double precision)') IS NULL
     OR to_regprocedure(
-      'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text)'
+      'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text,vector)'
     ) IS NULL THEN
     RAISE EXCEPTION 'one or more current Agent Memory RPC signatures are missing';
   END IF;
@@ -113,6 +118,6 @@ BEGIN
   RAISE NOTICE 'PASS origin/main upgrade revokes DELETE on 8 tables';
   RAISE NOTICE 'PASS origin/main upgrade enforces NOT NULL and workspace idempotency';
   RAISE NOTICE 'PASS origin/main upgrade preserves legacy parent and child data';
-  RAISE NOTICE 'PASS upgrade adds embedding and replaces both legacy RPC overloads';
+  RAISE NOTICE 'PASS upgrade adds embedding and replaces legacy RPC overloads';
 END
 $upgrade$;

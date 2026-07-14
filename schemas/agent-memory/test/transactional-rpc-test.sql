@@ -8,7 +8,7 @@ BEGIN
     'public.agent_memory_writeback_tx(text,text,text,jsonb,jsonb,jsonb,jsonb,text,jsonb,vector)',
     'public.agent_memory_writeback_batch_tx(text,jsonb,text,jsonb)',
     'public.agent_memory_match(text,vector,integer,double precision)',
-    'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text)'
+    'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text,vector)'
   ] LOOP
     IF NOT has_function_privilege('service_role', v_signature, 'EXECUTE') THEN
       RAISE EXCEPTION 'service_role lacks EXECUTE on %', v_signature;
@@ -26,6 +26,11 @@ BEGIN
     'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text)'
   ) IS NOT NULL THEN
     RAISE EXCEPTION 'legacy review_tx overload still exists';
+  END IF;
+  IF to_regprocedure(
+    'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'pre-embedding review_tx overload still exists';
   END IF;
   RAISE NOTICE 'PASS governance RPC grants are service_role-only and old overloads are absent';
 END
@@ -162,6 +167,8 @@ DECLARE
   v_refs_before BIGINT;
   v_artifacts_before BIGINT;
   v_audits_before BIGINT;
+  v_replay_id UUID;
+  v_stored_embedding vector(1536);
 BEGIN
   SELECT count(*) INTO v_memories_before FROM public.agent_memories;
   SELECT count(*) INTO v_refs_before FROM public.agent_memory_source_refs;
@@ -240,31 +247,52 @@ BEGIN
     RAISE EXCEPTION 'missing-embedding batch persisted partial rows';
   END IF;
 
-  v_result := public.agent_memory_writeback_batch_tx(
-    'rpc-workspace',
-    jsonb_build_array(
-      jsonb_build_object(
+  SELECT id, embedding INTO v_replay_id, v_stored_embedding
+  FROM public.agent_memories
+  WHERE workspace_id = 'rpc-workspace' AND idempotency_key = 'rpc-write:1';
+
+  BEGIN
+    PERFORM public.agent_memory_writeback_batch_tx(
+      'rpc-workspace',
+      jsonb_build_array(jsonb_build_object(
         'idempotency_key', 'rpc-write:1',
         'content_hash', repeat('1', 64),
         'memory', jsonb_build_object('memory_type', 'lesson', 'summary', 'Replay', 'content', 'Replay'),
         'provenance', jsonb_build_object('provenance_status', 'generated')
-      ),
-      jsonb_build_object(
-        'idempotency_key', 'rpc-batch-success:1',
-        'content_hash', repeat('9', 64),
-        'memory', jsonb_build_object('memory_type', 'lesson', 'summary', 'Batch success', 'content', 'Embedded batch item'),
-        'provenance', jsonb_build_object('provenance_status', 'generated'),
-        'embedding', v_embedding
-      )
-    )
-  );
-  IF (v_result->>'count')::INT <> 2
-    OR NOT (v_result->'items'->0->>'replayed')::BOOLEAN
-    OR (v_result->'items'->1->>'replayed')::BOOLEAN THEN
-    RAISE EXCEPTION 'batch replay did not use the existing embedding: %', v_result;
+      ))
+    );
+    RAISE EXCEPTION 'expected replay without embedding failure' USING ERRCODE = 'ZX009';
+  EXCEPTION
+    WHEN invalid_parameter_value THEN
+      IF SQLERRM NOT LIKE 'embedding required — batch item 1%' THEN RAISE; END IF;
+  END;
+
+  IF (SELECT count(*) FROM public.agent_memories) <> v_memories_before
+    OR (SELECT count(*) FROM public.agent_memory_source_refs) <> v_refs_before
+    OR (SELECT count(*) FROM public.agent_memory_artifacts) <> v_artifacts_before
+    OR (SELECT count(*) FROM public.agent_memory_audit_events) <> v_audits_before THEN
+    RAISE EXCEPTION 'replay without embedding changed batch counters';
   END IF;
 
-  RAISE NOTICE 'PASS batch rollback and replay-with-existing-embedding semantics';
+  v_result := public.agent_memory_writeback_batch_tx(
+    'rpc-workspace',
+    jsonb_build_array(jsonb_build_object(
+      'idempotency_key', 'rpc-write:1',
+      'content_hash', repeat('1', 64),
+      'memory', jsonb_build_object('memory_type', 'lesson', 'summary', 'Replay', 'content', 'Replay'),
+      'provenance', jsonb_build_object('provenance_status', 'generated'),
+      'embedding', v_embedding
+    ))
+  );
+  IF (v_result->>'count')::INT <> 1
+    OR NOT (v_result->'items'->0->>'replayed')::BOOLEAN
+    OR (v_result->'items'->0->>'id')::UUID <> v_replay_id
+    OR (SELECT embedding FROM public.agent_memories WHERE id = v_replay_id)
+      IS DISTINCT FROM v_stored_embedding THEN
+    RAISE EXCEPTION 'validated batch replay did not preserve the stored embedding: %', v_result;
+  END IF;
+
+  RAISE NOTICE 'PASS batch rollback and strict replay embedding semantics';
 END
 $batch$;
 
@@ -273,11 +301,17 @@ DECLARE
   v_embedding vector(1536) := (
     '[' || array_to_string(array_fill('0.03'::TEXT, ARRAY[1536]), ',') || ']'
   )::vector(1536);
+  v_edit_embedding vector(1536) := (
+    '[1,' || array_to_string(array_fill('0'::TEXT, ARRAY[1535]), ',') || ']'
+  )::vector(1536);
   v_memory_id UUID;
   v_related_id UUID;
   v_scope_id UUID;
   v_result JSONB;
   v_count INT;
+  v_before JSONB;
+  v_reviews_before BIGINT;
+  v_audits_before BIGINT;
 BEGIN
   SELECT id INTO v_memory_id
   FROM public.agent_memories
@@ -309,6 +343,32 @@ BEGIN
     WHEN invalid_parameter_value THEN
       IF SQLERRM <> 'action confirm requires actor_kind human' THEN RAISE; END IF;
   END;
+
+  SELECT to_jsonb(memory_row) INTO v_before
+  FROM public.agent_memories AS memory_row
+  WHERE id = v_memory_id;
+  SELECT count(*) INTO v_reviews_before FROM public.agent_memory_review_actions;
+  SELECT count(*) INTO v_audits_before FROM public.agent_memory_audit_events;
+
+  BEGIN
+    PERFORM public.agent_memory_review_tx(
+      v_memory_id,
+      'rpc-workspace',
+      'edit',
+      'editor-agent',
+      p_content => 'Agent-edited content requires a fresh human review.'
+    );
+    RAISE EXCEPTION 'expected content edit without embedding failure' USING ERRCODE = 'ZX010';
+  EXCEPTION
+    WHEN invalid_parameter_value THEN
+      IF SQLERRM <> 'embedding required when editing content' THEN RAISE; END IF;
+  END;
+  IF (SELECT to_jsonb(memory_row) FROM public.agent_memories AS memory_row WHERE id = v_memory_id)
+      IS DISTINCT FROM v_before
+    OR (SELECT count(*) FROM public.agent_memory_review_actions) <> v_reviews_before
+    OR (SELECT count(*) FROM public.agent_memory_audit_events) <> v_audits_before THEN
+    RAISE EXCEPTION 'content edit without embedding changed memory or audit state';
+  END IF;
 
   v_result := public.agent_memory_review_tx(
     v_memory_id,
@@ -344,13 +404,32 @@ BEGIN
     'rpc-workspace',
     'edit',
     'editor-agent',
-    p_content => 'Agent-edited content requires a fresh human review.'
+    p_content => 'Agent-edited content requires a fresh human review.',
+    p_embedding => v_edit_embedding
   );
   IF v_result->'memory'->>'review_status' <> 'pending'
     OR (v_result->'memory'->>'can_use_as_instruction')::BOOLEAN
     OR NOT (v_result->'memory'->>'can_use_as_evidence')::BOOLEAN
     OR NOT (v_result->'memory'->>'requires_user_confirmation')::BOOLEAN THEN
     RAISE EXCEPTION 'agent edit did not reset confirmed memory to pending evidence: %', v_result;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.agent_memories
+    WHERE id = v_memory_id
+      AND content = 'Agent-edited content requires a fresh human review.'
+      AND content_hash = public.agent_memory_hash_text(
+        'decision:Agent-edited content requires a fresh human review.'
+      )
+      AND embedding = v_edit_embedding
+  ) THEN
+    RAISE EXCEPTION 'content, content_hash, and embedding were not updated atomically';
+  END IF;
+  SELECT count(*) INTO v_count
+  FROM public.agent_memory_match('rpc-workspace', v_edit_embedding, 10, 0.99)
+  WHERE memory_id = v_memory_id;
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'edited content embedding was not recallable through agent_memory_match';
   END IF;
   IF NOT EXISTS (
     SELECT 1
@@ -429,7 +508,7 @@ BEGIN
     RAISE EXCEPTION 'merge relation was not written';
   END IF;
 
-  RAISE NOTICE 'PASS reviewer authority, edit downgrade, equal scope, widening rejection, and merge';
+  RAISE NOTICE 'PASS reviewer authority, atomic re-embedding edit recall, scope, and merge';
 END
 $review$;
 

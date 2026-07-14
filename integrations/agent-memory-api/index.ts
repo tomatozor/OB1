@@ -703,7 +703,13 @@ function transactionalRpcError(
 ) {
   const message = error.message ?? "";
   const normalized = message.toLowerCase();
-  if (error.code === "PGRST202") {
+  const outdatedReviewSignature = operation === "review" &&
+    normalized.includes("agent_memory_review_tx") &&
+    normalized.includes("p_embedding") &&
+    (normalized.includes("does not exist") ||
+      normalized.includes("could not find") ||
+      normalized.includes("schema cache"));
+  if (error.code === "PGRST202" || outdatedReviewSignature) {
     return c.json(
       {
         error: operation === "writeback"
@@ -1405,6 +1411,10 @@ app.patch("/memories/:id/review", async (c) => {
     }
   }
 
+  const embedding = req.content
+    ? await getEmbeddingWithRetry(req.content)
+    : null;
+
   const { data, error } = await supabase.rpc("agent_memory_review_tx", {
     p_memory_id: id,
     p_workspace_id: req.workspace_id,
@@ -1416,6 +1426,7 @@ app.patch("/memories/:id/review", async (c) => {
     p_summary: req.summary ?? null,
     p_visibility: req.visibility ?? null,
     p_actor_kind: reviewer ? "human" : "agent",
+    p_embedding: embedding,
   });
   if (error) return transactionalRpcError(c, "review", error);
   const result = rpcMemoryResult(data);

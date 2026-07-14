@@ -729,6 +729,32 @@ BEGIN
         USING ERRCODE = '22023';
     END IF;
 
+    -- Every batch item must prove semantic recallability before replay lookup.
+    -- On a valid replay, the persisted embedding remains authoritative.
+    IF jsonb_typeof(v_item->'embedding') IS DISTINCT FROM 'array' THEN
+      RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+        v_item_number USING ERRCODE = '22023';
+    END IF;
+    IF jsonb_array_length(v_item->'embedding') <> 1536 THEN
+      RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+        v_item_number USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(v_item->'embedding') AS dimension(value)
+      WHERE jsonb_typeof(dimension.value) IS DISTINCT FROM 'number'
+    ) THEN
+      RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+        v_item_number USING ERRCODE = '22023';
+    END IF;
+    BEGIN
+      v_embedding := (v_item->'embedding')::TEXT::vector(1536);
+    EXCEPTION
+      WHEN OTHERS THEN
+        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+          v_item_number USING ERRCODE = '22023';
+    END;
+
     PERFORM pg_advisory_xact_lock(
       hashtextextended(v_workspace_id || E'\x1f' || v_idempotency_key, 0)
     );
@@ -749,33 +775,8 @@ BEGIN
           'embedding required — batch replay item % has no existing semantic embedding',
           v_item_number USING ERRCODE = '22023';
       END IF;
-      -- A replay is governed by the already persisted embedding, even when the
-      -- caller omitted or supplied a malformed embedding in this batch item.
+      -- A validated replay is governed by the already persisted embedding.
       v_embedding := v_existing.embedding;
-    ELSE
-      IF jsonb_typeof(v_item->'embedding') IS DISTINCT FROM 'array' THEN
-        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
-          v_item_number USING ERRCODE = '22023';
-      END IF;
-      IF jsonb_array_length(v_item->'embedding') <> 1536 THEN
-        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
-          v_item_number USING ERRCODE = '22023';
-      END IF;
-      IF EXISTS (
-        SELECT 1
-        FROM jsonb_array_elements(v_item->'embedding') AS dimension(value)
-        WHERE jsonb_typeof(dimension.value) IS DISTINCT FROM 'number'
-      ) THEN
-        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
-          v_item_number USING ERRCODE = '22023';
-      END IF;
-      BEGIN
-        v_embedding := (v_item->'embedding')::TEXT::vector(1536);
-      EXCEPTION
-        WHEN OTHERS THEN
-          RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
-            v_item_number USING ERRCODE = '22023';
-      END;
     END IF;
 
     v_result := public.agent_memory_writeback_tx(
@@ -797,10 +798,13 @@ BEGIN
 END;
 $agent_memory_writeback_batch_tx$;
 
--- Remove the pre-authority overload transactionally before installing the
--- actor-kind signature, avoiding ambiguous default-argument resolution.
+-- Remove the pre-authority and pre-embedding overloads transactionally before
+-- installing the current signature, avoiding ambiguous default resolution.
 DROP FUNCTION IF EXISTS public.agent_memory_review_tx(
   UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
+);
+DROP FUNCTION IF EXISTS public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
 );
 
 CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
@@ -813,7 +817,8 @@ CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
   p_content TEXT DEFAULT NULL,
   p_summary TEXT DEFAULT NULL,
   p_visibility TEXT DEFAULT NULL,
-  p_actor_kind TEXT DEFAULT 'agent'
+  p_actor_kind TEXT DEFAULT 'agent',
+  p_embedding vector(1536) DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -855,6 +860,10 @@ BEGIN
   END IF;
   IF v_action IN ('confirm', 'merge', 'supersede') AND v_actor_kind <> 'human' THEN
     RAISE EXCEPTION 'action % requires actor_kind human', v_action
+      USING ERRCODE = '22023';
+  END IF;
+  IF p_content IS NOT NULL AND p_embedding IS NULL THEN
+    RAISE EXCEPTION 'embedding required when editing content'
       USING ERRCODE = '22023';
   END IF;
 
@@ -989,6 +998,8 @@ BEGIN
         THEN btrim(p_summary) ELSE summary END,
       content_hash = CASE WHEN v_action = 'edit' AND nullif(btrim(p_content), '') IS NOT NULL
         THEN public.agent_memory_hash_text(memory_type || ':' || btrim(p_content)) ELSE content_hash END,
+      embedding = CASE WHEN v_action = 'edit' AND nullif(btrim(p_content), '') IS NOT NULL
+        THEN p_embedding ELSE embedding END,
       visibility = CASE WHEN v_action = 'restrict_scope' THEN v_visibility ELSE visibility END
   WHERE id = p_memory_id
     AND workspace_id = v_workspace_id
@@ -1142,10 +1153,10 @@ REVOKE ALL ON FUNCTION public.agent_memory_match(
   TEXT, vector, INT, DOUBLE PRECISION
 ) FROM authenticated;
 REVOKE ALL ON FUNCTION public.agent_memory_review_tx(
-  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, vector
 ) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.agent_memory_review_tx(
-  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, vector
 ) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.agent_memory_writeback_tx(
   TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB, vector
@@ -1157,7 +1168,7 @@ GRANT EXECUTE ON FUNCTION public.agent_memory_match(
   TEXT, vector, INT, DOUBLE PRECISION
 ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.agent_memory_review_tx(
-  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, vector
 ) TO service_role;
 
 NOTIFY pgrst, 'reload schema';
