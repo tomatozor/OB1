@@ -52,6 +52,7 @@ node recipes/retrieval-eval-harness/run-eval.mjs \
   --modes semantic,text,hybrid,hybrid-local \
   --k 10 --threshold 0.3 \
   --semantic-weight 1.0 --text-weight 2.0 \
+  --recency-half-life-days 30 \
   --out /tmp/ob1-retrieval-report.json
 ```
 
@@ -59,13 +60,15 @@ node recipes/retrieval-eval-harness/run-eval.mjs \
 
 All network calls have bounded timeouts: 15 seconds for embeddings and 10 seconds for PostgREST RPCs. When `--out` writes outside `$HOME` or outside a path containing `.planning`, the runner warns: `le rapport peut contenir des données personnelles — ne pas committer`. The warning does not block report generation.
 
-`semantic` calls `match_thoughts`; `text` calls `search_thoughts_text`; `hybrid` calls `hybrid_search_thoughts`. The hybrid call sends `p_semantic_weight` and `p_text_weight` in addition to the deployed `schemas/hybrid-recall` parameters. If the installed RPC has the legacy signature, the harness retries without the two weights; when `--threshold` was explicitly supplied, it can then retry once more without `p_semantic_threshold` for the older threshold-less signature. If the optional RPC returns HTTP 404, the mode is explicitly skipped rather than counted as a failed quality result. `hybrid-local` makes a semantic and text request with depth 60 and applies the same weighted RRF (`k=60`) in the client.
+`semantic` calls `match_thoughts`; `text` calls `search_thoughts_text`; `hybrid` calls `hybrid_search_thoughts`. The hybrid call sends `p_semantic_weight` and `p_text_weight` in addition to the deployed `schemas/hybrid-recall` parameters. When `--recency-half-life-days` is supplied, it also sends `p_recency_half_life_days`; a previous ten-parameter RPC is retried without recency while preserving the threshold and weights. Older signatures are then retried without weights and, when `--threshold` was explicitly supplied, without `p_semantic_threshold`. If the optional RPC returns HTTP 404, the mode is explicitly skipped rather than counted as a failed quality result. `hybrid-local` makes a semantic and text request with depth 60 and applies the same weighted RRF (`k=60`) and optional exponential recency decay in the client. With recency enabled, every fused candidate must expose a valid `created_at` in at least one retrieval leg or that query fails closed.
 
 ## Lexical-priority methodology and out-of-sample warning
 
 The defaults are `--semantic-weight 1.0 --text-weight 2.0`. They are **baseline-derived from 21 real cases measured on 2026-07-14**. Unweighted hybrid retrieval measured `hit@10=0.6667` and `MRR=0.4512`; the 2:1 lexical-priority simulation preserved `hit@10=0.6667` and estimated `MRR≈0.533`. On that same corpus, text-only MRR was `0.505` and semantic-only MRR was `0.218`.
 
 This is in-sample tuning. Revalidate the weighting on a separate, untouched golden set before using it as evidence of general improvement. Record the weights with every comparison; the console table and JSON report both expose the effective values. Both CLI weights must be finite and strictly greater than zero.
+
+Recency is separate from the baseline-derived lexical weights. Its default is disabled, and the harness assumes no tuned half-life. `--recency-half-life-days <n>` requires a finite positive number and multiplies each RRF contribution by `exp(-ln(2) * age_days / n)`. The console header and JSON report record either the supplied half-life or `disabled`/`null`.
 
 Before the timed evaluation, the runner precomputes every unique query embedding in an unmeasured warmup phase. Embedding time therefore cannot be assigned to whichever mode happens to run first; reported latency measures only retrieval RPC calls and their network time. The runner reports this warmup explicitly.
 

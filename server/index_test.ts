@@ -12,6 +12,7 @@ const {
   isMissingDatabaseObjectError,
   isMissingEnhancedThoughtsError,
   isMissingHybridRpcError,
+  isHybridRecencySignatureError,
   isHybridThresholdSignatureError,
   isHybridWeightSignatureError,
   parseAllowedOrigins,
@@ -84,6 +85,40 @@ Deno.test("RRF weights must be finite and strictly positive", () => {
       );
     }
     assert(rejected, `invalid weight was accepted: ${String(invalid)}`);
+  }
+});
+
+Deno.test("RRF recency half-life promotes recent rows and is disabled by default", () => {
+  const old = {
+    ...thought("old"),
+    created_at: new Date(Date.now() - 90 * 86_400_000).toISOString(),
+  };
+  const recent = {
+    ...thought("recent"),
+    created_at: new Date(Date.now() - 86_400_000).toISOString(),
+  };
+  const semantic = [old, recent];
+  const text = [old, recent];
+
+  assert(
+    fuseRrf(semantic, text)[0].id === "old",
+    "disabled recency changed the prior RRF order",
+  );
+  assert(
+    fuseRrf(semantic, text, 60, 1, 2, 7)[0].id === "recent",
+    "7-day half-life did not promote the recent row",
+  );
+
+  for (const invalid of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    let rejected = false;
+    try {
+      validateRrfWeight("recency_half_life_days", invalid);
+    } catch (error) {
+      rejected = String(error).includes(
+        "Invalid recency_half_life_days: expected a finite number > 0",
+      );
+    }
+    assert(rejected, `invalid recency half-life was accepted: ${invalid}`);
   }
 });
 
@@ -453,6 +488,21 @@ Deno.test("base-schema and threshold-signature errors are narrowly classified", 
       message: "Could not find hybrid_search_thoughts(p_query)",
     }),
     "missing hybrid RPC was misclassified as a weight mismatch",
+  );
+  assert(
+    isHybridRecencySignatureError({
+      code: "PGRST202",
+      message:
+        "Could not find hybrid_search_thoughts(p_query, p_recency_half_life_days) in the schema cache",
+    }),
+    "recency signature mismatch was not detected",
+  );
+  assert(
+    !isHybridRecencySignatureError({
+      code: "PGRST202",
+      message: "Could not find hybrid_search_thoughts(p_query)",
+    }),
+    "missing hybrid RPC was misclassified as a recency mismatch",
   );
   assert(
     isHybridThresholdSignatureError({

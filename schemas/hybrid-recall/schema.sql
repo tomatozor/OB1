@@ -270,6 +270,13 @@ DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(
   TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION
 );
 
+-- Replacing the ten-argument overload adds the optional recency contract. This
+-- drop and the replacement below commit atomically with the whole migration.
+DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(
+  TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION,
+  DOUBLE PRECISION, DOUBLE PRECISION
+);
+
 CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
   p_query TEXT,
   p_query_embedding vector(1536),
@@ -280,7 +287,8 @@ CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
   p_rrf_k INT DEFAULT 60,
   p_semantic_threshold DOUBLE PRECISION DEFAULT NULL,
   p_semantic_weight DOUBLE PRECISION DEFAULT 1.0,
-  p_text_weight DOUBLE PRECISION DEFAULT 2.0
+  p_text_weight DOUBLE PRECISION DEFAULT 2.0,
+  p_recency_half_life_days DOUBLE PRECISION DEFAULT NULL
 )
 RETURNS TABLE (
   id UUID,
@@ -312,6 +320,15 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  IF p_recency_half_life_days IS NOT NULL AND
+     NOT (
+       p_recency_half_life_days > 0.0 AND
+       p_recency_half_life_days < 'Infinity'::DOUBLE PRECISION
+     ) THEN
+    RAISE EXCEPTION 'p_recency_half_life_days must be finite and > 0 when provided'
+      USING ERRCODE = '22023';
+  END IF;
+
   RETURN QUERY
   WITH parameters AS (
     SELECT
@@ -320,6 +337,7 @@ BEGIN
       greatest(1, coalesce(p_rrf_k, 60)) AS rrf_k,
       p_semantic_weight AS semantic_weight,
       p_text_weight AS text_weight,
+      p_recency_half_life_days AS recency_half_life_days,
       least(
         5000,
         greatest(
@@ -329,7 +347,13 @@ BEGIN
         )
       ) AS candidate_limit,
       coalesce(p_filter, '{}'::jsonb) AS filter_value,
-      websearch_to_tsquery('simple', btrim(coalesce(p_query, ''))) AS text_query
+      -- Jambe texte = instrument de PRÉCISION (config 'simple', AND).
+      -- Évalués et REJETÉS par mesure hors échantillon le 2026-07-14 :
+      -- (a) étage OR français (bruit : hit@10 0,864→0,273, latence ×7) ;
+      -- (b) jambe AND française (0,864→0,818 sans gain mesuré — le stemming
+      -- n'apparaît dans aucun golden). Le rappel conversationnel est le rôle
+      -- de la jambe sémantique.
+      websearch_to_tsquery('simple', btrim(coalesce(p_query, ''))) AS simple_text_query
   ),
   semantic_candidates AS (
     SELECT
@@ -370,7 +394,7 @@ BEGIN
       LIMIT (SELECT candidate_limit FROM parameters)
     ) AS candidate
   ),
-  text_candidates AS (
+  simple_text_candidates AS (
     SELECT
       candidate.id,
       row_number() OVER (
@@ -380,11 +404,12 @@ BEGIN
       SELECT
         t.id,
         t.created_at,
-        ts_rank(to_tsvector('simple', coalesce(t.content, '')), p.text_query) AS fts_rank
+        ts_rank(to_tsvector('simple', coalesce(t.content, '')), p.simple_text_query) AS fts_rank
       FROM public.thoughts t
       CROSS JOIN parameters p
       WHERE btrim(coalesce(p_query, '')) <> ''
-        AND to_tsvector('simple', coalesce(t.content, '')) @@ p.text_query
+        AND numnode(p.simple_text_query) > 0
+        AND to_tsvector('simple', coalesce(t.content, '')) @@ p.simple_text_query
         AND (p_include_restricted OR t.sensitivity_tier IS DISTINCT FROM 'restricted')
         AND lower(coalesce(t.metadata->>'deleted', 'false')) <> 'true'
         AND (NOT (p.filter_value ? 'type') OR t.type = p.filter_value->>'type')
@@ -405,6 +430,9 @@ BEGIN
       LIMIT (SELECT candidate_limit FROM parameters)
     ) AS candidate
   ),
+  text_candidates AS (
+    SELECT * FROM simple_text_candidates
+  ),
   fused AS (
     SELECT semantic_candidates.id FROM semantic_candidates
     UNION
@@ -418,16 +446,32 @@ BEGIN
       t.created_at,
       t.type,
       t.importance,
-      (
-        CASE
-          WHEN semantic.semantic_rank IS NULL THEN 0.0
-          ELSE p.semantic_weight / (p.rrf_k + semantic.semantic_rank)
-        END
-        + CASE
-          WHEN lexical.text_rank IS NULL THEN 0.0
-          ELSE p.text_weight / (p.rrf_k + lexical.text_rank)
-        END
-      )::DOUBLE PRECISION AS rrf_score,
+      CASE
+        WHEN p.recency_half_life_days IS NULL THEN (
+          CASE
+            WHEN semantic.semantic_rank IS NULL THEN 0.0
+            ELSE p.semantic_weight / (p.rrf_k + semantic.semantic_rank)
+          END
+          + CASE
+            WHEN lexical.text_rank IS NULL THEN 0.0
+            ELSE p.text_weight / (p.rrf_k + lexical.text_rank)
+          END
+        )::DOUBLE PRECISION
+        ELSE (
+          CASE
+            WHEN semantic.semantic_rank IS NULL THEN 0.0
+            ELSE p.semantic_weight / (p.rrf_k + semantic.semantic_rank)
+          END
+          + CASE
+            WHEN lexical.text_rank IS NULL THEN 0.0
+            ELSE p.text_weight / (p.rrf_k + lexical.text_rank)
+          END
+        ) * exp(
+          -ln(2.0) *
+          (extract(epoch FROM (now() - t.created_at)) / 86400.0) /
+          p.recency_half_life_days
+        )
+      END::DOUBLE PRECISION AS rrf_score,
       semantic.semantic_rank,
       lexical.text_rank
     FROM fused
@@ -453,8 +497,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION)
+REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION)
   TO authenticated, service_role;
 
 -- ============================================================

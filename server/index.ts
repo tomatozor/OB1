@@ -154,6 +154,7 @@ type HybridSearchInput = {
   includeRestricted: boolean;
   semanticWeight?: number;
   textWeight?: number;
+  recencyHalfLifeDays?: number;
 };
 
 type HybridSearchDependencies = {
@@ -547,6 +548,14 @@ export function isHybridWeightSignatureError(error: unknown): boolean {
       text.includes("schema cache"));
 }
 
+export function isHybridRecencySignatureError(error: unknown): boolean {
+  const text = errorText(error).toLowerCase();
+  return text.includes("hybrid_search_thoughts") &&
+    text.includes("p_recency_half_life_days") &&
+    (text.includes("does not exist") || text.includes("could not find") ||
+      text.includes("schema cache"));
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -702,12 +711,17 @@ export function fuseRrf(
   k = RRF_K,
   semanticWeight = DEFAULT_SEMANTIC_WEIGHT,
   textWeight = DEFAULT_TEXT_WEIGHT,
+  recencyHalfLifeDays?: number,
 ): ThoughtRecord[] {
   const validatedSemanticWeight = validateRrfWeight(
     "semantic_weight",
     semanticWeight,
   );
   const validatedTextWeight = validateRrfWeight("text_weight", textWeight);
+  const validatedRecencyHalfLife = recencyHalfLifeDays === undefined
+    ? undefined
+    : validateRrfWeight("recency_half_life_days", recencyHalfLifeDays);
+  const scoringTime = Date.now();
   const fused = new Map<string, { row: ThoughtRecord; score: number }>();
   for (
     const [rows, weight] of [
@@ -717,7 +731,20 @@ export function fuseRrf(
   ) {
     rows.forEach((row, index) => {
       const current = fused.get(row.id);
-      const contribution = weight / (k + index + 1);
+      let recencyMultiplier = 1;
+      if (validatedRecencyHalfLife !== undefined) {
+        const createdAt = Date.parse(row.created_at);
+        if (!Number.isFinite(createdAt)) {
+          throw new Error(
+            `Cannot apply recency weighting: thought ${row.id} has an invalid created_at`,
+          );
+        }
+        const ageDays = (scoringTime - createdAt) / 86_400_000;
+        recencyMultiplier = Math.exp(
+          -Math.LN2 * ageDays / validatedRecencyHalfLife,
+        );
+      }
+      const contribution = recencyMultiplier * weight / (k + index + 1);
       if (current) {
         current.score += contribution;
         current.row = { ...current.row, ...row };
@@ -761,6 +788,7 @@ export async function retrieveHybrid(
       RRF_K,
       input.semanticWeight ?? DEFAULT_SEMANTIC_WEIGHT,
       input.textWeight ?? DEFAULT_TEXT_WEIGHT,
+      input.recencyHalfLifeDays,
     ).slice(
       input.offset,
       input.offset + input.limit,
@@ -889,11 +917,27 @@ async function callHybridSearchRpc(
     ...basePayload,
     p_semantic_threshold: threshold,
   };
-  const weightedResult = await supabase.rpc("hybrid_search_thoughts", {
+  const weightedPayload = {
     ...thresholdPayload,
     p_semantic_weight: input.semanticWeight ?? DEFAULT_SEMANTIC_WEIGHT,
     p_text_weight: input.textWeight ?? DEFAULT_TEXT_WEIGHT,
-  });
+  };
+  let weightedResult = input.recencyHalfLifeDays === undefined
+    ? await supabase.rpc("hybrid_search_thoughts", weightedPayload)
+    : await supabase.rpc("hybrid_search_thoughts", {
+      ...weightedPayload,
+      p_recency_half_life_days: input.recencyHalfLifeDays,
+    });
+
+  if (
+    input.recencyHalfLifeDays !== undefined && weightedResult.error &&
+    isHybridRecencySignatureError(weightedResult.error)
+  ) {
+    weightedResult = await supabase.rpc(
+      "hybrid_search_thoughts",
+      weightedPayload,
+    );
+  }
   if (
     !weightedResult.error ||
     !isHybridWeightSignatureError(weightedResult.error)
@@ -981,6 +1025,7 @@ async function runSearch(params: {
   threshold: number;
   semanticWeight: number;
   textWeight: number;
+  recencyHalfLifeDays?: number;
   filters: SearchFilters;
 }): Promise<JsonObject> {
   const pageSize = params.limit + 1;
@@ -1019,6 +1064,7 @@ async function runSearch(params: {
           includeRestricted: params.filters.include_restricted,
           semanticWeight: params.semanticWeight,
           textWeight: params.textWeight,
+          recencyHalfLifeDays: params.recencyHalfLifeDays,
         },
         {
           primary: async (input) =>
@@ -1978,6 +2024,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
         threshold: z.number().min(0).max(1).default(0.5).optional(),
         semantic_weight: z.number().default(DEFAULT_SEMANTIC_WEIGHT).optional(),
         text_weight: z.number().default(DEFAULT_TEXT_WEIGHT).optional(),
+        recency_half_life_days: z.number().optional(),
       },
     },
     async ({
@@ -1994,6 +2041,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
       threshold = 0.5,
       semantic_weight = DEFAULT_SEMANTIC_WEIGHT,
       text_weight = DEFAULT_TEXT_WEIGHT,
+      recency_half_life_days,
     }) => {
       logRecallInvocation(recallContext, "search_thoughts");
       try {
@@ -2007,6 +2055,12 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
           "text_weight",
           text_weight,
         );
+        const normalizedRecencyHalfLife = recency_half_life_days === undefined
+          ? undefined
+          : validateRrfWeight(
+            "recency_half_life_days",
+            recency_half_life_days,
+          );
         return toolJson(
           await runSearch({
             query,
@@ -2016,6 +2070,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
             threshold,
             semanticWeight: normalizedSemanticWeight,
             textWeight: normalizedTextWeight,
+            recencyHalfLifeDays: normalizedRecencyHalfLife,
             filters: {
               type,
               source_type,

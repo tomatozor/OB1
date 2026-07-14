@@ -85,7 +85,7 @@ END;
 $$;
 
 -- Minimal reproduction of the superseded install state. The current migration
--- must replace the eight-argument RPC and extend this audit table atomically.
+-- must replace the ten-argument RPC and extend this audit table atomically.
 CREATE TABLE public.thought_audit (
   id BIGSERIAL PRIMARY KEY,
   thought_id UUID NOT NULL,
@@ -102,7 +102,9 @@ CREATE FUNCTION public.hybrid_search_thoughts(
   p_filter JSONB,
   p_include_restricted BOOLEAN,
   p_rrf_k INT,
-  p_semantic_threshold DOUBLE PRECISION
+  p_semantic_threshold DOUBLE PRECISION,
+  p_semantic_weight DOUBLE PRECISION,
+  p_text_weight DOUBLE PRECISION
 )
 RETURNS SETOF UUID
 LANGUAGE sql
@@ -110,7 +112,7 @@ STABLE
 AS $$ SELECT NULL::UUID WHERE false $$;
 SQL
 
-echo "==> Seeded upgrade state: legacy 8-argument hybrid RPC and audit table"
+echo "==> Seeded upgrade state: legacy 10-argument hybrid RPC and audit table"
 
 echo "==> Applying schema.sql (pass 1)"
 psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${SCHEMA_FILE}"

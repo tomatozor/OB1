@@ -163,15 +163,20 @@ flag, or usage claim.
   `created_at`) when `search_thoughts_text` or enhanced thought columns are not
   installed; semantic retrieval remains available and enrichment is
   opportunistic.
-- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.5, semantic_weight=1.0, text_weight=2.0)`
+- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.5, semantic_weight=1.0, text_weight=2.0, recency_half_life_days?)`
   provides filtered retrieval. Hybrid mode calls `hybrid_search_thoughts` first,
   then uses weighted semantic/text RRF (`k=60`) only when that RPC is absent. The caller's
   `threshold` is sent to the hybrid RPC as `p_semantic_threshold` and applies
   to the semantic fallback leg. `semantic_weight` and `text_weight` are sent as
   `p_semantic_weight` and `p_text_weight` and are applied identically by the
-  local fallback; both must be finite and greater than zero. A server with the
-  legacy eight-parameter hybrid signature is retried without the two weights;
-  the older threshold-less signature remains a final compatibility retry.
+  local fallback; both must be finite and greater than zero.
+  `recency_half_life_days`, when present, must also be finite and greater than
+  zero and is sent as `p_recency_half_life_days`. Each local RRF contribution is
+  multiplied by the same exponential age decay used by SQL. Recency is optional
+  and disabled by default; no baseline-derived half-life is assumed. A database
+  with the previous ten-parameter signature is retried without recency, while
+  preserving threshold and weights; older weight-less and threshold-less
+  signatures retain their compatibility retries.
   Dates must be parseable by `Date.parse`.
   Pagination includes `has_more` when a page-plus-one read can determine it.
 - `recall_context(scope_topics?, scope_people?, days=30, limit=12, min_importance=0, include_restricted=false)`
@@ -211,6 +216,10 @@ These defaults are baseline-derived and in-sample. They must be revalidated on a
 score = semantic_weight * Σ 1/(k + semantic_rank)
       + text_weight     * Σ 1/(k + text_rank)
 ```
+
+With `recency_half_life_days`, each contribution above is multiplied by
+`exp(-ln(2) * age_days / recency_half_life_days)`. Omitting the option leaves
+the prior formula unchanged.
 
 ## Agent Memory
 

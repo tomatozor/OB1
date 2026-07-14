@@ -14,8 +14,13 @@ BEGIN
   END IF;
   IF to_regprocedure(
     'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'superseded ten-argument hybrid_search_thoughts still exists';
+  END IF;
+  IF to_regprocedure(
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision,double precision)'
   ) IS NULL THEN
-    RAISE EXCEPTION 'current ten-argument hybrid_search_thoughts is missing';
+    RAISE EXCEPTION 'current eleven-argument hybrid_search_thoughts is missing';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -26,7 +31,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'legacy thought_audit was not upgraded with actor/session_id';
   END IF;
-  RAISE NOTICE 'PASS upgrade replaced legacy 7/8-argument RPCs with the 10-argument RPC and extended legacy thought_audit';
+  RAISE NOTICE 'PASS upgrade replaced legacy 7/8/10-argument RPCs with the 11-argument RPC and extended legacy thought_audit';
 END
 $upgrade$;
 
@@ -68,7 +73,7 @@ BEGIN
 
   IF NOT has_function_privilege(
     'authenticated',
-    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision)',
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision,double precision)',
     'EXECUTE'
   ) OR NOT has_function_privilege(
     'authenticated',
@@ -81,6 +86,85 @@ BEGIN
   RAISE NOTICE 'PASS sensitive RPC grants are service_role-only; read RPCs remain authenticated';
 END;
 $$;
+
+INSERT INTO public.thoughts (
+  content, embedding, metadata, created_at, updated_at,
+  type, sensitivity_tier, importance, quality_score, source_type, enriched
+)
+VALUES
+  ('décision budget', NULL, '{"source":"french-fts-test"}', now(), now(), 'decision', 'standard', 5, 90, 'french-fts-test', false),
+  ('EST deployment window', NULL, '{"source":"simple-fallback-test"}', now(), now(), 'reference', 'standard', 3, 70, 'simple-fallback-test', false);
+
+DO $$
+BEGIN
+  -- Jambe texte simple-only (décision MESURÉE du 2026-07-14, voir schema.sql :
+  -- les variantes françaises OR et AND ont été évaluées hors échantillon et
+  -- rejetées). Mot-clé exact → jambe texte ; question conversationnelle →
+  -- aucun bruit texte (le rappel conversationnel est le rôle du sémantique).
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.hybrid_search_thoughts(
+      'budget',
+      NULL,
+      10,
+      0,
+      '{"source_type":"french-fts-test"}'::jsonb,
+      false,
+      60
+    ) result
+    WHERE result.content = 'décision budget'
+      AND result.text_rank IS NOT NULL
+      AND result.semantic_rank IS NULL
+  ) THEN
+    RAISE EXCEPTION 'keyword query did not retrieve through the simple text leg';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.hybrid_search_thoughts(
+      'qu''avions-nous décidé pour le budget ?',
+      NULL,
+      10,
+      0,
+      '{"source_type":"french-fts-test"}'::jsonb,
+      false,
+      60
+    ) result
+    WHERE result.content <> 'décision budget'
+  ) THEN
+    RAISE EXCEPTION 'conversational query produced unexpected noise candidates';
+  END IF;
+
+  RAISE NOTICE 'PASS simple-only text leg: exact keyword matches, conversational query stays noise-free';
+END;
+$$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.hybrid_search_thoughts(
+      'EST',
+      NULL,
+      10,
+      0,
+      '{"source_type":"simple-fallback-test"}'::jsonb,
+      false,
+      60
+    ) result
+    WHERE result.content = 'EST deployment window'
+      AND result.text_rank IS NOT NULL
+      AND result.semantic_rank IS NULL
+  ) THEN
+    RAISE EXCEPTION 'English EST keyword did not retrieve through the simple text leg';
+  END IF;
+
+  RAISE NOTICE 'PASS English keyword retrieves through the simple text leg';
+END;
+$$;
+
+DELETE FROM public.thoughts
+WHERE source_type IN ('french-fts-test', 'simple-fallback-test');
 
 INSERT INTO public.thoughts (
   content, embedding, metadata, created_at, updated_at,
@@ -189,6 +273,65 @@ $$;
 
 DELETE FROM public.thoughts WHERE source_type = 'rrf-weight-test';
 
+INSERT INTO public.thoughts (
+  content, embedding, metadata, created_at, updated_at,
+  type, sensitivity_tier, importance, quality_score, source_type, enriched
+)
+VALUES
+  ('recencytopic recencytopic recencytopic recencytopic', pg_temp.unit_vector(9), '{"source":"recency-test"}', now() - interval '90 days', now(), 'reference', 'standard', 3, 70, 'recency-test', true),
+  ('recencytopic', pg_temp.unit_vector(9), '{"source":"recency-test"}', now() - interval '1 day', now(), 'reference', 'standard', 3, 70, 'recency-test', true);
+
+DO $$
+DECLARE
+  v_default_first TEXT;
+  v_recent_first TEXT;
+BEGIN
+  SELECT result.content INTO v_default_first
+  FROM public.hybrid_search_thoughts(
+    'recencytopic',
+    pg_temp.unit_vector(9),
+    2,
+    0,
+    '{"source_type":"recency-test"}'::jsonb,
+    false,
+    60,
+    NULL,
+    1.0,
+    2.0,
+    NULL
+  ) result
+  LIMIT 1;
+
+  SELECT result.content INTO v_recent_first
+  FROM public.hybrid_search_thoughts(
+    'recencytopic',
+    pg_temp.unit_vector(9),
+    2,
+    0,
+    '{"source_type":"recency-test"}'::jsonb,
+    false,
+    60,
+    NULL,
+    1.0,
+    2.0,
+    7.0
+  ) result
+  LIMIT 1;
+
+  IF v_default_first <> 'recencytopic recencytopic recencytopic recencytopic' THEN
+    RAISE EXCEPTION 'NULL recency half-life changed the prior relevance order: %', v_default_first;
+  END IF;
+
+  IF v_recent_first <> 'recencytopic' THEN
+    RAISE EXCEPTION '7-day recency half-life did not promote the recent equally semantic document: %', v_recent_first;
+  END IF;
+
+  RAISE NOTICE 'PASS 7-day half-life promotes the recent document and NULL restores the prior order';
+END;
+$$;
+
+DELETE FROM public.thoughts WHERE source_type = 'recency-test';
+
 DO $$
 DECLARE
   v_invalid DOUBLE PRECISION;
@@ -225,6 +368,30 @@ BEGIN
   END LOOP;
 
   RAISE NOTICE 'PASS weighted RRF rejects zero, negative, and NaN weights on both legs';
+END;
+$$;
+
+DO $$
+DECLARE
+  v_invalid DOUBLE PRECISION;
+BEGIN
+  FOREACH v_invalid IN ARRAY ARRAY[0.0::DOUBLE PRECISION, -1.0::DOUBLE PRECISION, 'NaN'::DOUBLE PRECISION]
+  LOOP
+    BEGIN
+      PERFORM public.hybrid_search_thoughts(
+        'recencytopic', pg_temp.unit_vector(9), 2, 0,
+        '{}'::jsonb, false, 60, NULL, 1.0, 2.0, v_invalid
+      );
+      RAISE EXCEPTION 'expected invalid recency half-life rejection for %', v_invalid;
+    EXCEPTION
+      WHEN SQLSTATE '22023' THEN
+        IF SQLERRM <> 'p_recency_half_life_days must be finite and > 0 when provided' THEN
+          RAISE;
+        END IF;
+    END;
+  END LOOP;
+
+  RAISE NOTICE 'PASS recency half-life rejects zero, negative, and NaN values';
 END;
 $$;
 

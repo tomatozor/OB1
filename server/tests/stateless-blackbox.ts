@@ -22,6 +22,8 @@ const MEMORY_OUTSIDE_TRACE_ID = "99999999-9999-4999-8999-999999999999";
 const DELETED_STRING_ID = "aaaaaaaa-1111-4111-8111-111111111111";
 const BASE_SCHEMA_ID = "aaaaaaaa-2222-4222-8222-222222222222";
 const HYBRID_RPC_ID = "aaaaaaaa-3333-4333-8333-333333333333";
+const RECENCY_OLD_ID = "aaaaaaaa-4444-4444-8444-444444444444";
+const RECENCY_RECENT_ID = "aaaaaaaa-5555-4555-8555-555555555555";
 const VALID_EMBEDDING = Array.from(
   { length: 1536 },
   (_, index) => index < 3 ? [0.1, 0.2, 0.3][index] : 0,
@@ -205,6 +207,7 @@ globalThis.fetch = (async (
     }
     const embedding = [...VALID_EMBEDDING];
     if (inputText === "base-schema") embedding[0] = 0.42;
+    if (inputText === "hybrid-recency") embedding[0] = 0.73;
     return json(200, { data: [{ embedding }] });
   }
   if (
@@ -228,12 +231,28 @@ globalThis.fetch = (async (
 
   const rpc = url.pathname.match(/\/rest\/v1\/rpc\/([^/]+)$/)?.[1];
   if (rpc === "search_thoughts_text") {
-    if (JSON.parse(rawBody).p_query === "base-schema") {
+    const payload = JSON.parse(rawBody);
+    if (payload.p_query === "base-schema") {
       return json(404, {
         code: "PGRST202",
         message:
           "Could not find the function public.search_thoughts_text in the schema cache",
       });
+    }
+    if (payload.p_query === "hybrid-recency") {
+      return json(200, [{
+        id: RECENCY_OLD_ID,
+        content: "old equal-relevance thought",
+        metadata: {},
+        created_at: new Date(Date.now() - 90 * 86_400_000).toISOString(),
+        total_count: 2,
+      }, {
+        id: RECENCY_RECENT_ID,
+        content: "recent equal-relevance thought",
+        metadata: {},
+        created_at: new Date(Date.now() - 86_400_000).toISOString(),
+        total_count: 2,
+      }]);
     }
     return json(200, [{
       id: "text-visible",
@@ -279,7 +298,8 @@ globalThis.fetch = (async (
       if (
         payload.p_semantic_threshold !== 0.83 ||
         payload.p_semantic_weight !== 0.75 ||
-        payload.p_text_weight !== 3
+        payload.p_text_weight !== 3 ||
+        payload.p_recency_half_life_days !== 7
       ) {
         return json(400, {
           code: "P0001",
@@ -290,6 +310,24 @@ globalThis.fetch = (async (
         id: HYBRID_RPC_ID,
         similarity: 0.9,
         content: "hybrid RPC result",
+        metadata: {},
+        created_at: "2026-07-14T00:00:00.000Z",
+      }]);
+    }
+    if (
+      payload.p_query === "hybrid-recency-legacy" &&
+      Object.hasOwn(payload, "p_recency_half_life_days")
+    ) {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.hybrid_search_thoughts(p_query, p_recency_half_life_days) in the schema cache",
+      });
+    }
+    if (payload.p_query === "hybrid-recency-legacy") {
+      return json(200, [{
+        id: HYBRID_RPC_ID,
+        content: "ten-parameter hybrid RPC result",
         metadata: {},
         created_at: "2026-07-14T00:00:00.000Z",
       }]);
@@ -321,8 +359,15 @@ globalThis.fetch = (async (
     });
   }
   if (rpc === "match_thoughts") {
-    if (JSON.parse(rawBody).query_embedding?.[0] === 0.42) {
+    const payload = JSON.parse(rawBody);
+    if (payload.query_embedding?.[0] === 0.42) {
       return json(200, [{ id: BASE_SCHEMA_ID, similarity: 0.89 }]);
+    }
+    if (payload.query_embedding?.[0] === 0.73) {
+      return json(200, [{ id: RECENCY_OLD_ID, similarity: 0.91 }, {
+        id: RECENCY_RECENT_ID,
+        similarity: 0.91,
+      }]);
     }
     return json(200, [{ id: "semantic-visible", similarity: 0.91 }]);
   }
@@ -803,6 +848,8 @@ globalThis.fetch = (async (
         "text-metadata-source",
         BASE_SCHEMA_ID,
         HYBRID_RPC_ID,
+        RECENCY_OLD_ID,
+        RECENCY_RECENT_ID,
       ].filter((id) => idFilter.includes(id));
       return json(
         200,
@@ -816,7 +863,11 @@ globalThis.fetch = (async (
             : id === "text-metadata-source"
             ? { source: "mcp" }
             : {},
-          created_at: "2026-07-14T00:00:00.000Z",
+          created_at: id === RECENCY_OLD_ID
+            ? new Date(Date.now() - 90 * 86_400_000).toISOString()
+            : id === RECENCY_RECENT_ID
+            ? new Date(Date.now() - 86_400_000).toISOString()
+            : "2026-07-14T00:00:00.000Z",
           type: "idea",
           source_type: id === "text-visible" ? "note" : null,
           importance: 4,
@@ -1525,6 +1576,7 @@ const hybridRpc = await mcp("tools/call", {
     threshold: 0.83,
     semantic_weight: 0.75,
     text_weight: 3,
+    recency_half_life_days: 7,
   },
 });
 assert(
@@ -1538,9 +1590,36 @@ assert(
     JSON.parse(entry.body).p_query === "hybrid-rpc" &&
     JSON.parse(entry.body).p_semantic_threshold === 0.83 &&
     JSON.parse(entry.body).p_semantic_weight === 0.75 &&
-    JSON.parse(entry.body).p_text_weight === 3
+    JSON.parse(entry.body).p_text_weight === 3 &&
+    JSON.parse(entry.body).p_recency_half_life_days === 7
   ),
-  "hybrid RPC receives threshold and both configurable weights",
+  "hybrid RPC receives threshold, both weights, and the recency half-life",
+);
+const recencyLegacyHybrid = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: {
+    query: "hybrid-recency-legacy",
+    mode: "hybrid",
+    recency_half_life_days: 7,
+  },
+});
+const recencyLegacyCalls = requests.filter((entry) =>
+  entry.url.includes("/rpc/hybrid_search_thoughts") &&
+  JSON.parse(entry.body).p_query === "hybrid-recency-legacy"
+);
+assert(
+  recencyLegacyHybrid.body?.result?.isError !== true &&
+    recencyLegacyCalls.length === 2 &&
+    JSON.parse(recencyLegacyCalls[0].body).p_recency_half_life_days === 7 &&
+    !Object.hasOwn(
+      JSON.parse(recencyLegacyCalls[1].body),
+      "p_recency_half_life_days",
+    ) &&
+    Object.hasOwn(
+      JSON.parse(recencyLegacyCalls[1].body),
+      "p_semantic_weight",
+    ),
+  "hybrid RPC retries a legacy 10-parameter signature without recency only",
 );
 const legacyHybrid = await mcp("tools/call", {
   name: "search_thoughts",
@@ -1581,8 +1660,33 @@ assert(
   "hybrid fallback uses caller-supplied semantic/text weights",
 );
 
+const unweightedRecency = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: { query: "hybrid-recency", mode: "hybrid", limit: 1 },
+});
+const weightedRecency = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: {
+    query: "hybrid-recency",
+    mode: "hybrid",
+    limit: 1,
+    recency_half_life_days: 7,
+  },
+});
+assert(
+  unweightedRecency.body?.result?.isError !== true &&
+    toolResult(unweightedRecency.body!).results[0]?.id === RECENCY_OLD_ID &&
+    weightedRecency.body?.result?.isError !== true &&
+    toolResult(weightedRecency.body!).results[0]?.id === RECENCY_RECENT_ID,
+  "hybrid local fallback applies recency decay only when a half-life is supplied",
+);
+
 for (
-  const [name, value] of [["semantic_weight", 0], ["text_weight", -1]] as const
+  const [name, value] of [
+    ["semantic_weight", 0],
+    ["text_weight", -1],
+    ["recency_half_life_days", 0],
+  ] as const
 ) {
   const invalidWeight = await mcp("tools/call", {
     name: "search_thoughts",
