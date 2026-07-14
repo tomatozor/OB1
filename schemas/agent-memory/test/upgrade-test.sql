@@ -6,6 +6,7 @@ DECLARE
   v_nullable TEXT;
   v_index_definition TEXT;
   v_memory_id UUID;
+  v_embedding_type TEXT;
 BEGIN
   FOREACH v_table IN ARRAY ARRAY[
     'agent_memories',
@@ -35,6 +36,13 @@ BEGIN
     AND column_name = 'content_hash';
   IF v_nullable <> 'NO' THEN
     RAISE EXCEPTION 'content_hash is still nullable';
+  END IF;
+  SELECT udt_name INTO v_embedding_type
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'agent_memories'
+    AND column_name = 'embedding';
+  IF v_embedding_type <> 'vector' THEN
+    RAISE EXCEPTION 'embedding vector column is missing after upgrade: %', v_embedding_type;
   END IF;
 
   IF to_regclass('public.idx_agent_memories_idempotency_key') IS NOT NULL THEN
@@ -81,8 +89,30 @@ BEGIN
     RAISE EXCEPTION 'populated legacy keys were changed';
   END IF;
 
+  IF to_regprocedure(
+    'public.agent_memory_writeback_tx(text,text,text,jsonb,jsonb,jsonb,jsonb,text,jsonb)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy writeback_tx signature survived upgrade';
+  END IF;
+  IF to_regprocedure(
+    'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy review_tx signature survived upgrade';
+  END IF;
+  IF to_regprocedure(
+    'public.agent_memory_writeback_tx(text,text,text,jsonb,jsonb,jsonb,jsonb,text,jsonb,vector)'
+  ) IS NULL
+    OR to_regprocedure('public.agent_memory_writeback_batch_tx(text,jsonb,text,jsonb)') IS NULL
+    OR to_regprocedure('public.agent_memory_match(text,vector,integer,double precision)') IS NULL
+    OR to_regprocedure(
+      'public.agent_memory_review_tx(uuid,text,text,text,text,uuid,text,text,text,text)'
+    ) IS NULL THEN
+    RAISE EXCEPTION 'one or more current Agent Memory RPC signatures are missing';
+  END IF;
+
   RAISE NOTICE 'PASS origin/main upgrade revokes DELETE on 8 tables';
   RAISE NOTICE 'PASS origin/main upgrade enforces NOT NULL and workspace idempotency';
   RAISE NOTICE 'PASS origin/main upgrade preserves legacy parent and child data';
+  RAISE NOTICE 'PASS upgrade adds embedding and replaces both legacy RPC overloads';
 END
 $upgrade$;

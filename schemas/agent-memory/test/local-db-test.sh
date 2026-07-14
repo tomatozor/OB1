@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA="$(cd "$SCRIPT_DIR/.." && pwd)/schema.sql"
 ORIGIN_MAIN_SCHEMA="$SCRIPT_DIR/origin-main-schema.sql"
 RPC_TEST="$SCRIPT_DIR/transactional-rpc-test.sql"
+SEMANTIC_MATCH_TEST="$SCRIPT_DIR/semantic-match-test.sql"
 UPGRADE_TEST="$SCRIPT_DIR/upgrade-test.sql"
 started=0
 
@@ -159,9 +160,7 @@ if [[ "$index_count" != "4" ]]; then
   exit 1
 fi
 echo "PASS required index count: $index_count"
-
-docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres < "$RPC_TEST"
-echo "PASS transactional governance RPC assertions"
+echo "PASS fresh install assertions"
 
 docker exec "$CONTAINER" createdb -U postgres agent_memory_upgrade
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade >/dev/null <<'SQL'
@@ -180,6 +179,32 @@ docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_
 echo "PASS installed exact origin/main Agent Memory schema"
 
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade >/dev/null <<'SQL'
+CREATE FUNCTION public.agent_memory_writeback_tx(
+  p_workspace_id TEXT,
+  p_idempotency_key TEXT,
+  p_content_hash TEXT,
+  p_memory JSONB,
+  p_provenance JSONB,
+  p_source_refs JSONB DEFAULT '[]'::jsonb,
+  p_artifacts JSONB DEFAULT '[]'::jsonb,
+  p_created_by TEXT DEFAULT NULL,
+  p_request_context JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB LANGUAGE SQL AS $$ SELECT '{}'::jsonb $$;
+
+CREATE FUNCTION public.agent_memory_review_tx(
+  p_memory_id UUID,
+  p_workspace_id TEXT,
+  p_action TEXT,
+  p_actor_id TEXT,
+  p_notes TEXT DEFAULT NULL,
+  p_related_memory_id UUID DEFAULT NULL,
+  p_content TEXT DEFAULT NULL,
+  p_summary TEXT DEFAULT NULL,
+  p_visibility TEXT DEFAULT NULL
+)
+RETURNS JSONB LANGUAGE SQL AS $$ SELECT '{}'::jsonb $$;
+
 DO $pre_upgrade$
 BEGIN
   IF to_regclass('public.idx_agent_memories_idempotency_key') IS NULL THEN
@@ -215,7 +240,7 @@ INSERT INTO public.agent_memories (
   'legacy-existing-key', repeat('f', 64)
 );
 SQL
-echo "PASS seeded origin/main rows, including NULL migration inputs"
+echo "PASS seeded origin/main rows and previous transactional RPC signatures"
 
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade < "$SCHEMA" >/dev/null
 echo "PASS upgraded origin/main schema to current schema"
@@ -223,5 +248,11 @@ docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_
 echo "PASS upgraded schema reapply (idempotent)"
 docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d agent_memory_upgrade < "$UPGRADE_TEST"
 echo "PASS origin/main upgrade assertions"
+
+docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres < "$RPC_TEST"
+echo "PASS transactional governance RPC assertions"
+
+docker exec -i "$CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d postgres < "$SEMANTIC_MATCH_TEST"
+echo "PASS semantic match E2E assertions"
 
 echo "PASS Agent Memory SQL local test"

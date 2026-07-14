@@ -22,6 +22,7 @@ This schema adds sidecar tables that let Open Brain store agent-created operatio
 
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
 - Supabase project with the core `thoughts` table
+- PostgreSQL `vector` extension with 1,536-dimension embeddings
 - The core dedupe setup from Step 2.6 is recommended
 
 > [!CAUTION]
@@ -41,6 +42,10 @@ SUPABASE (from your Open Brain setup)
 ```
 
 ## Steps
+
+1. Apply [`schema.sql`](./schema.sql) to a disposable local or staging database.
+2. Apply the same migration again and verify that the second run is idempotent.
+3. Run [`test/local-db-test.sh`](./test/local-db-test.sh), then inspect every `PASS` line before promoting the migration.
 
 ![Step 1](https://img.shields.io/badge/Step_1-Run_the_Agent_Memory_Schema-1E88E5?style=for-the-badge)
 
@@ -84,7 +89,7 @@ If `verify_jwt = false` is already configured for the function in `supabase/conf
 
 **Done when:** `GET /health` on the deployed API returns `{"ok":true}`.
 
-## Expected Outcome
+## Expected outcome
 
 After applying this schema, OB1 can store agent memories as governed records instead of raw transcript dumps. Agent-written memories start as evidence-only pending review. Only `user_confirmed` or trusted `imported` memories can become instruction-grade.
 
@@ -95,6 +100,16 @@ The persistence visibility enum is deliberately limited to `workspace`,
 API enforces the exact contextual matching and runtime ownership semantics
 documented in [`integrations/agent-memory-api`](../../integrations/agent-memory-api/README.md#scope-model).
 
+`restrict_scope` accepts the current visibility as an idempotent request and
+accepts any narrower visibility. It rejects only widening: `personal` <
+`channel` < `project` < `workspace`. Project and channel scopes still require
+their corresponding identifiers.
+
+Known retrieval ceilings are intentionally layered: REST returns at most 100
+memories per request, MCP scans at most 1,000 memories in a workspace, the
+server candidate pool is capped at 2,500, and the SQL semantic-match pool is
+capped at 5,000.
+
 The service role is granted `SELECT`, `INSERT`, and `UPDATE`, but not `DELETE`, on all eight sidecar tables. The API exposes no physical-delete route. Rejection, staleness, merging, dispute, and supersession are represented through `lifecycle_status`, reviewer records, relations, and `agent_memory_audit_events`. A database trigger writes an audit event in the same transaction as every transition to `stale`, `superseded`, `disputed`, or `rejected`, so the lifecycle change rolls back if its audit cannot be persisted.
 
 ## Transactional Governance RPCs
@@ -103,19 +118,31 @@ The schema installs these exact service-role-only signatures:
 
 ```sql
 agent_memory_writeback_tx(
-  text, text, text, jsonb, jsonb, jsonb, jsonb, text, jsonb
+  text, text, text, jsonb, jsonb, jsonb, jsonb, text, jsonb, vector(1536)
 ) returns jsonb
 
+agent_memory_writeback_batch_tx(
+  text, jsonb, text, jsonb
+) returns jsonb
+
+agent_memory_match(
+  text, vector(1536), integer, double precision
+) returns table(memory_id uuid, similarity double precision)
+
 agent_memory_review_tx(
-  uuid, text, text, text, text, uuid, text, text, text
+  uuid, text, text, text, text, uuid, text, text, text, text
 ) returns jsonb
 ```
 
-In declaration order, writeback accepts `p_workspace_id`, `p_idempotency_key`, `p_content_hash`, `p_memory`, `p_provenance`, `p_source_refs DEFAULT '[]'`, `p_artifacts DEFAULT '[]'`, `p_created_by DEFAULT NULL`, and `p_request_context DEFAULT '{}'`. It serializes equal workspace/key pairs, returns the existing row with `replayed=true` only when the hash also matches, and otherwise creates the memory, source-reference rows, artifact rows, and one audit event in the caller's transaction. A failure in any of those database writes aborts the function call. New rows are forced to evidence-only, pending-review state; writeback provenance is limited to `observed`, `inferred`, or `generated`.
+In declaration order, writeback accepts `p_workspace_id`, `p_idempotency_key`, `p_content_hash`, `p_memory`, `p_provenance`, `p_source_refs DEFAULT '[]'`, `p_artifacts DEFAULT '[]'`, `p_created_by DEFAULT NULL`, `p_request_context DEFAULT '{}'`, and `p_embedding vector(1536) DEFAULT NULL`. The default exists only for call-signature compatibility: a null embedding raises `embedding required — a writeback must be semantically recallable` before any memory, child, or audit write. A supplied embedding is stored atomically with the memory. Equal workspace/key pairs are serialized; same-hash replay returns the existing embedded row, while a different hash conflicts. New rows remain evidence-only and pending review, and writeback provenance is limited to `observed`, `inferred`, or `generated`.
 
-Review accepts `p_memory_id`, `p_workspace_id`, `p_action`, `p_actor_id`, `p_notes DEFAULT NULL`, `p_related_memory_id DEFAULT NULL`, `p_content DEFAULT NULL`, `p_summary DEFAULT NULL`, and `p_visibility DEFAULT NULL`. The row lock and related-memory lookup are workspace-bounded. `approve` is normalized to `confirm`; all accepted actions validate their transition before the memory update, review-action row, optional merge/supersede relation, and audit event are committed together. The function does not create or re-embed a `thoughts` row when review content changes; callers that require a synchronized thought or embedding must perform that separate workflow deliberately.
+Batch writeback accepts a JSON array of `{idempotency_key, content_hash, memory, provenance, source_refs?, artifacts?, embedding}` items. Every new item requires an array of exactly 1,536 numbers. A same-hash replay may omit it because the existing stored embedding governs the replay. The loop calls the single-item RPC inside one database function; any item failure rolls back every memory, child, and audit row created by the batch.
 
-`PUBLIC` has no execution privilege on either governance RPC, and the schema grants execution only to `service_role`. Keep the service key server-side.
+`agent_memory_match` computes cosine similarity only over non-null embeddings in the requested workspace and excludes `rejected` and `superseded` memories. Its optional threshold is applied before the ordered, capped result is returned; a request can never return a row from another workspace.
+
+Review accepts `p_memory_id`, `p_workspace_id`, `p_action`, `p_actor_id`, `p_notes DEFAULT NULL`, `p_related_memory_id DEFAULT NULL`, `p_content DEFAULT NULL`, `p_summary DEFAULT NULL`, `p_visibility DEFAULT NULL`, and `p_actor_kind DEFAULT 'agent'`. Actor kind is restricted to `agent|human`; `confirm`/`approve`, `merge`, and `supersede` require `human`. An agent edit of a confirmed or instruction-grade memory atomically resets it to pending evidence (`can_use_as_instruction=false`, `requires_user_confirmation=true`) and audits the downgrade. A human edit preserves confirmed state. The row lock and related-memory lookup remain workspace-bounded.
+
+`PUBLIC` and `authenticated` have no execution privilege on these four RPCs; execution is granted only to `service_role`. Keep the service key server-side.
 
 ## Upgrade Behavior
 
@@ -124,6 +151,10 @@ Applying this schema to the `origin/main` Agent Memory installation performs a r
 - existing null `idempotency_key` and `content_hash` values become the deterministic value `legacy:<memory-id>`, then both columns become `NOT NULL`;
 - the former global partial `idx_agent_memories_idempotency_key` is dropped and replaced by the unique workspace-scoped `idx_agent_memories_workspace_idempotency_key (workspace_id, idempotency_key)`;
 - legacy `visibility='organization'` rows become `workspace` before the four-level visibility check is installed;
+- `agent_memories.embedding vector(1536)` is added without rewriting or deleting existing memory rows;
+- the old nine-argument writeback RPC is dropped transactionally and replaced by the ten-argument embedding signature;
+- the old nine-argument review RPC is dropped transactionally and replaced by the ten-argument actor-authority signature;
+- semantic match and atomic batch writeback RPCs are installed with service-role-only execution;
 - `DELETE` is explicitly revoked from `service_role` on all eight tables, undoing the earlier grant rather than assuming a narrower later `GRANT` revokes it;
 - existing memory and child rows are retained. The migration does not remove or rewrite `thoughts` columns.
 
@@ -139,7 +170,7 @@ With Docker running, execute:
 schemas/agent-memory/test/local-db-test.sh
 ```
 
-The test starts `pgvector/pgvector:pg16` as `ob-thanos-am-pg` on local port `55433`, creates a minimal live-compatible UUID `thoughts` table, applies `schema.sql` twice, exercises both transactional governance RPCs (including replay, rollback, workspace bounds, and transition validation), verifies lifecycle audit and constraints, then runs a second database through the exact checked-in `origin/main` schema fixture and the current schema. The upgrade assertions cover all eight `DELETE` revocations, both `NOT NULL` columns, index replacement, deterministic backfill, data preservation, and clean reapplication. The harness removes its container and refuses to remove a pre-existing container with the same name.
+The test starts `pgvector/pgvector:pg16` as `ob-thanos-am-pg` on local port `55433`, creates a minimal live-compatible UUID `thoughts` table, and applies `schema.sql` twice. It then verifies the real upgrade path, including replacement of the previous transactional RPC signatures, before running transactional authority, batch rollback, real audit-trigger fault injection, and semantic-match E2E groups. The E2E group proves same-vector similarity near 1, strict workspace isolation, and zero writes when embedding is null. The harness removes its container and refuses to remove a pre-existing container with the same name.
 
 ## Troubleshooting
 

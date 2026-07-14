@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
   )
 );
 
+-- Additive semantic-recall storage. Existing rows remain valid evidence, but
+-- every accepted transactional writeback below must supply an embedding.
+ALTER TABLE public.agent_memories
+  ADD COLUMN IF NOT EXISTS embedding vector(1536);
+
 -- Keep repeat applications aligned with the runtime-neutral four-level scope
 -- model, including databases created by an earlier version of this schema.
 UPDATE public.agent_memories
@@ -374,6 +379,13 @@ BEGIN
 END;
 $$;
 
+-- PostgreSQL identifies functions by argument types, so changing a signature
+-- creates an overload unless the prior signature is removed explicitly. Keep
+-- the upgrade atomic by dropping the pre-embedding overload in this transaction.
+DROP FUNCTION IF EXISTS public.agent_memory_writeback_tx(
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB
+);
+
 CREATE OR REPLACE FUNCTION public.agent_memory_writeback_tx(
   p_workspace_id TEXT,
   p_idempotency_key TEXT,
@@ -383,7 +395,8 @@ CREATE OR REPLACE FUNCTION public.agent_memory_writeback_tx(
   p_source_refs JSONB DEFAULT '[]'::jsonb,
   p_artifacts JSONB DEFAULT '[]'::jsonb,
   p_created_by TEXT DEFAULT NULL,
-  p_request_context JSONB DEFAULT '{}'::jsonb
+  p_request_context JSONB DEFAULT '{}'::jsonb,
+  p_embedding vector(1536) DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -404,6 +417,10 @@ DECLARE
   v_existing public.agent_memories%ROWTYPE;
   v_memory public.agent_memories%ROWTYPE;
 BEGIN
+  IF p_embedding IS NULL THEN
+    RAISE EXCEPTION 'embedding required — a writeback must be semantically recallable'
+      USING ERRCODE = '22023';
+  END IF;
   IF v_workspace_id IS NULL THEN
     RAISE EXCEPTION 'workspace_id is required' USING ERRCODE = '22023';
   END IF;
@@ -483,6 +500,13 @@ BEGIN
 
   IF FOUND THEN
     IF v_existing.content_hash = v_content_hash THEN
+      IF v_existing.embedding IS NULL THEN
+        UPDATE public.agent_memories
+        SET embedding = p_embedding
+        WHERE id = v_existing.id
+          AND workspace_id = v_workspace_id
+        RETURNING * INTO v_existing;
+      END IF;
       RETURN to_jsonb(v_existing) || jsonb_build_object('replayed', true);
     END IF;
     RAISE EXCEPTION 'idempotency key already used with different content hash'
@@ -517,6 +541,7 @@ BEGIN
     stale_after,
     idempotency_key,
     content_hash,
+    embedding,
     metadata
   ) VALUES (
     nullif(v_memory_input->>'thought_id', '')::UUID,
@@ -546,6 +571,7 @@ BEGIN
     nullif(v_memory_input->>'stale_after', '')::TIMESTAMPTZ,
     v_idempotency_key,
     v_content_hash,
+    p_embedding,
     coalesce(v_memory_input->'metadata', '{}'::jsonb)
       || jsonb_build_object(
         'provenance', v_provenance_input,
@@ -608,6 +634,175 @@ BEGIN
 END;
 $agent_memory_writeback_tx$;
 
+CREATE OR REPLACE FUNCTION public.agent_memory_match(
+  p_workspace_id TEXT,
+  p_query_embedding vector(1536),
+  p_limit INT DEFAULT 20,
+  p_threshold DOUBLE PRECISION DEFAULT NULL
+)
+RETURNS TABLE(memory_id UUID, similarity DOUBLE PRECISION)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $agent_memory_match$
+DECLARE
+  v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
+  v_limit INT := coalesce(p_limit, 20);
+BEGIN
+  IF v_workspace_id IS NULL THEN
+    RAISE EXCEPTION 'workspace_id is required' USING ERRCODE = '22023';
+  END IF;
+  IF p_query_embedding IS NULL THEN
+    RAISE EXCEPTION 'query_embedding is required' USING ERRCODE = '22023';
+  END IF;
+  IF v_limit < 1 THEN
+    RAISE EXCEPTION 'limit must be greater than zero' USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    candidate.id,
+    (1 - (candidate.embedding <=> p_query_embedding))::DOUBLE PRECISION
+  FROM public.agent_memories AS candidate
+  WHERE candidate.workspace_id = v_workspace_id
+    AND candidate.embedding IS NOT NULL
+    AND candidate.lifecycle_status NOT IN ('rejected', 'superseded')
+    AND (
+      p_threshold IS NULL
+      OR (1 - (candidate.embedding <=> p_query_embedding)) >= p_threshold
+    )
+  ORDER BY candidate.embedding <=> p_query_embedding, candidate.id
+  LIMIT least(v_limit, 5000);
+END;
+$agent_memory_match$;
+
+CREATE OR REPLACE FUNCTION public.agent_memory_writeback_batch_tx(
+  p_workspace_id TEXT,
+  p_items JSONB,
+  p_created_by TEXT DEFAULT NULL,
+  p_request_context JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $agent_memory_writeback_batch_tx$
+DECLARE
+  v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
+  v_request_context JSONB := coalesce(p_request_context, '{}'::jsonb);
+  v_item JSONB;
+  v_item_number INT := 0;
+  v_idempotency_key TEXT;
+  v_content_hash TEXT;
+  v_embedding vector(1536);
+  v_existing public.agent_memories%ROWTYPE;
+  v_result JSONB;
+  v_results JSONB := '[]'::jsonb;
+BEGIN
+  IF v_workspace_id IS NULL THEN
+    RAISE EXCEPTION 'workspace_id is required' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(p_items) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'items must be a JSON array' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(v_request_context) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'request_context must be a JSON object' USING ERRCODE = '22023';
+  END IF;
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_items)
+  LOOP
+    v_item_number := v_item_number + 1;
+    IF jsonb_typeof(v_item) IS DISTINCT FROM 'object' THEN
+      RAISE EXCEPTION 'batch item % must be a JSON object', v_item_number
+        USING ERRCODE = '22023';
+    END IF;
+
+    v_idempotency_key := nullif(btrim(v_item->>'idempotency_key'), '');
+    v_content_hash := nullif(btrim(v_item->>'content_hash'), '');
+    IF v_idempotency_key IS NULL THEN
+      RAISE EXCEPTION 'batch item % idempotency_key is required', v_item_number
+        USING ERRCODE = '22023';
+    END IF;
+    IF v_content_hash IS NULL THEN
+      RAISE EXCEPTION 'batch item % content_hash is required', v_item_number
+        USING ERRCODE = '22023';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended(v_workspace_id || E'\x1f' || v_idempotency_key, 0)
+    );
+    SELECT *
+    INTO v_existing
+    FROM public.agent_memories
+    WHERE workspace_id = v_workspace_id
+      AND idempotency_key = v_idempotency_key
+    FOR UPDATE;
+
+    IF FOUND THEN
+      IF v_existing.content_hash <> v_content_hash THEN
+        RAISE EXCEPTION 'idempotency key already used with different content hash'
+          USING ERRCODE = '23505';
+      END IF;
+      IF v_existing.embedding IS NULL THEN
+        RAISE EXCEPTION
+          'embedding required — batch replay item % has no existing semantic embedding',
+          v_item_number USING ERRCODE = '22023';
+      END IF;
+      -- A replay is governed by the already persisted embedding, even when the
+      -- caller omitted or supplied a malformed embedding in this batch item.
+      v_embedding := v_existing.embedding;
+    ELSE
+      IF jsonb_typeof(v_item->'embedding') IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+          v_item_number USING ERRCODE = '22023';
+      END IF;
+      IF jsonb_array_length(v_item->'embedding') <> 1536 THEN
+        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+          v_item_number USING ERRCODE = '22023';
+      END IF;
+      IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(v_item->'embedding') AS dimension(value)
+        WHERE jsonb_typeof(dimension.value) IS DISTINCT FROM 'number'
+      ) THEN
+        RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+          v_item_number USING ERRCODE = '22023';
+      END IF;
+      BEGIN
+        v_embedding := (v_item->'embedding')::TEXT::vector(1536);
+      EXCEPTION
+        WHEN OTHERS THEN
+          RAISE EXCEPTION 'embedding required — batch item % must contain 1536 numbers',
+            v_item_number USING ERRCODE = '22023';
+      END;
+    END IF;
+
+    v_result := public.agent_memory_writeback_tx(
+      v_workspace_id,
+      v_idempotency_key,
+      v_content_hash,
+      v_item->'memory',
+      v_item->'provenance',
+      coalesce(v_item->'source_refs', '[]'::jsonb),
+      coalesce(v_item->'artifacts', '[]'::jsonb),
+      p_created_by,
+      v_request_context,
+      v_embedding
+    );
+    v_results := v_results || jsonb_build_array(v_result);
+  END LOOP;
+
+  RETURN jsonb_build_object('count', v_item_number, 'items', v_results);
+END;
+$agent_memory_writeback_batch_tx$;
+
+-- Remove the pre-authority overload transactionally before installing the
+-- actor-kind signature, avoiding ambiguous default-argument resolution.
+DROP FUNCTION IF EXISTS public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
+);
+
 CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
   p_memory_id UUID,
   p_workspace_id TEXT,
@@ -617,7 +812,8 @@ CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
   p_related_memory_id UUID DEFAULT NULL,
   p_content TEXT DEFAULT NULL,
   p_summary TEXT DEFAULT NULL,
-  p_visibility TEXT DEFAULT NULL
+  p_visibility TEXT DEFAULT NULL,
+  p_actor_kind TEXT DEFAULT 'agent'
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -628,6 +824,7 @@ DECLARE
   v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
   v_action TEXT := lower(nullif(btrim(p_action), ''));
   v_actor_id TEXT := nullif(btrim(p_actor_id), '');
+  v_actor_kind TEXT := lower(nullif(btrim(p_actor_kind), ''));
   v_visibility TEXT := lower(nullif(btrim(p_visibility), ''));
   v_before JSONB;
   v_memory public.agent_memories%ROWTYPE;
@@ -643,6 +840,9 @@ BEGIN
   IF v_actor_id IS NULL THEN
     RAISE EXCEPTION 'actor_id is required' USING ERRCODE = '22023';
   END IF;
+  IF v_actor_kind IS NULL OR v_actor_kind NOT IN ('agent', 'human') THEN
+    RAISE EXCEPTION 'actor_kind must be agent or human' USING ERRCODE = '22023';
+  END IF;
   IF v_action = 'approve' THEN
     v_action := 'confirm';
   END IF;
@@ -651,6 +851,10 @@ BEGIN
     'merge', 'supersede', 'reject', 'dispute'
   ) THEN
     RAISE EXCEPTION 'invalid review action: %', coalesce(v_action, '<null>')
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_action IN ('confirm', 'merge', 'supersede') AND v_actor_kind <> 'human' THEN
+    RAISE EXCEPTION 'action % requires actor_kind human', v_action
       USING ERRCODE = '22023';
   END IF;
 
@@ -695,8 +899,8 @@ BEGIN
     v_new_scope_rank := CASE v_visibility
       WHEN 'workspace' THEN 4 WHEN 'project' THEN 3 WHEN 'channel' THEN 2 WHEN 'personal' THEN 1
     END;
-    IF v_new_scope_rank >= v_current_scope_rank THEN
-      RAISE EXCEPTION 'restrict_scope may only reduce the existing visibility'
+    IF v_new_scope_rank > v_current_scope_rank THEN
+      RAISE EXCEPTION 'restrict_scope may not widen the existing visibility'
         USING ERRCODE = '22023';
     END IF;
     IF v_visibility = 'project' AND v_memory.project_id IS NULL THEN
@@ -729,6 +933,12 @@ BEGIN
   SET review_status = CASE v_action
         WHEN 'confirm' THEN 'confirmed'
         WHEN 'evidence_only' THEN 'evidence_only'
+        WHEN 'edit' THEN CASE
+          WHEN v_actor_kind = 'agent'
+            AND (v_memory.review_status = 'confirmed' OR v_memory.can_use_as_instruction)
+            THEN 'pending'
+          ELSE review_status
+        END
         WHEN 'restrict_scope' THEN 'restricted'
         WHEN 'mark_stale' THEN 'stale'
         WHEN 'merge' THEN 'merged'
@@ -751,6 +961,10 @@ BEGIN
       END,
       can_use_as_instruction = CASE
         WHEN v_action = 'confirm' THEN true
+        WHEN v_action = 'edit'
+          AND v_actor_kind = 'agent'
+          AND (v_memory.review_status = 'confirmed' OR v_memory.can_use_as_instruction)
+          THEN false
         WHEN v_action IN ('evidence_only', 'mark_stale', 'merge', 'supersede', 'reject', 'dispute') THEN false
         ELSE can_use_as_instruction
       END,
@@ -761,6 +975,10 @@ BEGIN
       END,
       requires_user_confirmation = CASE
         WHEN v_action IN ('confirm', 'evidence_only', 'merge', 'supersede') THEN false
+        WHEN v_action = 'edit'
+          AND v_actor_kind = 'agent'
+          AND (v_memory.review_status = 'confirmed' OR v_memory.can_use_as_instruction)
+          THEN true
         WHEN v_action = 'dispute' THEN true
         ELSE requires_user_confirmation
       END,
@@ -819,12 +1037,17 @@ BEGIN
     v_after.workspace_id,
     v_after.project_id,
     v_after.id,
-    'user',
+    CASE WHEN v_actor_kind = 'human' THEN 'user' ELSE 'agent' END,
     v_actor_id,
     v_after.runtime_name,
     v_after.task_id,
     jsonb_build_object(
       'action', v_action,
+      'actor_kind', v_actor_kind,
+      'instruction_grade_reset',
+        v_action = 'edit'
+        AND v_actor_kind = 'agent'
+        AND (v_memory.review_status = 'confirmed' OR v_memory.can_use_as_instruction),
       'notes', p_notes,
       'related_memory_id', p_related_memory_id,
       'before_review_status', v_memory.review_status,
@@ -901,16 +1124,40 @@ GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_audit_events TO servic
 GRANT EXECUTE ON FUNCTION public.agent_memory_hash_text(TEXT) TO service_role;
 
 REVOKE ALL ON FUNCTION public.agent_memory_writeback_tx(
-  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB, vector
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.agent_memory_writeback_tx(
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB, vector
+) FROM authenticated;
+REVOKE ALL ON FUNCTION public.agent_memory_writeback_batch_tx(
+  TEXT, JSONB, TEXT, JSONB
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.agent_memory_writeback_batch_tx(
+  TEXT, JSONB, TEXT, JSONB
+) FROM authenticated;
+REVOKE ALL ON FUNCTION public.agent_memory_match(
+  TEXT, vector, INT, DOUBLE PRECISION
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.agent_memory_match(
+  TEXT, vector, INT, DOUBLE PRECISION
+) FROM authenticated;
+REVOKE ALL ON FUNCTION public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
 ) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.agent_memory_review_tx(
-  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
-) FROM PUBLIC;
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
+) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.agent_memory_writeback_tx(
-  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB, vector
+) TO service_role;
+GRANT EXECUTE ON FUNCTION public.agent_memory_writeback_batch_tx(
+  TEXT, JSONB, TEXT, JSONB
+) TO service_role;
+GRANT EXECUTE ON FUNCTION public.agent_memory_match(
+  TEXT, vector, INT, DOUBLE PRECISION
 ) TO service_role;
 GRANT EXECUTE ON FUNCTION public.agent_memory_review_tx(
-  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT
 ) TO service_role;
 
 NOTIFY pgrst, 'reload schema';
