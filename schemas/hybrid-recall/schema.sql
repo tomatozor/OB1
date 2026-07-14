@@ -126,8 +126,93 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION public.log_thought_audit(UUID, TEXT, TEXT, JSONB) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.log_thought_audit(UUID, TEXT, TEXT, JSONB) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.log_thought_audit(UUID, TEXT, TEXT, JSONB)
-  TO authenticated, service_role;
+  TO service_role;
+
+CREATE OR REPLACE FUNCTION public.audit_thought_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_action TEXT;
+  v_actor TEXT;
+  v_diff JSONB := '{}'::jsonb;
+  v_metadata_keys TEXT[] := ARRAY[]::TEXT[];
+  v_was_deleted BOOLEAN;
+  v_is_deleted BOOLEAN;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    v_action := 'capture';
+    IF nullif(btrim(NEW.metadata->>'author_session_id'), '') IS NOT NULL THEN
+      v_diff := jsonb_build_object(
+        'session_id',
+        nullif(btrim(NEW.metadata->>'author_session_id'), '')
+      );
+    END IF;
+    v_actor := coalesce(
+      nullif(current_setting('ob1.audit_actor', true), ''),
+      nullif(btrim(NEW.metadata->>'source'), ''),
+      'database-trigger'
+    );
+  ELSE
+    v_was_deleted := lower(coalesce(OLD.metadata->>'deleted', 'false')) = 'true';
+    v_is_deleted := lower(coalesce(NEW.metadata->>'deleted', 'false')) = 'true';
+
+    IF NOT v_was_deleted AND v_is_deleted THEN
+      v_action := 'delete';
+    ELSIF v_was_deleted AND NOT v_is_deleted THEN
+      v_action := 'restore';
+    ELSE
+      v_action := 'update';
+    END IF;
+
+    IF OLD.content IS DISTINCT FROM NEW.content THEN
+      v_diff := v_diff || jsonb_build_object('content_changed', true);
+    END IF;
+
+    SELECT coalesce(array_agg(changed.key ORDER BY changed.key), ARRAY[]::TEXT[])
+    INTO v_metadata_keys
+    FROM (
+      SELECT key
+      FROM jsonb_object_keys(
+        coalesce(OLD.metadata, '{}'::jsonb) || coalesce(NEW.metadata, '{}'::jsonb)
+      ) AS keys(key)
+      WHERE OLD.metadata->key IS DISTINCT FROM NEW.metadata->key
+    ) AS changed;
+
+    IF cardinality(v_metadata_keys) > 0 THEN
+      v_diff := v_diff || jsonb_build_object('metadata_keys_changed', v_metadata_keys);
+    END IF;
+
+    IF OLD.embedding IS DISTINCT FROM NEW.embedding THEN
+      v_diff := v_diff || jsonb_build_object('embedding_set', NEW.embedding IS NOT NULL);
+    END IF;
+
+    v_actor := coalesce(
+      nullif(current_setting('ob1.audit_actor', true), ''),
+      CASE
+        WHEN v_action = 'delete' THEN nullif(btrim(NEW.metadata->>'deleted_by'), '')
+        ELSE NULL
+      END,
+      nullif(btrim(NEW.metadata->>'source'), ''),
+      'database-trigger'
+    );
+  END IF;
+
+  PERFORM public.log_thought_audit(NEW.id, v_action, v_actor, v_diff);
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.audit_thought_mutation() FROM PUBLIC;
+
+CREATE OR REPLACE TRIGGER trg_thoughts_audit_mutation
+AFTER INSERT OR UPDATE ON public.thoughts
+FOR EACH ROW
+EXECUTE FUNCTION public.audit_thought_mutation();
 
 -- ============================================================
 -- 3. HYBRID RRF SEARCH
@@ -137,6 +222,11 @@ GRANT EXECUTE ON FUNCTION public.log_thought_audit(UUID, TEXT, TEXT, JSONB)
 -- Candidate pools are bounded at 5,000 rows per retrieval path.
 -- ============================================================
 
+-- Replacing the seven-argument overload avoids leaving a stale legacy RPC.
+DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(
+  TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT
+);
+
 CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
   p_query TEXT,
   p_query_embedding vector(1536),
@@ -144,7 +234,8 @@ CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
   p_offset INT DEFAULT 0,
   p_filter JSONB DEFAULT '{}'::jsonb,
   p_include_restricted BOOLEAN DEFAULT false,
-  p_rrf_k INT DEFAULT 60
+  p_rrf_k INT DEFAULT 60,
+  p_semantic_threshold DOUBLE PRECISION DEFAULT NULL
 )
 RETURNS TABLE (
   id UUID,
@@ -194,6 +285,10 @@ AS $$
       CROSS JOIN parameters p
       WHERE p_query_embedding IS NOT NULL
         AND t.embedding IS NOT NULL
+        AND (
+          p_semantic_threshold IS NULL
+          OR 1.0 - (t.embedding <=> p_query_embedding) >= p_semantic_threshold
+        )
         AND (p_include_restricted OR t.sensitivity_tier IS DISTINCT FROM 'restricted')
         AND lower(coalesce(t.metadata->>'deleted', 'false')) <> 'true'
         AND (NOT (p.filter_value ? 'type') OR t.type = p.filter_value->>'type')
@@ -296,8 +391,8 @@ AS $$
   LIMIT (SELECT result_limit FROM parameters);
 $$;
 
-REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT)
+REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION)
   TO authenticated, service_role;
 
 -- ============================================================
@@ -325,8 +420,12 @@ DECLARE
   v_id UUID;
   v_deduped BOOLEAN;
   v_has_embedding BOOLEAN;
-  v_actor TEXT;
 BEGIN
+  IF p_content IS NULL OR btrim(p_content) = '' THEN
+    RAISE EXCEPTION 'content required'
+      USING ERRCODE = '22023';
+  END IF;
+
   -- Réplique EXACTEMENT la formule de fingerprint du upsert_thought live
   -- (SHA-256 hex du contenu normalisé), sinon la détection de dédup ne matche jamais.
   v_fingerprint := encode(sha256(convert_to(
@@ -362,23 +461,6 @@ BEGIN
   FROM public.thoughts t
   WHERE t.id = v_id;
 
-  v_actor := coalesce(
-    p_payload #>> '{metadata,source}',
-    p_payload->>'source',
-    'capture_thought_atomic'
-  );
-
-  PERFORM public.log_thought_audit(
-    v_id,
-    CASE WHEN v_deduped THEN 'update' ELSE 'capture' END,
-    v_actor,
-    jsonb_build_object(
-      'deduped', v_deduped,
-      'has_embedding', coalesce(v_has_embedding, false),
-      'session_id', p_payload #>> '{metadata,author_session_id}'
-    )
-  );
-
   RETURN jsonb_build_object(
     'id', v_id,
     'deduped', v_deduped,
@@ -388,8 +470,9 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION public.capture_thought_atomic(TEXT, JSONB, vector(1536)) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.capture_thought_atomic(TEXT, JSONB, vector(1536)) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.capture_thought_atomic(TEXT, JSONB, vector(1536))
-  TO authenticated, service_role;
+  TO service_role;
 
 -- ============================================================
 -- 5. SOURCE TYPE BACKFILL
@@ -471,16 +554,21 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION public.backfill_source_type(INT, BOOLEAN) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.backfill_source_type(INT, BOOLEAN) FROM authenticated;
 GRANT EXECUTE ON FUNCTION public.backfill_source_type(INT, BOOLEAN)
-  TO authenticated, service_role;
+  TO service_role;
 
 -- ============================================================
 -- 6. LOGICAL DELETE AND RESTORE
 -- ============================================================
 
+DROP FUNCTION IF EXISTS public.soft_delete_thought(UUID, TEXT);
+DROP FUNCTION IF EXISTS public.restore_thought(UUID, TEXT);
+
 CREATE OR REPLACE FUNCTION public.soft_delete_thought(
   p_id UUID,
-  p_actor TEXT DEFAULT 'mcp'
+  p_actor TEXT DEFAULT 'mcp',
+  p_confirm BOOLEAN DEFAULT false
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -492,7 +580,13 @@ DECLARE
   v_after JSONB;
   v_found BOOLEAN;
   v_changed BOOLEAN := false;
+  v_previous_actor TEXT;
 BEGIN
+  IF p_confirm IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'confirm required'
+      USING ERRCODE = '22023';
+  END IF;
+
   SELECT coalesce(t.metadata, '{}'::jsonb)
   INTO v_before
   FROM public.thoughts t
@@ -505,6 +599,13 @@ BEGIN
   END IF;
 
   IF lower(coalesce(v_before->>'deleted', 'false')) <> 'true' THEN
+    v_previous_actor := current_setting('ob1.audit_actor', true);
+    PERFORM set_config(
+      'ob1.audit_actor',
+      coalesce(nullif(btrim(p_actor), ''), 'mcp'),
+      true
+    );
+
     UPDATE public.thoughts AS t
     SET metadata = v_before || jsonb_build_object(
           'deleted', true,
@@ -515,13 +616,8 @@ BEGIN
     WHERE t.id = p_id
     RETURNING t.metadata INTO v_after;
 
+    PERFORM set_config('ob1.audit_actor', coalesce(v_previous_actor, ''), true);
     v_changed := true;
-    PERFORM public.log_thought_audit(
-      p_id,
-      'delete',
-      coalesce(nullif(btrim(p_actor), ''), 'mcp'),
-      jsonb_build_object('before', v_before, 'after', v_after)
-    );
   ELSE
     v_after := v_before;
   END IF;
@@ -537,7 +633,8 @@ $$;
 
 CREATE OR REPLACE FUNCTION public.restore_thought(
   p_id UUID,
-  p_actor TEXT
+  p_actor TEXT DEFAULT 'mcp',
+  p_confirm BOOLEAN DEFAULT false
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -549,7 +646,13 @@ DECLARE
   v_after JSONB;
   v_found BOOLEAN;
   v_changed BOOLEAN := false;
+  v_previous_actor TEXT;
 BEGIN
+  IF p_confirm IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'confirm required'
+      USING ERRCODE = '22023';
+  END IF;
+
   SELECT coalesce(t.metadata, '{}'::jsonb)
   INTO v_before
   FROM public.thoughts t
@@ -564,18 +667,20 @@ BEGIN
   IF lower(coalesce(v_before->>'deleted', 'false')) = 'true' THEN
     v_after := v_before - 'deleted' - 'deleted_at' - 'deleted_by';
 
+    v_previous_actor := current_setting('ob1.audit_actor', true);
+    PERFORM set_config(
+      'ob1.audit_actor',
+      coalesce(nullif(btrim(p_actor), ''), 'mcp'),
+      true
+    );
+
     UPDATE public.thoughts AS t
     SET metadata = v_after,
         updated_at = now()
     WHERE t.id = p_id;
 
+    PERFORM set_config('ob1.audit_actor', coalesce(v_previous_actor, ''), true);
     v_changed := true;
-    PERFORM public.log_thought_audit(
-      p_id,
-      'restore',
-      coalesce(nullif(btrim(p_actor), ''), 'mcp'),
-      jsonb_build_object('before', v_before, 'after', v_after)
-    );
   ELSE
     v_after := v_before;
   END IF;
@@ -589,12 +694,14 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.soft_delete_thought(UUID, TEXT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.restore_thought(UUID, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.soft_delete_thought(UUID, TEXT)
-  TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.restore_thought(UUID, TEXT)
-  TO authenticated, service_role;
+REVOKE ALL ON FUNCTION public.soft_delete_thought(UUID, TEXT, BOOLEAN) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.restore_thought(UUID, TEXT, BOOLEAN) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.soft_delete_thought(UUID, TEXT, BOOLEAN) FROM authenticated;
+REVOKE EXECUTE ON FUNCTION public.restore_thought(UUID, TEXT, BOOLEAN) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.soft_delete_thought(UUID, TEXT, BOOLEAN)
+  TO service_role;
+GRANT EXECUTE ON FUNCTION public.restore_thought(UUID, TEXT, BOOLEAN)
+  TO service_role;
 
 -- ============================================================
 -- 7. EXACT, UNPAGINATED STATISTICS
@@ -661,3 +768,17 @@ $$;
 REVOKE ALL ON FUNCTION public.thought_stats_exact() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.thought_stats_exact()
   TO authenticated, service_role;
+
+-- Supabase normally provides anon. Keep the migration portable for PostgreSQL
+-- test instances where that role has not been created.
+DO $revoke_sensitive_rpc_anon$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE EXECUTE ON FUNCTION public.soft_delete_thought(UUID, TEXT, BOOLEAN) FROM anon;
+    REVOKE EXECUTE ON FUNCTION public.restore_thought(UUID, TEXT, BOOLEAN) FROM anon;
+    REVOKE EXECUTE ON FUNCTION public.backfill_source_type(INT, BOOLEAN) FROM anon;
+    REVOKE EXECUTE ON FUNCTION public.capture_thought_atomic(TEXT, JSONB, vector(1536)) FROM anon;
+    REVOKE EXECUTE ON FUNCTION public.log_thought_audit(UUID, TEXT, TEXT, JSONB) FROM anon;
+  END IF;
+END
+$revoke_sensitive_rpc_anon$;

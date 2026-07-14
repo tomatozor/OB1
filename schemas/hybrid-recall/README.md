@@ -15,7 +15,9 @@ query + embedding
        |                             +--> RRF --> filtered page
        +--> FTS top-N ------- rank --+
 
-capture --> fingerprint lock --> canonical upsert --> embedding --> audit
+capture --> fingerprint lock --> canonical upsert --> embedding
+                                      |
+thought INSERT/UPDATE ----------------+--> audit trigger --> thought_audit
 ```
 
 The migration never replaces `upsert_thought`, never physically deletes a thought, and never removes or changes an existing `thoughts` column.
@@ -24,7 +26,9 @@ The migration never replaces `upsert_thought`, never physically deletes a though
 
 Embedding similarity catches conceptual matches while full-text search catches exact names and phrases. RRF combines both rank lists without pretending their raw scores are comparable. The companion write helpers keep capture and lifecycle operations transactional and reviewable.
 
-This contribution follows the practical Open Brain systems shared by [Nate B. Jones](https://natebjones.com). Nate publishes more useful, operator-focused workflows in [Nate's Newsletter](https://substack.com/@natesnewsletter).
+Implementation and review corrections in this schema are authored by [Thomas Verdenne](https://github.com/tomatozor).
+
+Upstream credit remains separate: this contribution builds on the practical Open Brain systems shared by [Nate B. Jones](https://natebjones.com). Nate gives away more useful, operator-focused systems in [Nate's Newsletter](https://substack.com/@natesnewsletter).
 
 ## Prerequisites
 
@@ -79,7 +83,8 @@ from public.hybrid_search_thoughts(
 ## Installed SQL Signatures
 
 ```sql
-hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int)
+hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int,
+                       double precision)
   returns table (id uuid, content text, metadata jsonb, created_at timestamptz,
                  type text, importance smallint, rrf_score double precision,
                  semantic_rank int, text_rank int)
@@ -87,26 +92,36 @@ hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int)
 capture_thought_atomic(text, jsonb, vector(1536)) returns jsonb
 backfill_source_type(int, boolean) returns jsonb
 log_thought_audit(uuid, text, text, jsonb) returns void
-soft_delete_thought(uuid, text) returns jsonb
-restore_thought(uuid, text) returns jsonb
+soft_delete_thought(uuid, text, boolean) returns jsonb
+restore_thought(uuid, text, boolean) returns jsonb
 thought_stats_exact() returns jsonb
 ```
+
+In declaration order, the hybrid-search parameters are `p_query`, `p_query_embedding`, `p_limit DEFAULT 10`, `p_offset DEFAULT 0`, `p_filter DEFAULT '{}'`, `p_include_restricted DEFAULT false`, `p_rrf_k DEFAULT 60`, and `p_semantic_threshold DEFAULT NULL`. When the threshold is present, the semantic candidate leg keeps only cosine similarity values greater than or equal to it.
 
 `hybrid_search_thoughts` accepts these optional `p_filter` keys: `type`, `source_type`, `min_importance`, `start_date`, and `end_date`. Dates must be valid `timestamptz` strings. Restricted thoughts are excluded unless explicitly requested; logically deleted thoughts are always excluded.
 
 `backfill_source_type(500, true)` is a read-only preview grouped by `metadata.source`. Pass `false` only after reviewing that output. Apply mode updates at most `p_batch` eligible rows and reports both `updated` and `remaining`.
+
+Logical lifecycle writes are confirmation-gated. Both `soft_delete_thought` and `restore_thought` declare `p_actor text DEFAULT 'mcp'` and `p_confirm boolean DEFAULT false`; callers must explicitly pass `p_confirm => true` or the RPC raises `confirm required`.
+
+## Access and Audit Model
+
+The read RPCs `hybrid_search_thoughts` and `thought_stats_exact` remain executable by `authenticated` and `service_role`. The mutation and maintenance RPCs `capture_thought_atomic`, `backfill_source_type`, `soft_delete_thought`, `restore_thought`, and `log_thought_audit` are executable only by `service_role`; access is revoked from `PUBLIC`, `authenticated`, and `anon` when that role exists. Keep the service key server-side.
+
+An `AFTER INSERT OR UPDATE` trigger on `thoughts` is the single mutation-audit path. Inserts record `capture`; ordinary updates record `update`; `metadata.deleted` transitions record `delete` or `restore`. Update diffs contain only changed audit indicators: `content_changed`, `metadata_keys_changed`, and `embedding_set`. Capture/delete/restore helpers do not call `log_thought_audit` explicitly, which avoids double counting. `thought_audit` has no trigger, so logging cannot recurse.
 
 ## Logical Rollback
 
 The schema is additive, so leaving the indexes and audit history in place is the safest rollback. To retire only the callable surface, review and run the following lines individually. They are commented to prevent accidental execution.
 
 ```sql
--- DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int);
+-- DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int, double precision);
 -- DROP FUNCTION IF EXISTS public.capture_thought_atomic(text, jsonb, vector(1536));
 -- DROP FUNCTION IF EXISTS public.backfill_source_type(int, boolean);
 -- DROP FUNCTION IF EXISTS public.log_thought_audit(uuid, text, text, jsonb);
--- DROP FUNCTION IF EXISTS public.soft_delete_thought(uuid, text);
--- DROP FUNCTION IF EXISTS public.restore_thought(uuid, text);
+-- DROP FUNCTION IF EXISTS public.soft_delete_thought(uuid, text, boolean);
+-- DROP FUNCTION IF EXISTS public.restore_thought(uuid, text, boolean);
 -- DROP FUNCTION IF EXISTS public.thought_stats_exact();
 ```
 
@@ -115,13 +130,13 @@ The schema is additive, so leaving the indexes and audit history in place is the
 
 ## Compatibility and Guardrails
 
-- All objects are created with `IF NOT EXISTS`, `CREATE OR REPLACE`, or guarded `DO` blocks.
+- Objects are created with `IF NOT EXISTS`, `CREATE OR REPLACE`, or guarded `DO` blocks. The only executable drops remove superseded function signatures immediately before their default-compatible replacements.
 - The migration is additive and can be applied multiple times.
-- `capture_thought_atomic` preserves the canonical `upsert_thought` behavior and only adds transaction serialization, optional embedding storage, and audit.
-- `soft_delete_thought` writes deletion markers into `metadata`; `restore_thought` removes those markers. Neither performs physical deletion.
+- `capture_thought_atomic` preserves the canonical `upsert_thought` behavior and only adds transaction serialization and optional embedding storage; the table trigger supplies audit.
+- `soft_delete_thought` writes deletion markers into `metadata`; `restore_thought` removes those markers. Both require explicit confirmation and neither performs physical deletion.
 - `thought_audit` has no foreign key to `thoughts`, so audit rows survive future archival operations.
 - An older `schemas/thought-audit` installation is tolerated: missing `actor` and `session_id` columns are added. If its legacy action check rejects `restore`, the helper records `action='update'` with `diff.logical_action='restore'` instead of weakening or dropping the old constraint.
-- SECURITY DEFINER functions use a fixed search path and are executable only by `authenticated` and `service_role`, not `anon` or `PUBLIC`.
+- SECURITY DEFINER functions use a fixed search path. Read RPCs allow `authenticated`; mutation and maintenance RPCs are restricted to `service_role`; no RPC is executable by `anon` or `PUBLIC`.
 
 ## Local Test
 
@@ -140,7 +155,7 @@ schemas/hybrid-recall/test/local-test.sh
 docker rm -f ob-thanos-pg
 ```
 
-The harness creates the full minimal live-compatible `thoughts` shape, installs the schema twice, loads nine synthetic rows through its assertions, and verifies hybrid recall, filters, atomic deduplication, backfill, logical deletion/restoration, audit, and exact statistics.
+The harness creates the full minimal live-compatible `thoughts` shape, installs the schema twice, loads nine synthetic rows through its assertions, and verifies grants, hybrid recall and thresholding, filters, capture validation and deduplication, backfill, gated logical deletion/restoration, trigger audit counts and compact diffs, and exact statistics.
 
 ## Expected Outcome
 

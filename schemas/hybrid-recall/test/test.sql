@@ -12,6 +12,46 @@ AS $$
   FROM generate_series(1, 1536) AS dimension;
 $$;
 
+DO $$
+DECLARE
+  v_signature TEXT;
+BEGIN
+  FOREACH v_signature IN ARRAY ARRAY[
+    'public.soft_delete_thought(uuid,text,boolean)',
+    'public.restore_thought(uuid,text,boolean)',
+    'public.backfill_source_type(integer,boolean)',
+    'public.capture_thought_atomic(text,jsonb,vector)',
+    'public.log_thought_audit(uuid,text,text,jsonb)'
+  ] LOOP
+    IF has_function_privilege('authenticated', v_signature, 'EXECUTE') THEN
+      RAISE EXCEPTION 'authenticated retained execute on sensitive RPC %', v_signature;
+    END IF;
+
+    IF has_function_privilege('anon', v_signature, 'EXECUTE') THEN
+      RAISE EXCEPTION 'anon retained execute on sensitive RPC %', v_signature;
+    END IF;
+
+    IF NOT has_function_privilege('service_role', v_signature, 'EXECUTE') THEN
+      RAISE EXCEPTION 'service_role lacks execute on sensitive RPC %', v_signature;
+    END IF;
+  END LOOP;
+
+  IF NOT has_function_privilege(
+    'authenticated',
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision)',
+    'EXECUTE'
+  ) OR NOT has_function_privilege(
+    'authenticated',
+    'public.thought_stats_exact()',
+    'EXECUTE'
+  ) THEN
+    RAISE EXCEPTION 'expected service or authenticated grants are missing';
+  END IF;
+
+  RAISE NOTICE 'PASS sensitive RPC grants are service_role-only; read RPCs remain authenticated';
+END;
+$$;
+
 INSERT INTO public.thoughts (
   content, embedding, metadata, created_at, updated_at,
   type, sensitivity_tier, importance, quality_score, source_type, enriched
@@ -62,6 +102,43 @@ BEGIN
   END IF;
 
   RAISE NOTICE 'PASS hybrid fusion excludes restricted/deleted and exposes both rank paths (% rows)', v_count;
+END;
+$$;
+
+DO $$
+DECLARE
+  v_count INT;
+BEGIN
+  SELECT count(*) INTO v_count
+  FROM public.hybrid_search_thoughts(
+    '',
+    pg_temp.unit_vector(1),
+    20,
+    0,
+    '{}'::jsonb,
+    false,
+    60,
+    0.99
+  );
+
+  IF v_count <> 1 OR NOT EXISTS (
+    SELECT 1
+    FROM public.hybrid_search_thoughts(
+      '',
+      pg_temp.unit_vector(1),
+      20,
+      0,
+      '{}'::jsonb,
+      false,
+      60,
+      0.99
+    ) result
+    WHERE result.content = 'Alpha launch plan'
+  ) THEN
+    RAISE EXCEPTION 'semantic threshold expected only the exact vector match, got % rows', v_count;
+  END IF;
+
+  RAISE NOTICE 'PASS semantic threshold filters the semantic candidate leg (% row)', v_count;
 END;
 $$;
 
@@ -126,6 +203,32 @@ CREATE TEMP TABLE capture_results (
   attempt INT PRIMARY KEY,
   result JSONB NOT NULL
 );
+
+DO $$
+BEGIN
+  BEGIN
+    PERFORM public.capture_thought_atomic(NULL, '{}'::jsonb, NULL);
+    RAISE EXCEPTION 'expected NULL content rejection';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLERRM <> 'content required' THEN
+        RAISE;
+      END IF;
+  END;
+
+  BEGIN
+    PERFORM public.capture_thought_atomic('   ', '{}'::jsonb, NULL);
+    RAISE EXCEPTION 'expected blank content rejection';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLERRM <> 'content required' THEN
+        RAISE;
+      END IF;
+  END;
+
+  RAISE NOTICE 'PASS atomic capture rejects NULL and blank content';
+END;
+$$;
 
 INSERT INTO capture_results VALUES
   (1, public.capture_thought_atomic(
@@ -225,7 +328,67 @@ $$;
 CREATE TEMP TABLE logical_delete_target AS
 SELECT id FROM public.thoughts WHERE content = 'Project roadmap and milestones';
 
-SELECT public.soft_delete_thought(id, 'test-suite') FROM logical_delete_target;
+DO $$
+DECLARE
+  v_id UUID;
+BEGIN
+  SELECT id INTO v_id FROM logical_delete_target;
+
+  BEGIN
+    PERFORM public.soft_delete_thought(v_id, 'test-suite');
+    RAISE EXCEPTION 'expected soft delete confirmation gate';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLERRM <> 'confirm required' THEN
+        RAISE;
+      END IF;
+  END;
+
+  BEGIN
+    PERFORM public.restore_thought(v_id, 'test-suite');
+    RAISE EXCEPTION 'expected restore confirmation gate';
+  EXCEPTION
+    WHEN OTHERS THEN
+      IF SQLERRM <> 'confirm required' THEN
+        RAISE;
+      END IF;
+  END;
+
+  IF (SELECT count(*) FROM public.thought_audit WHERE thought_id = v_id) <> 1
+     OR NOT EXISTS (
+       SELECT 1 FROM public.thought_audit
+       WHERE thought_id = v_id AND action = 'capture'
+     ) THEN
+    RAISE EXCEPTION 'insert trigger did not create exactly one capture audit row';
+  END IF;
+
+  UPDATE public.thoughts
+  SET content = content || ' reviewed',
+      metadata = metadata || '{"review_state":"checked"}'::jsonb,
+      embedding = pg_temp.unit_vector(9),
+      updated_at = now()
+  WHERE id = v_id;
+
+  IF (SELECT count(*) FROM public.thought_audit WHERE thought_id = v_id AND action = 'update') <> 1
+     OR NOT EXISTS (
+       SELECT 1
+       FROM public.thought_audit
+       WHERE thought_id = v_id
+         AND action = 'update'
+         AND diff = jsonb_build_object(
+           'content_changed', true,
+           'metadata_keys_changed', ARRAY['review_state']::TEXT[],
+           'embedding_set', true
+         )
+     ) THEN
+    RAISE EXCEPTION 'update trigger did not create the expected compact audit diff';
+  END IF;
+
+  RAISE NOTICE 'PASS audit trigger records insert and compact update diff';
+END;
+$$;
+
+SELECT public.soft_delete_thought(id, 'test-suite', true) FROM logical_delete_target;
 
 DO $$
 DECLARE
@@ -249,7 +412,7 @@ BEGIN
 END;
 $$;
 
-SELECT public.restore_thought(id, 'test-suite') FROM logical_delete_target;
+SELECT public.restore_thought(id, 'test-suite', true) FROM logical_delete_target;
 
 DO $$
 DECLARE
@@ -264,7 +427,8 @@ BEGIN
     RAISE EXCEPTION 'restore did not remove logical deletion markers';
   END IF;
 
-  IF (SELECT count(*) FROM public.thought_audit WHERE thought_id = v_id AND action IN ('delete', 'restore')) <> 2 THEN
+  IF (SELECT count(*) FROM public.thought_audit WHERE thought_id = v_id AND action = 'delete') <> 1
+     OR (SELECT count(*) FROM public.thought_audit WHERE thought_id = v_id AND action = 'restore') <> 1 THEN
     RAISE EXCEPTION 'delete/restore audit rows are missing';
   END IF;
 
