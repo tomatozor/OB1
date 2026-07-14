@@ -1,10 +1,13 @@
 -- ============================================================
 -- Hybrid Recall for Open Brain
 --
--- Additive, idempotent SQL for hybrid RRF retrieval, atomic capture,
+-- Data-additive, idempotent SQL for hybrid RRF retrieval, atomic capture,
 -- source backfill, logical deletion, append-only audit, and exact stats.
--- Existing thoughts columns and RPCs are never removed or replaced.
+-- Existing thoughts columns and the canonical upsert_thought RPC are not
+-- removed or replaced; superseded Hybrid Recall overloads are replaced below.
 -- ============================================================
+
+BEGIN;
 
 SET search_path TO public, extensions;
 
@@ -57,6 +60,38 @@ ALTER TABLE public.thought_audit
 
 ALTER TABLE public.thought_audit
   ADD COLUMN IF NOT EXISTS session_id TEXT;
+
+-- Upgrade : les installations antérieures (schemas/thought-audit) portent un
+-- CHECK sans le verbe 'restore'. On élargit la contrainte historique, sinon
+-- les restaurations seraient journalisées en 'update' dégradé.
+DO $widen_audit_action_check$
+DECLARE
+  v_conname TEXT;
+BEGIN
+  FOR v_conname IN
+    SELECT conname
+    FROM pg_constraint
+    WHERE conrelid = 'public.thought_audit'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%action%'
+      AND pg_get_constraintdef(oid) NOT LIKE '%restore%'
+  LOOP
+    EXECUTE format('ALTER TABLE public.thought_audit DROP CONSTRAINT %I', v_conname);
+  END LOOP;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'public.thought_audit'::regclass
+      AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%action%'
+  ) THEN
+    ALTER TABLE public.thought_audit
+      ADD CONSTRAINT thought_audit_action_widened_check
+      CHECK (action IN ('capture', 'update', 'delete', 'restore'));
+  END IF;
+END
+$widen_audit_action_check$;
 
 CREATE INDEX IF NOT EXISTS idx_thought_audit_thought_created
   ON public.thought_audit (thought_id, created_at DESC);
@@ -782,3 +817,5 @@ BEGIN
   END IF;
 END
 $revoke_sensitive_rpc_anon$;
+
+COMMIT;

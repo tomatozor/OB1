@@ -17,7 +17,23 @@ const RRF_K = 60;
 const AGENT_MEMORY_RUNTIME = "open-brain-mcp-v2";
 const AGENT_MEMORY_SCHEMA_ERROR =
   "Agent Memory schema not installed — see schemas/agent-memory";
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const AGENT_MEMORY_TRANSACTIONAL_RPC_ERROR =
+  "Agent Memory transactional RPCs not installed — apply schemas/agent-memory";
+const DELETE_RPC_ERROR =
+  "soft_delete_thought RPC not installed — apply schemas/hybrid-recall before using delete_thought";
+const EMBEDDING_DIMENSIONS = 1536;
+const OPENROUTER_TIMEOUT_MS = 15_000;
+const POSTGREST_TIMEOUT_MS = 10_000;
+
+const postgrestFetch: typeof fetch = (input, init = {}) =>
+  fetch(input, {
+    ...init,
+    signal: AbortSignal.timeout(POSTGREST_TIMEOUT_MS),
+  });
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  global: { fetch: postgrestFetch },
+});
 
 type JsonObject = Record<string, unknown>;
 
@@ -152,7 +168,7 @@ function parseDateInput(name: string, value?: string): string | undefined {
   if (value === undefined) return undefined;
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) {
-    throw new Error(
+    throw actionable(
       `Invalid ${name}: expected a date parseable by Date.parse, received ${
         JSON.stringify(value)
       }`,
@@ -224,26 +240,82 @@ function toolError(message: string) {
   };
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
-  const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
-      input: text,
-    }),
-  });
-  if (!response.ok) {
-    const message = await response.text().catch(() => "");
+class ActionableToolError extends Error {}
+
+function actionable(message: string): ActionableToolError {
+  return new ActionableToolError(message);
+}
+
+function internalToolError(tool: string, error: unknown) {
+  if (error instanceof ActionableToolError) {
+    return toolError(`${tool} error: ${error.message}`);
+  }
+  const correlationId = crypto.randomUUID().slice(0, 8);
+  console.error(`[${correlationId}] ${tool} internal failure`, error);
+  return toolError(
+    `${tool} error: Internal failure (reference ${correlationId})`,
+  );
+}
+
+class EmbeddingRequestError extends Error {
+  constructor(message: string, readonly retryable: boolean) {
+    super(message);
+  }
+}
+
+export function validateEmbedding(value: unknown): number[] {
+  if (
+    !Array.isArray(value) || value.length !== EMBEDDING_DIMENSIONS ||
+    !value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
+  ) {
     throw new Error(
-      `OpenRouter embeddings failed: ${response.status} ${message}`,
+      `Invalid embedding response: expected ${EMBEDDING_DIMENSIONS} finite numbers`,
     );
   }
-  const body = await response.json();
-  return body.data[0].embedding;
+  return value as number[];
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof DOMException &&
+    (error.name === "TimeoutError" || error.name === "AbortError");
+}
+
+function retryDelay(attempt: number): Promise<void> {
+  const delay = 20 * (attempt + 1) + Math.floor(Math.random() * 30);
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function getEmbedding(text: string): Promise<number[]> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "openai/text-embedding-3-small",
+          input: text,
+        }),
+        signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        throw new EmbeddingRequestError(
+          `OpenRouter embeddings returned HTTP ${response.status}`,
+          response.status === 429 || response.status >= 500,
+        );
+      }
+      const body = await response.json();
+      return validateEmbedding(body?.data?.[0]?.embedding);
+    } catch (error) {
+      const retryable = isTimeoutError(error) ||
+        (error instanceof EmbeddingRequestError && error.retryable);
+      if (!retryable || attempt === 2) throw error;
+      await retryDelay(attempt);
+    }
+  }
+  throw new Error("Embedding retry loop exhausted");
 }
 
 async function extractMetadata(text: string): Promise<JsonObject> {
@@ -271,7 +343,13 @@ Only extract what's explicitly there.`,
         { role: "user", content: text },
       ],
     }),
+    signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
   });
+  if (!response.ok) {
+    throw new Error(
+      `OpenRouter metadata extraction returned HTTP ${response.status}`,
+    );
+  }
   const body = await response.json();
   try {
     return JSON.parse(body.choices[0].message.content);
@@ -328,24 +406,66 @@ function agentMemoryDatabaseError(
   operation: string,
 ): Error {
   if (isMissingDatabaseObjectError(error, objectName)) {
-    return new Error(AGENT_MEMORY_SCHEMA_ERROR);
+    return actionable(AGENT_MEMORY_SCHEMA_ERROR);
   }
   return new Error(`${operation} failed: ${errorText(error)}`);
 }
 
-function isRecord(value: unknown): value is JsonObject {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+function isMissingTransactionalAgentMemoryRpc(
+  error: unknown,
+  rpcName: string,
+): boolean {
+  return isMissingDatabaseObjectError(error, rpcName);
 }
 
-function extractThoughtId(value: unknown): string | null {
-  const candidate = Array.isArray(value) ? value[0] : value;
-  if (!isRecord(candidate)) return null;
-  const id = candidate.id ?? candidate.thought_id;
-  return typeof id === "string" &&
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-        .test(id)
-    ? id
-    : null;
+function agentMemoryTransactionalRpcError(
+  error: unknown,
+  rpcName: string,
+): Error {
+  if (isMissingTransactionalAgentMemoryRpc(error, rpcName)) {
+    return actionable(AGENT_MEMORY_TRANSACTIONAL_RPC_ERROR);
+  }
+  const detail = errorText(error);
+  if (
+    /idempot|different content|transition|workspace|not found|related memory/i
+      .test(detail)
+  ) {
+    return actionable(detail);
+  }
+  return new Error(`${rpcName} failed: ${detail}`);
+}
+
+export function isMissingEnhancedThoughtsError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const code = (error as JsonObject).code;
+    if (code === "42703" || code === "PGRST202" || code === "PGRST204") {
+      return true;
+    }
+  }
+  const text = errorText(error).toLowerCase();
+  return (text.includes("search_thoughts_text") ||
+    [
+      "updated_at",
+      "type",
+      "source_type",
+      "importance",
+      "quality_score",
+      "sensitivity_tier",
+    ].some((column) => text.includes(column))) &&
+    (text.includes("does not exist") || text.includes("schema cache") ||
+      text.includes("could not find"));
+}
+
+export function isHybridThresholdSignatureError(error: unknown): boolean {
+  const text = errorText(error).toLowerCase();
+  return text.includes("hybrid_search_thoughts") &&
+    text.includes("p_semantic_threshold") &&
+    (text.includes("does not exist") || text.includes("could not find") ||
+      text.includes("schema cache"));
+}
+
+function isRecord(value: unknown): value is JsonObject {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -356,6 +476,20 @@ async function sha256Hex(value: string): Promise<string> {
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${
+      Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+      ).join(",")
+    }}`;
+  }
+  return JSON.stringify(value ?? null);
 }
 
 function unsafeAgentMemoryReasons(text: string): string[] {
@@ -454,26 +588,6 @@ function agentMemoryTokenCost(memory: AgentMemoryRecord): number {
   return Math.ceil((memory.summary.length + memory.content.length) / 4);
 }
 
-const agentMemoryVisibilityRank: Record<AgentMemoryVisibility, number> = {
-  workspace: 0,
-  project: 1,
-  channel: 2,
-  personal: 3,
-};
-
-function canRestrictAgentMemory(
-  memory: AgentMemoryRecord,
-  requested: AgentMemoryVisibility,
-): boolean {
-  if (
-    agentMemoryVisibilityRank[requested] <
-      agentMemoryVisibilityRank[memory.visibility]
-  ) return false;
-  if (requested === "project" && !memory.project_id) return false;
-  if (requested === "channel" && !memory.channel_id) return false;
-  return true;
-}
-
 async function auditAgentMemory(
   event_type: string,
   payload: JsonObject,
@@ -561,14 +675,29 @@ async function hydrateRows(rows: ThoughtRecord[]): Promise<ThoughtRecord[]> {
   const details: ThoughtRecord[] = [];
   for (let index = 0; index < ids.length; index += 100) {
     const batch = ids.slice(index, index + 100);
-    const { data, error } = await supabase
+    const enriched = await supabase
       .from("thoughts")
       .select(
         "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
       )
       .in("id", batch);
-    if (error) throw new Error(`thought hydration failed: ${error.message}`);
-    details.push(...((data ?? []) as ThoughtRecord[]));
+    if (!enriched.error) {
+      details.push(...((enriched.data ?? []) as ThoughtRecord[]));
+      continue;
+    }
+    if (!isMissingEnhancedThoughtsError(enriched.error)) {
+      throw new Error(`thought hydration failed: ${errorText(enriched.error)}`);
+    }
+    const base = await supabase
+      .from("thoughts")
+      .select("id, content, metadata, created_at")
+      .in("id", batch);
+    if (base.error) {
+      throw new Error(
+        `base thought hydration failed: ${errorText(base.error)}`,
+      );
+    }
+    details.push(...((base.data ?? []) as ThoughtRecord[]));
   }
 
   const byId = new Map(details.map((row) => [row.id, row]));
@@ -627,7 +756,10 @@ async function textCandidates(
       p_filter: {},
       p_offset: rpcOffset,
     });
-    if (error) throw new Error(`search_thoughts_text failed: ${error.message}`);
+    if (error) {
+      if (isMissingEnhancedThoughtsError(error)) return [];
+      throw new Error(`search_thoughts_text failed: ${errorText(error)}`);
+    }
     const rows = (data ?? []) as ThoughtRecord[];
     if (!rows.length) break;
     const parsedTotal = Number(rows[0].total_count);
@@ -637,6 +769,29 @@ async function textCandidates(
   }
 
   return matches;
+}
+
+async function callHybridSearchRpc(
+  input: HybridSearchInput,
+  threshold: number,
+): Promise<{ data: unknown; error: unknown }> {
+  const basePayload = {
+    p_query: input.query,
+    p_query_embedding: input.queryEmbedding,
+    p_limit: input.limit,
+    p_offset: input.offset,
+    p_filter: input.filter,
+    p_include_restricted: input.includeRestricted,
+    p_rrf_k: RRF_K,
+  };
+  const result = await supabase.rpc("hybrid_search_thoughts", {
+    ...basePayload,
+    p_semantic_threshold: threshold,
+  });
+  if (!result.error || !isHybridThresholdSignatureError(result.error)) {
+    return result;
+  }
+  return await supabase.rpc("hybrid_search_thoughts", basePayload);
 }
 
 async function excludeDeletedConnections(
@@ -743,15 +898,7 @@ async function runSearch(params: {
         },
         {
           primary: async (input) =>
-            await supabase.rpc("hybrid_search_thoughts", {
-              p_query: input.query,
-              p_query_embedding: input.queryEmbedding,
-              p_limit: input.limit,
-              p_offset: input.offset,
-              p_filter: input.filter,
-              p_include_restricted: input.includeRestricted,
-              p_rrf_k: RRF_K,
-            }),
+            await callHybridSearchRpc(input, params.threshold),
           semantic: async () =>
             await semanticCandidates(
               embedding,
@@ -780,6 +927,36 @@ async function runSearch(params: {
       returned: page.length,
       has_more: rows.length > params.limit,
     },
+  };
+}
+
+async function fetchThoughtForChatGpt(
+  id: string,
+): Promise<{ data: ThoughtRecord | null; error: unknown }> {
+  const enriched = await supabase
+    .from("thoughts")
+    .select(
+      "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
+    )
+    .eq("id", id)
+    .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
+    .or("sensitivity_tier.is.null,sensitivity_tier.neq.restricted")
+    .single();
+  if (!enriched.error) {
+    return { data: enriched.data as ThoughtRecord, error: null };
+  }
+  if (!isMissingEnhancedThoughtsError(enriched.error)) {
+    return { data: null, error: enriched.error };
+  }
+  const base = await supabase
+    .from("thoughts")
+    .select("id, content, metadata, created_at")
+    .eq("id", id)
+    .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
+    .single();
+  return {
+    data: (base.data as ThoughtRecord | null) ?? null,
+    error: base.error,
   };
 }
 
@@ -1034,7 +1211,7 @@ function registerAgentMemoryTools(server: McpServer): void {
           memories: selected.map(agentMemoryResponse),
         });
       } catch (error) {
-        return toolError(`memory_recall error: ${(error as Error).message}`);
+        return internalToolError("memory_recall", error);
       }
     },
   );
@@ -1113,200 +1290,67 @@ function registerAgentMemoryTools(server: McpServer): void {
             : "workspace");
         const sourceRefs =
           (provenance.source_refs ?? []) as AgentMemorySourceRef[];
-        const canonicalContent = JSON.stringify({
-          memory_type: memory.type,
-          summary: memory.summary,
-          content: memory.content,
-          visibility,
-          project_id: memory.project_id ?? null,
-          channel_id: memory.channel_id ?? null,
-          provenance_status: provenance.status,
-          source_refs: sourceRefs,
-          created_by,
-        });
-        const writebackHash = await sha256Hex(canonicalContent);
-        const existingResult = await supabase
-          .from("agent_memories")
-          .select("*")
-          .eq("workspace_id", workspace_id)
-          .eq("idempotency_key", idempotency_key)
-          .maybeSingle();
-        if (existingResult.error) {
-          throw agentMemoryDatabaseError(
-            existingResult.error,
-            "agent_memories",
-            "Agent Memory idempotency lookup",
-          );
-        }
-        if (existingResult.data) {
-          const existing = existingResult.data as AgentMemoryRecord;
-          const metadata = asMetadata(existing.metadata);
-          const priorHash = metadata.writeback_content_hash ??
-            existing.content_hash;
-          if (priorHash !== writebackHash) {
-            return toolError(
-              "memory_writeback error: Idempotency key was already used with different content",
-            );
-          }
-          return toolJson({
-            memory: agentMemoryResponse(existing),
-            idempotent_replay: true,
-          });
-        }
-
         const unsafe = [memory.summary, memory.content].flatMap((text) =>
           unsafeAgentMemoryReasons(text)
         );
         if (unsafe.length) {
-          await auditAgentMemory("memory_rejected", {
-            workspace_id,
-            project_id: memory.project_id ?? null,
-            actor_kind: "system",
-            reason: "unsafe_writeback",
-            unsafe: [...new Set(unsafe)],
-          });
           return toolError(
             `memory_writeback error: Unsafe write-back blocked: ${
               [...new Set(unsafe)].join(", ")
             }`,
           );
         }
-
-        const embedding = await getEmbedding(memory.content);
-        const { data: thoughtResult, error: thoughtError } = await supabase.rpc(
-          "upsert_thought",
-          {
-            p_content: memory.content,
-            p_payload: {
-              metadata: {
-                source: "agent_memory",
-                source_type: "agent_memory",
-                type: memory.type,
-                agent_memory: {
-                  runtime: AGENT_MEMORY_RUNTIME,
-                  provenance_status: provenance.status,
-                },
-              },
-            },
-          },
-        );
-        if (thoughtError) {
-          throw new Error(`upsert_thought failed: ${thoughtError.message}`);
-        }
-        const thoughtId = extractThoughtId(thoughtResult);
-        if (!thoughtId) {
-          throw new Error("upsert_thought returned no UUID thought id");
-        }
-        const embeddingResult = await supabase
-          .from("thoughts")
-          .update({ embedding: `[${embedding.join(",")}]` })
-          .eq("id", thoughtId);
-        if (embeddingResult.error) {
-          throw new Error(
-            `Agent Memory thought embedding update failed: ${embeddingResult.error.message}`,
-          );
-        }
-
-        const insertPayload = {
-          thought_id: thoughtId,
-          workspace_id,
-          project_id: memory.project_id ?? null,
-          channel_id: memory.channel_id ?? null,
-          visibility,
-          memory_type: memory.type,
+        const normalizedMemory = {
+          type: memory.type,
           summary: memory.summary,
           content: memory.content,
-          provenance_status: provenance.status,
-          confidence: 0.5,
-          created_by,
-          runtime_name: AGENT_MEMORY_RUNTIME,
-          can_use_as_instruction: false,
-          can_use_as_evidence: true,
-          requires_user_confirmation: true,
-          review_status: "pending",
-          last_confirmed_at: null,
-          idempotency_key,
-          content_hash: writebackHash,
-          metadata: {
-            source_refs: sourceRefs,
-            writeback_schema_version: "openbrain.agent_memory.mcp_writeback.v1",
-            writeback_content_hash: writebackHash,
-          },
+          visibility,
+          project_id: memory.project_id ?? null,
+          channel_id: memory.channel_id ?? null,
         };
-        const inserted = await supabase.from("agent_memories")
-          .insert(insertPayload)
-          .select("*")
-          .single();
-        if (inserted.error || !inserted.data) {
-          if ((inserted.error as JsonObject | null)?.code === "23505") {
-            const concurrent = await supabase.from("agent_memories")
-              .select("*")
-              .eq("workspace_id", workspace_id)
-              .eq("idempotency_key", idempotency_key)
-              .maybeSingle();
-            if (concurrent.error) {
-              throw agentMemoryDatabaseError(
-                concurrent.error,
-                "agent_memories",
-                "Agent Memory concurrent idempotency lookup",
-              );
-            }
-            if (concurrent.data) {
-              const concurrentMemory = concurrent.data as AgentMemoryRecord;
-              const priorHash = asMetadata(concurrentMemory.metadata)
-                .writeback_content_hash ?? concurrentMemory.content_hash;
-              if (priorHash === writebackHash) {
-                return toolJson({
-                  memory: agentMemoryResponse(concurrentMemory),
-                  idempotent_replay: true,
-                });
-              }
-            }
-            return toolError(
-              "memory_writeback error: Idempotency key was concurrently used with different content",
-            );
-          }
-          throw agentMemoryDatabaseError(
-            inserted.error,
-            "agent_memories",
-            "Agent Memory insert",
+        const normalizedProvenance = { status: provenance.status };
+        const artifacts: JsonObject[] = [];
+        const contentHash = await sha256Hex(canonicalJson({
+          memory: normalizedMemory,
+          provenance: normalizedProvenance,
+          source_refs: sourceRefs,
+          artifacts,
+          created_by,
+        }));
+        const result = await supabase.rpc("agent_memory_writeback_tx", {
+          p_workspace_id: workspace_id,
+          p_idempotency_key: idempotency_key,
+          p_content_hash: contentHash,
+          p_memory: normalizedMemory,
+          p_provenance: normalizedProvenance,
+          p_source_refs: sourceRefs,
+          p_artifacts: artifacts,
+          p_created_by: created_by,
+          p_request_context: {
+            runtime_name: AGENT_MEMORY_RUNTIME,
+            schema_version: "openbrain.agent_memory.mcp_writeback.v1",
+          },
+        });
+        if (result.error) {
+          throw agentMemoryTransactionalRpcError(
+            result.error,
+            "agent_memory_writeback_tx",
           );
         }
-        const created = inserted.data as AgentMemoryRecord;
-
-        if (sourceRefs.length) {
-          const { error } = await supabase.from("agent_memory_source_refs")
-            .insert(sourceRefs.map((source) => ({
-              memory_id: created.id,
-              source_kind: source.kind,
-              uri: source.uri ?? null,
-              title: source.title ?? null,
-              source_timestamp: source.timestamp ?? null,
-            })));
-          if (error) {
-            throw agentMemoryDatabaseError(
-              error,
-              "agent_memory_source_refs",
-              "Agent Memory source reference insert",
-            );
-          }
+        const response = asMetadata(result.data);
+        const memoryResult = isRecord(response.memory)
+          ? response.memory
+          : response;
+        if (typeof memoryResult.id !== "string") {
+          throw new Error("agent_memory_writeback_tx returned no memory");
         }
-
-        await auditAgentMemory("memory_written", {
-          workspace_id,
-          project_id: memory.project_id ?? null,
-          memory_id: created.id,
-          runtime_name: AGENT_MEMORY_RUNTIME,
-          actor_kind: created_by,
-          provenance_status: provenance.status,
-          review_status: "pending",
-        });
         return toolJson({
-          memory: agentMemoryResponse(created),
-          idempotent_replay: false,
+          memory: agentMemoryResponse(memoryResult as AgentMemoryRecord),
+          idempotent_replay: response.replayed === true ||
+            memoryResult.replayed === true,
         });
       } catch (error) {
-        return toolError(`memory_writeback error: ${(error as Error).message}`);
+        return internalToolError("memory_writeback", error);
       }
     },
   );
@@ -1432,9 +1476,7 @@ function registerAgentMemoryTools(server: McpServer): void {
         }
         return toolJson({ ok: true });
       } catch (error) {
-        return toolError(
-          `memory_usage_report error: ${(error as Error).message}`,
-        );
+        return internalToolError("memory_usage_report", error);
       }
     },
   );
@@ -1482,9 +1524,7 @@ function registerAgentMemoryTools(server: McpServer): void {
           },
         });
       } catch (error) {
-        return toolError(
-          `memory_review_queue error: ${(error as Error).message}`,
-        );
+        return internalToolError("memory_review_queue", error);
       }
     },
   );
@@ -1562,231 +1602,51 @@ function registerAgentMemoryTools(server: McpServer): void {
           );
         }
 
-        const beforeResult = await supabase.from("agent_memories")
-          .select("*")
-          .eq("id", memory_id)
-          .eq("workspace_id", workspace_id)
-          .maybeSingle();
-        if (beforeResult.error) {
-          throw agentMemoryDatabaseError(
-            beforeResult.error,
-            "agent_memories",
-            "Agent Memory review lookup",
-          );
-        }
-        if (!beforeResult.data) {
-          return toolError("memory_review error: Memory not found");
-        }
-        const before = beforeResult.data as AgentMemoryRecord;
         if (related_memory_id === memory_id) {
           return toolError(
             "memory_review error: A memory cannot be related to itself",
           );
         }
-        if (related_memory_id) {
-          const relatedResult = await supabase.from("agent_memories")
-            .select("id")
-            .eq("id", related_memory_id)
-            .eq("workspace_id", workspace_id)
-            .maybeSingle();
-          if (relatedResult.error) {
-            throw agentMemoryDatabaseError(
-              relatedResult.error,
-              "agent_memories",
-              "Related Agent Memory lookup",
-            );
-          }
-          if (!relatedResult.data) {
-            return toolError(
-              "memory_review error: Related memory must exist in the same workspace",
-            );
-          }
-        }
-
         const normalizedAction = action === "approve" ? "confirm" : action;
-        const updates: JsonObject = {};
-        if (normalizedAction === "confirm") {
-          Object.assign(updates, {
-            review_status: "confirmed",
-            provenance_status: "user_confirmed",
-            can_use_as_instruction: true,
-            requires_user_confirmation: false,
-            last_confirmed_at: new Date().toISOString(),
-          });
-        } else if (normalizedAction === "evidence_only") {
-          Object.assign(updates, {
-            review_status: "evidence_only",
-            can_use_as_instruction: false,
-            can_use_as_evidence: true,
-            requires_user_confirmation: false,
-          });
-        } else if (normalizedAction === "reject") {
-          Object.assign(updates, {
-            review_status: "rejected",
-            lifecycle_status: "rejected",
-            can_use_as_instruction: false,
-            can_use_as_evidence: false,
-          });
-        } else if (normalizedAction === "mark_stale") {
-          Object.assign(updates, {
-            review_status: "stale",
-            lifecycle_status: "stale",
-            can_use_as_instruction: false,
-          });
-        } else if (normalizedAction === "dispute") {
-          Object.assign(updates, {
-            lifecycle_status: "disputed",
-            provenance_status: "disputed",
-            can_use_as_instruction: false,
-            can_use_as_evidence: false,
-            requires_user_confirmation: true,
-          });
-        } else if (normalizedAction === "restrict_scope") {
-          if (!canRestrictAgentMemory(before, visibility!)) {
+        if (content) {
+          const unsafe = unsafeAgentMemoryReasons(content);
+          if (unsafe.length) {
             return toolError(
-              "memory_review error: restrict_scope may only reduce the existing visibility",
-            );
-          }
-          Object.assign(updates, {
-            review_status: "restricted",
-            visibility,
-          });
-        } else if (normalizedAction === "edit") {
-          if (content) {
-            const unsafe = unsafeAgentMemoryReasons(content);
-            if (unsafe.length) {
-              return toolError(
-                `memory_review error: Unsafe review edit blocked: ${
-                  unsafe.join(", ")
-                }`,
-              );
-            }
-            const embedding = await getEmbedding(content);
-            const thoughtResult = await supabase.rpc("upsert_thought", {
-              p_content: content,
-              p_payload: {
-                metadata: {
-                  source: "agent_memory_review",
-                  agent_memory_id: memory_id,
-                },
-              },
-            });
-            if (thoughtResult.error) {
-              throw new Error(
-                `upsert_thought failed: ${thoughtResult.error.message}`,
-              );
-            }
-            const thoughtId = extractThoughtId(thoughtResult.data);
-            if (!thoughtId) {
-              throw new Error("upsert_thought returned no UUID thought id");
-            }
-            const embeddingResult = await supabase.from("thoughts")
-              .update({ embedding: `[${embedding.join(",")}]` })
-              .eq("id", thoughtId);
-            if (embeddingResult.error) {
-              throw new Error(
-                `Agent Memory review embedding update failed: ${embeddingResult.error.message}`,
-              );
-            }
-            updates.content = content;
-            updates.content_hash = await sha256Hex(
-              `${before.memory_type}:${content}`,
-            );
-            updates.thought_id = thoughtId;
-          }
-          if (summary) updates.summary = summary;
-        } else if (normalizedAction === "merge") {
-          Object.assign(updates, {
-            review_status: "merged",
-            lifecycle_status: "superseded",
-            can_use_as_instruction: false,
-            can_use_as_evidence: false,
-            requires_user_confirmation: false,
-          });
-        } else if (normalizedAction === "supersede") {
-          Object.assign(updates, {
-            review_status: "stale",
-            lifecycle_status: "superseded",
-            can_use_as_instruction: false,
-            can_use_as_evidence: false,
-            requires_user_confirmation: false,
-          });
-        }
-
-        const updatedResult = await supabase.from("agent_memories")
-          .update(updates)
-          .eq("id", memory_id)
-          .eq("workspace_id", workspace_id)
-          .select("*")
-          .single();
-        if (updatedResult.error || !updatedResult.data) {
-          throw agentMemoryDatabaseError(
-            updatedResult.error,
-            "agent_memories",
-            "Agent Memory review update",
-          );
-        }
-        const after = updatedResult.data as AgentMemoryRecord;
-        const reviewActionResult = await supabase
-          .from("agent_memory_review_actions")
-          .insert({
-            memory_id,
-            action: normalizedAction,
-            actor_id,
-            notes: notes ?? null,
-            before,
-            after,
-          });
-        if (reviewActionResult.error) {
-          throw agentMemoryDatabaseError(
-            reviewActionResult.error,
-            "agent_memory_review_actions",
-            "Agent Memory review action insert",
-          );
-        }
-
-        if (
-          related_memory_id && ["merge", "supersede"].includes(normalizedAction)
-        ) {
-          const relationResult = await supabase
-            .from("agent_memory_relations")
-            .insert({
-              from_memory_id: memory_id,
-              to_memory_id: related_memory_id,
-              relation: normalizedAction === "merge"
-                ? "merged_into"
-                : "superseded_by",
-              confidence: 1,
-            });
-          if (relationResult.error) {
-            throw agentMemoryDatabaseError(
-              relationResult.error,
-              "agent_memory_relations",
-              "Agent Memory relation insert",
+              `memory_review error: Unsafe review edit blocked: ${
+                unsafe.join(", ")
+              }`,
             );
           }
         }
-
-        const eventMap: Record<string, string> = {
-          confirm: "memory_confirmed",
-          edit: "memory_edited",
-          reject: "memory_rejected",
-          supersede: "memory_superseded",
-          dispute: "memory_disputed",
-        };
-        await auditAgentMemory(eventMap[normalizedAction] ?? "memory_edited", {
-          workspace_id,
-          project_id: before.project_id,
-          memory_id,
-          actor_kind: "user",
-          actor_label: actor_id,
-          action: normalizedAction,
-          notes: notes ?? null,
-          related_memory_id: related_memory_id ?? null,
+        const result = await supabase.rpc("agent_memory_review_tx", {
+          p_memory_id: memory_id,
+          p_workspace_id: workspace_id,
+          p_action: normalizedAction,
+          p_actor_id: actor_id,
+          p_notes: notes ?? null,
+          p_related_memory_id: related_memory_id ?? null,
+          p_content: content ?? null,
+          p_summary: summary ?? null,
+          p_visibility: visibility ?? null,
         });
-        return toolJson({ memory: agentMemoryResponse(after) });
+        if (result.error) {
+          throw agentMemoryTransactionalRpcError(
+            result.error,
+            "agent_memory_review_tx",
+          );
+        }
+        const response = asMetadata(result.data);
+        const memoryResult = isRecord(response.memory)
+          ? response.memory
+          : response;
+        if (typeof memoryResult.id !== "string") {
+          throw new Error("agent_memory_review_tx returned no memory");
+        }
+        return toolJson({
+          memory: agentMemoryResponse(memoryResult as AgentMemoryRecord),
+        });
       } catch (error) {
-        return toolError(`memory_review error: ${(error as Error).message}`);
+        return internalToolError("memory_review", error);
       }
     },
   );
@@ -1833,7 +1693,7 @@ function buildServer(): McpServer {
           })),
         });
       } catch (error) {
-        return toolError(`Search error: ${(error as Error).message}`);
+        return internalToolError("Search", error);
       }
     },
   );
@@ -1851,15 +1711,7 @@ function buildServer(): McpServer {
     },
     async ({ id }) => {
       try {
-        const { data, error } = await supabase
-          .from("thoughts")
-          .select(
-            "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
-          )
-          .eq("id", id)
-          .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
-          .or("sensitivity_tier.is.null,sensitivity_tier.neq.restricted")
-          .single();
+        const { data, error } = await fetchThoughtForChatGpt(id);
         if (error || !data) {
           return toolError(`Fetch error: thought ${id} not found`);
         }
@@ -1899,7 +1751,7 @@ function buildServer(): McpServer {
           connections,
         });
       } catch (error) {
-        return toolError(`Fetch error: ${(error as Error).message}`);
+        return internalToolError("Fetch", error);
       }
     },
   );
@@ -1960,7 +1812,7 @@ function buildServer(): McpServer {
           }),
         );
       } catch (error) {
-        return toolError(`search_thoughts error: ${(error as Error).message}`);
+        return internalToolError("search_thoughts", error);
       }
     },
   );
@@ -2031,7 +1883,7 @@ function buildServer(): McpServer {
         }));
         return toolJson({ results });
       } catch (error) {
-        return toolError(`recall_context error: ${(error as Error).message}`);
+        return internalToolError("recall_context", error);
       }
     },
   );
@@ -2116,7 +1968,7 @@ function buildServer(): McpServer {
           },
         });
       } catch (error) {
-        return toolError(`list_thoughts error: ${(error as Error).message}`);
+        return internalToolError("list_thoughts", error);
       }
     },
   );
@@ -2140,9 +1992,7 @@ function buildServer(): McpServer {
           p_exclude_restricted: !include_restricted,
         });
         if (error) {
-          return toolError(
-            `thought_stats error: brain_stats_aggregate failed: ${error.message}`,
-          );
+          throw new Error(`brain_stats_aggregate failed: ${errorText(error)}`);
         }
         return toolJson({
           since_days,
@@ -2150,11 +2000,7 @@ function buildServer(): McpServer {
           aggregate: data,
         });
       } catch (error) {
-        return toolError(
-          `thought_stats error: brain_stats_aggregate failed: ${
-            (error as Error).message
-          }`,
-        );
+        return internalToolError("thought_stats", error);
       }
     },
   );
@@ -2190,7 +2036,7 @@ function buildServer(): McpServer {
           p_exclude_restricted: true,
         });
         if (error) {
-          return toolError(`related_thoughts error: ${error.message}`);
+          throw new Error(`connection lookup failed: ${errorText(error)}`);
         }
         const rows = await excludeDeletedConnections(
           (data ?? []) as JsonObject[],
@@ -2200,7 +2046,7 @@ function buildServer(): McpServer {
           results: rows.slice(0, limit),
         });
       } catch (error) {
-        return toolError(`related_thoughts error: ${(error as Error).message}`);
+        return internalToolError("related_thoughts", error);
       }
     },
   );
@@ -2237,9 +2083,7 @@ function buildServer(): McpServer {
           const result = asMetadata(atomicResult.data);
           const thoughtId = result.id;
           if (typeof thoughtId !== "string") {
-            return toolError(
-              "Failed to capture: capture_thought_atomic returned no id",
-            );
+            throw new Error("capture_thought_atomic returned no id");
           }
           return toolJson({
             ...result,
@@ -2256,8 +2100,8 @@ function buildServer(): McpServer {
             "capture_thought_atomic",
           )
         ) {
-          return toolError(
-            `Failed to capture atomically: ${atomicResult.error.message}`,
+          throw new Error(
+            `capture_thought_atomic failed: ${errorText(atomicResult.error)}`,
           );
         }
 
@@ -2265,18 +2109,20 @@ function buildServer(): McpServer {
           p_content: content,
           p_payload: payload,
         });
-        if (error) return toolError(`Failed to capture: ${error.message}`);
+        if (error) {
+          throw new Error(`upsert_thought failed: ${errorText(error)}`);
+        }
         const thoughtId = (data as JsonObject | null)?.id;
         if (typeof thoughtId !== "string") {
-          return toolError("Failed to capture: upsert_thought returned no id");
+          throw new Error("upsert_thought returned no id");
         }
         const embeddingResult = await supabase
           .from("thoughts")
           .update({ embedding: embeddingValue })
           .eq("id", thoughtId);
         if (embeddingResult.error) {
-          return toolError(
-            `Failed to save embedding: ${embeddingResult.error.message}`,
+          throw new Error(
+            `embedding update failed: ${errorText(embeddingResult.error)}`,
           );
         }
         return toolJson({
@@ -2287,7 +2133,7 @@ function buildServer(): McpServer {
           via: "fallback_non_atomic",
         });
       } catch (error) {
-        return toolError(`capture_thought error: ${(error as Error).message}`);
+        return internalToolError("capture_thought", error);
       }
     },
   );
@@ -2332,6 +2178,11 @@ function buildServer(): McpServer {
           .single();
         if (fetchError || !existing) {
           return toolError(`update_thought error: thought ${id} not found`);
+        }
+        if (isDeleted(existing as ThoughtRecord)) {
+          return toolError(
+            `update_thought error: thought ${id} is logically deleted`,
+          );
         }
 
         if (if_unchanged_since) {
@@ -2382,7 +2233,9 @@ function buildServer(): McpServer {
         const { data, error } = await updateQuery
           .select("id, content, metadata, created_at, updated_at")
           .maybeSingle();
-        if (error) return toolError(`update_thought error: ${error.message}`);
+        if (error) {
+          throw new Error(`thought update failed: ${errorText(error)}`);
+        }
         if (!data) {
           return toolError(
             `STALE_READ: thought ${id} changed before the update could be applied`,
@@ -2397,7 +2250,7 @@ function buildServer(): McpServer {
           updated_at: data.updated_at,
         });
       } catch (error) {
-        return toolError(`update_thought error: ${(error as Error).message}`);
+        return internalToolError("update_thought", error);
       }
     },
   );
@@ -2441,88 +2294,18 @@ function buildServer(): McpServer {
           });
         }
         if (
-          !isMissingDatabaseObjectError(
+          isMissingDatabaseObjectError(
             atomicResult.error,
             "soft_delete_thought",
           )
         ) {
-          return toolError(
-            `delete_thought error: ${atomicResult.error.message}`,
-          );
+          return toolError(`delete_thought error: ${DELETE_RPC_ERROR}`);
         }
-
-        const { data: existing, error: fetchError } = await supabase
-          .from("thoughts")
-          .select("id, content, metadata, created_at, updated_at")
-          .eq("id", id)
-          .single();
-        if (fetchError || !existing) {
-          return toolError(`delete_thought error: thought ${id} not found`);
-        }
-        const priorMetadata = asMetadata(existing.metadata);
-        if (isDeleted({ metadata: priorMetadata })) {
-          return toolJson({
-            id,
-            deleted: true,
-            already_deleted: true,
-            atomic: false,
-            via: "fallback_non_atomic",
-          });
-        }
-
-        const deletedAt = new Date().toISOString();
-        const metadata = {
-          ...priorMetadata,
-          deleted: true,
-          deleted_at: deletedAt,
-          deleted_by: "mcp",
-        };
-        let deleteQuery = supabase
-          .from("thoughts")
-          .update({ metadata })
-          .eq("id", id)
-          .not("metadata", "cs", '{"deleted":true}');
-        deleteQuery = existing.updated_at
-          ? deleteQuery.eq("updated_at", existing.updated_at)
-          : deleteQuery.is("updated_at", null);
-        const { data, error } = await deleteQuery
-          .select("id, updated_at")
-          .maybeSingle();
-        if (error) return toolError(`delete_thought error: ${error.message}`);
-        if (!data) {
-          return toolError(
-            `STALE_READ: thought ${id} changed before logical deletion could be applied`,
-          );
-        }
-
-        try {
-          const auditResult = await supabase.from("thought_audit").insert({
-            thought_id: id,
-            action: "delete",
-            diff: {
-              previous_content: existing.content,
-              previous_metadata: priorMetadata,
-              deleted_at: deletedAt,
-              deleted_by: "mcp",
-            },
-          });
-          if (auditResult.error) {
-            console.warn("delete_thought audit unavailable");
-          }
-        } catch {
-          console.warn("delete_thought audit unavailable");
-        }
-
-        return toolJson({
-          id,
-          deleted: true,
-          deleted_at: deletedAt,
-          deleted_by: "mcp",
-          atomic: false,
-          via: "fallback_non_atomic",
-        });
+        throw new Error(
+          `soft_delete_thought failed: ${errorText(atomicResult.error)}`,
+        );
       } catch (error) {
-        return toolError(`delete_thought error: ${(error as Error).message}`);
+        return internalToolError("delete_thought", error);
       }
     },
   );
@@ -2537,29 +2320,20 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
 
-export function timingSafeEqualStrings(a: string, b: string): boolean {
+export async function timingSafeEqualStrings(
+  a: string,
+  b: string,
+): Promise<boolean> {
   const encoder = new TextEncoder();
-  const aBytes = encoder.encode(a);
-  const bBytes = encoder.encode(b);
-  const subtle = (crypto as unknown as {
-    subtle?: {
-      timingSafeEqual?: (
-        left: ArrayBufferView,
-        right: ArrayBufferView,
-      ) => boolean;
-    };
-  }).subtle;
-  if (
-    aBytes.length === bBytes.length &&
-    typeof subtle?.timingSafeEqual === "function"
-  ) {
-    return subtle.timingSafeEqual(aBytes, bBytes);
-  }
-
-  let difference = aBytes.length ^ bBytes.length;
-  const length = Math.max(aBytes.length, bBytes.length);
-  for (let index = 0; index < length; index++) {
-    difference |= (aBytes[index] ?? 0) ^ (bBytes[index] ?? 0);
+  const [aDigest, bDigest] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(a)),
+    crypto.subtle.digest("SHA-256", encoder.encode(b)),
+  ]);
+  const aBytes = new Uint8Array(aDigest);
+  const bBytes = new Uint8Array(bDigest);
+  let difference = 0;
+  for (let index = 0; index < 32; index++) {
+    difference |= aBytes[index] ^ bBytes[index];
   }
   return difference === 0;
 }
@@ -2574,10 +2348,12 @@ app.all("*", async (context) => {
   const bearerKey = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
   const hasConfiguredKey = typeof MCP_ACCESS_KEY === "string" &&
     MCP_ACCESS_KEY.length > 0;
-  const headerMatches = hasConfiguredKey &&
-    timingSafeEqualStrings(headerKey, MCP_ACCESS_KEY);
-  const bearerMatches = hasConfiguredKey &&
-    timingSafeEqualStrings(bearerKey, MCP_ACCESS_KEY);
+  const [headerMatches, bearerMatches] = hasConfiguredKey
+    ? await Promise.all([
+      timingSafeEqualStrings(headerKey, MCP_ACCESS_KEY),
+      timingSafeEqualStrings(bearerKey, MCP_ACCESS_KEY),
+    ])
+    : [false, false];
   if (!hasConfiguredKey || (!headerMatches && !bearerMatches)) {
     return context.json(
       { error: "Invalid or missing access key" },

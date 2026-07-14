@@ -13,9 +13,9 @@ sequenceDiagram
   API-->>Runtime: scoped memories + use policy
   Runtime->>API: POST /writeback
   API->>API: block secrets/transcripts/reasoning dumps
-  API->>OB1: store evidence-only memory
+  API->>OB1: agent_memory_writeback_tx (memory + provenance + sources + artifacts + audit)
   Human->>API: PATCH /memories/:id/review
-  API->>OB1: confirm/evidence-only/reject/scope
+  API->>OB1: agent_memory_review_tx (state + review + relation + audit)
 ```
 
 ## What It Does
@@ -52,10 +52,10 @@ GENERATED DURING SETUP
 
 Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql).
 
-**Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist.
+**Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist and PostgREST exposes both `agent_memory_writeback_tx` and `agent_memory_review_tx`.
 
 > [!CAUTION]
-> Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. The schema creates eight new sidecar tables; it does not alter `thoughts`.
+> Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. Existing installations must re-apply the current schema upgrade so the transactional RPCs are installed. The sidecar tables remain isolated from existing thought content.
 
 ![Step 2](https://img.shields.io/badge/Step_2-Deploy_the_Edge_Function-1E88E5?style=for-the-badge)
 
@@ -148,11 +148,13 @@ Authorization: Bearer YOUR_MCP_ACCESS_KEY
 
 Credentials in `?key=...` are rejected so they cannot leak into URL, proxy, CDN, or function logs. Header credentials are compared in constant time. JSON request bodies are capped at 64 KiB.
 
-`POST /writeback` requires `idempotency_key`. The server computes a SHA-256 `content_hash` for every generated memory row and a canonical request hash for the complete row set. The canonical bytes are the UTF-8 compact JSON encoding of the ordered `[{"memory_type":"...","content":"..."}]` rows produced by the request. Reusing the same key in the same workspace returns the existing rows only when both hashes match; changed content returns `409`. A caller may send that canonical request hash in `content_hash` for end-to-end verification.
+`POST /writeback` requires `idempotency_key`. The server computes a SHA-256 `content_hash` for every generated memory row and a canonical request hash for the complete row set. The canonical bytes are the UTF-8 compact JSON encoding of the ordered `[{"memory_type":"...","content":"..."}]` rows produced by the request. Reusing the same key in the same workspace returns the existing rows with `replayed=true` only when the hash matches; changed content returns `409`. A caller may send the canonical request hash in `content_hash` for end-to-end verification.
 
 Agent write-back accepts only `observed`, `inferred`, or `generated` provenance and always starts as evidence: `can_use_as_instruction=false`, `can_use_as_evidence=true`, `requires_user_confirmation=true`, and `review_status=pending`. Human confirmation through the review endpoint is the only API path that promotes a row to instruction-grade. Trusted bulk imports need a separately approved import path; this endpoint does not silently promote them.
 
-Lifecycle-changing review actions (`mark_stale`, `merge`, `reject`, `dispute`, and `supersede`) require a reviewer identity and notes. `merge` and `supersede` also require a related memory in the same workspace. These actions update `lifecycle_status`; there is no physical-delete endpoint. Every review action and recall/writeback event is persisted in the audit trail.
+Lifecycle-changing review actions (`mark_stale`, `merge`, `reject`, `dispute`, and `supersede`) require a reviewer identity and notes. `merge` and `supersede` also require a related memory in the same workspace. These actions update `lifecycle_status`; there is no physical-delete endpoint. Accepted write-backs and every review transition are committed through transactional RPCs: memory metadata, sources, artifacts, review action, relation, and audit either commit together or roll back together. The API fails closed with `503` when those RPCs are not installed.
+
+Outbound calls are bounded: OpenRouter embedding requests time out after 15 seconds and PostgREST requests after 10 seconds. Embeddings are rejected unless they contain exactly 1536 finite numbers. Unexpected server errors return only a generic message and a short correlation id; detailed diagnostics remain in function logs.
 
 The recall adapter deliberately calls the live three-argument RPC signature:
 
@@ -186,7 +188,10 @@ deno run --allow-env test/smoke-local.mjs
 It uses an in-memory Supabase/OpenRouter mock and verifies protocol guards,
 strict cross-workspace/project/channel/runtime isolation, by-id workspace
 binding, monotone `restrict_scope`, recency and token budgets, symmetric
-writeback defaults, and one-to-one artifact persistence.
+writeback defaults, one-to-one artifact persistence, idempotent replay and
+conflict behavior, missing-RPC fail-closed behavior, opaque `500` responses,
+recall trace/item failures, and transactional review rollback under injected
+review-action failure.
 
 Use the live smoke harness only after the production/staging installation gate and an intentional deployment or secret rotation:
 
@@ -222,6 +227,9 @@ Solution: Confirm write-back has created `agent_memories`, and that those memori
 
 **Issue: write-back blocked as unsafe**
 Solution: Store a compact summary and artifact links. Do not submit raw transcripts, reasoning traces, secrets, or large code blocks.
+
+**Issue: `transactional RPCs not installed — apply schemas/agent-memory (upgrade)`**
+Solution: Apply the current [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql), refresh the PostgREST schema cache if needed, and retry only after both transactional RPCs are visible.
 
 ## Tool Surface Area
 

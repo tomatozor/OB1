@@ -1,17 +1,30 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-import { Hono } from "npm:hono@4.9.2";
+import { type Context, Hono } from "npm:hono@4.9.2";
 import { createClient } from "npm:@supabase/supabase-js@2.47.10";
 import { z } from "npm:zod@4.1.13";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
+  "";
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY") ?? "";
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY") ?? "";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_REQUEST_BYTES = 64 * 1024;
+const OPENROUTER_TIMEOUT_MS = 15_000;
+const POSTGREST_TIMEOUT_MS = 10_000;
+const EMBEDDING_DIMENSIONS = 1536;
+const TRANSACTIONAL_RPC_MISSING_ERROR = "transactional RPCs not installed — apply schemas/agent-memory (upgrade)";
 
-let supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const postgrestFetch: typeof fetch = (input, init = {}) =>
+  fetch(input, {
+    ...init,
+    signal: AbortSignal.timeout(POSTGREST_TIMEOUT_MS),
+  });
+
+let supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  global: { fetch: postgrestFetch },
+});
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -30,7 +43,12 @@ const channelSchema = z.object({
   thread_id: z.string().trim().max(256).nullable().optional(),
 });
 
-const visibilitySchema = z.enum(["personal", "channel", "project", "workspace"]);
+const visibilitySchema = z.enum([
+  "personal",
+  "channel",
+  "project",
+  "workspace",
+]);
 
 const recallSchemaVersion = z.union([
   z.literal("openbrain.agent_memory.recall.v1"),
@@ -56,13 +74,18 @@ const recallSchema = z.object({
     model: z.string().trim().max(256).nullable().optional(),
   }).default({}),
   query: z.string().trim().min(1).max(8000),
-  entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100)).default({}),
+  entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100))
+    .default({}),
   scope: z.object({
     visibility: visibilitySchema.nullable().optional(),
     project_only: z.boolean().default(true),
     include_unconfirmed: z.boolean().default(false),
     include_stale: z.boolean().default(false),
-  }).default({ project_only: true, include_unconfirmed: false, include_stale: false }),
+  }).default({
+    project_only: true,
+    include_unconfirmed: false,
+    include_stale: false,
+  }),
   limits: z.object({
     max_items: z.number().int().min(1).max(50).default(10),
     max_tokens: z.number().int().min(256).max(20000).default(4000),
@@ -76,7 +99,8 @@ const memoryPayloadSchema = z.object({
   outputs: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
   lessons: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
   constraints: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
-  unresolved_questions: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
+  unresolved_questions: z.array(z.string().trim().min(1).max(15000)).max(50)
+    .default([]),
   next_steps: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
   failures: z.array(z.string().trim().min(1).max(15000)).max(50).default([]),
   artifacts: z.array(z.object({
@@ -84,7 +108,8 @@ const memoryPayloadSchema = z.object({
     uri: z.string().trim().min(1).max(2048),
     description: z.string().trim().max(2000).nullable().optional(),
   })).max(50).default([]),
-  entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100)).default({}),
+  entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100))
+    .default({}),
 });
 
 const writebackSchemaBase = z.object({
@@ -111,10 +136,16 @@ const writebackSchemaBase = z.object({
   })).max(50).default([]),
   memory_payload: memoryPayloadSchema,
   provenance: z.object({
-    default_status: z.enum(["observed", "inferred", "generated"]).default("generated"),
+    default_status: z.enum(["observed", "inferred", "generated"]).default(
+      "generated",
+    ),
     confidence: z.number().min(0).max(1).default(0.5),
     requires_review: z.literal(true).default(true),
-  }).default({ default_status: "generated", confidence: 0.5, requires_review: true }),
+  }).default({
+    default_status: "generated",
+    confidence: 0.5,
+    requires_review: true,
+  }),
   retention: z.object({
     ttl_days: z.number().int().positive().nullable().optional(),
     stale_after_days: z.number().int().positive().nullable().optional(),
@@ -122,10 +153,24 @@ const writebackSchemaBase = z.object({
   visibility: visibilitySchema.optional(),
 });
 
-const writebackSchema = writebackSchemaBase.superRefine((value: z.infer<typeof writebackSchemaBase>, ctx: z.RefinementCtx) => {
-  if (value.visibility === "project" && !value.project_id) ctx.addIssue({ code: "custom", message: "project visibility requires project_id", path: ["visibility"] });
-  if (value.visibility === "channel" && !value.channel.id) ctx.addIssue({ code: "custom", message: "channel visibility requires channel.id", path: ["visibility"] });
-});
+const writebackSchema = writebackSchemaBase.superRefine(
+  (value: z.infer<typeof writebackSchemaBase>, ctx: z.RefinementCtx) => {
+    if (value.visibility === "project" && !value.project_id) {
+      ctx.addIssue({
+        code: "custom",
+        message: "project visibility requires project_id",
+        path: ["visibility"],
+      });
+    }
+    if (value.visibility === "channel" && !value.channel.id) {
+      ctx.addIssue({
+        code: "custom",
+        message: "channel visibility requires channel.id",
+        path: ["visibility"],
+      });
+    }
+  },
+);
 
 const usageSchema = z.object({
   used_memory_ids: z.array(z.string().uuid()).max(100).default([]),
@@ -137,7 +182,17 @@ const usageSchema = z.object({
 
 const reviewSchemaBase = z.object({
   workspace_id: z.string().trim().min(1).max(256),
-  action: z.enum(["confirm", "edit", "evidence_only", "restrict_scope", "mark_stale", "merge", "reject", "dispute", "supersede"]),
+  action: z.enum([
+    "confirm",
+    "edit",
+    "evidence_only",
+    "restrict_scope",
+    "mark_stale",
+    "merge",
+    "reject",
+    "dispute",
+    "supersede",
+  ]),
   actor_id: z.string().trim().max(256).nullable().optional(),
   actor_label: z.string().trim().max(256).nullable().optional(),
   notes: z.string().trim().max(4000).nullable().optional(),
@@ -147,13 +202,51 @@ const reviewSchemaBase = z.object({
   related_memory_id: z.string().uuid().optional(),
 });
 
-const reviewSchema = reviewSchemaBase.superRefine((value: z.infer<typeof reviewSchemaBase>, ctx: z.RefinementCtx) => {
-  if (!value.actor_id && !value.actor_label) ctx.addIssue({ code: "custom", message: "actor_id or actor_label is required", path: ["actor_id"] });
-  if (["mark_stale", "merge", "reject", "dispute", "supersede"].includes(value.action) && !value.notes) ctx.addIssue({ code: "custom", message: "notes are required for lifecycle changes", path: ["notes"] });
-  if (["merge", "supersede"].includes(value.action) && !value.related_memory_id) ctx.addIssue({ code: "custom", message: "related_memory_id is required", path: ["related_memory_id"] });
-  if (value.action === "restrict_scope" && !value.visibility) ctx.addIssue({ code: "custom", message: "visibility is required", path: ["visibility"] });
-  if (value.action === "edit" && !value.content && !value.summary) ctx.addIssue({ code: "custom", message: "content or summary is required", path: ["content"] });
-});
+const reviewSchema = reviewSchemaBase.superRefine(
+  (value: z.infer<typeof reviewSchemaBase>, ctx: z.RefinementCtx) => {
+    if (!value.actor_id && !value.actor_label) {
+      ctx.addIssue({
+        code: "custom",
+        message: "actor_id or actor_label is required",
+        path: ["actor_id"],
+      });
+    }
+    if (
+      ["mark_stale", "merge", "reject", "dispute", "supersede"].includes(
+        value.action,
+      ) && !value.notes
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "notes are required for lifecycle changes",
+        path: ["notes"],
+      });
+    }
+    if (
+      ["merge", "supersede"].includes(value.action) && !value.related_memory_id
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "related_memory_id is required",
+        path: ["related_memory_id"],
+      });
+    }
+    if (value.action === "restrict_scope" && !value.visibility) {
+      ctx.addIssue({
+        code: "custom",
+        message: "visibility is required",
+        path: ["visibility"],
+      });
+    }
+    if (value.action === "edit" && !value.content && !value.summary) {
+      ctx.addIssue({
+        code: "custom",
+        message: "content or summary is required",
+        path: ["content"],
+      });
+    }
+  },
+);
 
 type AgentMemory = {
   id: string;
@@ -203,12 +296,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function extractThoughtId(value: unknown): string | null {
-  const candidate = Array.isArray(value) ? value[0] : value;
-  if (!isRecord(candidate)) return null;
-  const rawId = candidate.id ?? candidate.thought_id;
-  if (typeof rawId !== "string") return null;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawId) ? rawId : null;
+function validateEmbedding(value: unknown): number[] {
+  if (
+    !Array.isArray(value) || value.length !== EMBEDDING_DIMENSIONS ||
+    !value.every((item) => typeof item === "number" && Number.isFinite(item))
+  ) {
+    throw new Error(
+      `OpenRouter returned an invalid embedding; expected ${EMBEDDING_DIMENSIONS} finite numbers`,
+    );
+  }
+  return value;
 }
 
 async function fetchEmbedding(text: string): Promise<number[]> {
@@ -222,10 +319,16 @@ async function fetchEmbedding(text: string): Promise<number[]> {
       model: "openai/text-embedding-3-small",
       input: text,
     }),
+    signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
   });
-  if (!r.ok) throw new Error(`OpenRouter embeddings failed: ${r.status} ${await r.text()}`);
-  const d = await r.json();
-  return d.data[0].embedding;
+  if (!r.ok) {
+    throw new Error(
+      `OpenRouter embeddings failed: ${r.status} ${await r.text()}`,
+    );
+  }
+  const d: unknown = await r.json();
+  const embedding = isRecord(d) && Array.isArray(d.data) && isRecord(d.data[0]) ? d.data[0].embedding : null;
+  return validateEmbedding(embedding);
 }
 
 let getEmbedding = fetchEmbedding;
@@ -243,24 +346,45 @@ function timingSafeEqualStrings(provided: string, expected: string): boolean {
   const providedBytes = encoder.encode(provided);
   const expectedBytes = encoder.encode(expected);
   let difference = providedBytes.byteLength ^ expectedBytes.byteLength;
-  for (let index = 0; index < expectedBytes.byteLength; index++) difference |= (providedBytes[index] ?? 0) ^ expectedBytes[index];
+  for (let index = 0; index < expectedBytes.byteLength; index++) {
+    difference |= (providedBytes[index] ?? 0) ^ expectedBytes[index];
+  }
   return difference === 0;
 }
 
-function auth(c: { req: { header: (name: string) => string | undefined } }): boolean {
+function auth(
+  c: { req: { header: (name: string) => string | undefined } },
+): boolean {
   const headerKey = c.req.header("x-brain-key")?.trim();
-  const bearerKey = c.req.header("authorization")?.match(/^Bearer\s+([^\s]+)\s*$/i)?.[1];
+  const bearerKey = c.req.header("authorization")?.match(
+    /^Bearer\s+([^\s]+)\s*$/i,
+  )?.[1];
   const provided = headerKey || bearerKey;
-  return Boolean(provided && MCP_ACCESS_KEY && timingSafeEqualStrings(provided, MCP_ACCESS_KEY.trim()));
+  return Boolean(
+    provided && MCP_ACCESS_KEY &&
+      timingSafeEqualStrings(provided, MCP_ACCESS_KEY.trim()),
+  );
 }
 
 function unsafeReasons(text: string): string[] {
   const reasons: string[] = [];
-  if (/-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----/.test(text)) reasons.push("private_key");
-  if (/(?:sk-[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9_-]{20,})/.test(text)) reasons.push("api_key");
-  if (/(?:password|passwd|secret|token)\s*[:=]\s*\S{12,}/i.test(text)) reasons.push("credential_like_string");
-  if ((text.match(/```/g) || []).length >= 4 || text.split("\n").filter((l) => l.length > 120).length > 20) reasons.push("large_code_block");
-  if (text.length > 15000 || text.split("\n").filter((l) => /^(user|assistant|system|agent|human):/i.test(l.trim())).length > 8) reasons.push("raw_transcript_like");
+  if (/-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----/.test(text)) {
+    reasons.push("private_key");
+  }
+  if (/(?:sk-[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9_-]{20,})/.test(text)) {
+    reasons.push("api_key");
+  }
+  if (/(?:password|passwd|secret|token)\s*[:=]\s*\S{12,}/i.test(text)) {
+    reasons.push("credential_like_string");
+  }
+  if (
+    (text.match(/```/g) || []).length >= 4 ||
+    text.split("\n").filter((l) => l.length > 120).length > 20
+  ) reasons.push("large_code_block");
+  if (
+    text.length > 15000 ||
+    text.split("\n").filter((l) => /^(user|assistant|system|agent|human):/i.test(l.trim())).length > 8
+  ) reasons.push("raw_transcript_like");
   return reasons;
 }
 
@@ -274,13 +398,27 @@ function staleAfter(days?: number | null): string | null {
 function memoryRows(payload: z.infer<typeof writebackSchema>) {
   const p = payload.memory_payload;
   const rows: MemoryRow[] = [];
-  for (const content of p.decisions) rows.push({ memory_type: "decision", content });
-  for (const content of p.outputs) rows.push({ memory_type: "output", content });
-  for (const content of p.lessons) rows.push({ memory_type: "lesson", content });
-  for (const content of p.constraints) rows.push({ memory_type: "constraint", content });
-  for (const content of p.unresolved_questions) rows.push({ memory_type: "open_question", content });
-  for (const content of p.next_steps) rows.push({ memory_type: "work_log", content: `Next step: ${content}` });
-  for (const content of p.failures) rows.push({ memory_type: "failure", content });
+  for (const content of p.decisions) {
+    rows.push({ memory_type: "decision", content });
+  }
+  for (const content of p.outputs) {
+    rows.push({ memory_type: "output", content });
+  }
+  for (const content of p.lessons) {
+    rows.push({ memory_type: "lesson", content });
+  }
+  for (const content of p.constraints) {
+    rows.push({ memory_type: "constraint", content });
+  }
+  for (const content of p.unresolved_questions) {
+    rows.push({ memory_type: "open_question", content });
+  }
+  for (const content of p.next_steps) {
+    rows.push({ memory_type: "work_log", content: `Next step: ${content}` });
+  }
+  for (const content of p.failures) {
+    rows.push({ memory_type: "failure", content });
+  }
   for (const artifact of p.artifacts) {
     rows.push({
       memory_type: "artifact_reference",
@@ -291,30 +429,63 @@ function memoryRows(payload: z.infer<typeof writebackSchema>) {
   return rows;
 }
 
-function defaultVisibility(payload: z.infer<typeof writebackSchema>): Visibility {
+function defaultVisibility(
+  payload: z.infer<typeof writebackSchema>,
+): Visibility {
   if (payload.visibility) return payload.visibility;
   if (payload.channel.id) return "channel";
   if (payload.project_id) return "project";
   return "workspace";
 }
 
-function contextMatches(memory: AgentMemory, req: z.infer<typeof recallSchema>): boolean {
-  if (memory.project_id && memory.project_id !== (req.project_id ?? null)) return false;
-  if (memory.channel_id && memory.channel_id !== (req.channel.id ?? null)) return false;
+function contextMatches(
+  memory: AgentMemory,
+  req: z.infer<typeof recallSchema>,
+): boolean {
+  if (memory.project_id && memory.project_id !== (req.project_id ?? null)) {
+    return false;
+  }
+  if (memory.channel_id && memory.channel_id !== (req.channel.id ?? null)) {
+    return false;
+  }
   return true;
 }
 
-function scopeMatches(memory: AgentMemory, req: z.infer<typeof recallSchema>): boolean {
+function scopeMatches(
+  memory: AgentMemory,
+  req: z.infer<typeof recallSchema>,
+): boolean {
   if (memory.workspace_id !== req.workspace_id) return false;
-  if (["superseded", "rejected", "disputed"].includes(memory.lifecycle_status)) return false;
-  if (!req.scope.include_stale && memory.lifecycle_status === "stale") return false;
-  if (!req.scope.include_unconfirmed && memory.requires_user_confirmation && memory.review_status === "pending") return false;
-  if (req.scope.visibility && memory.visibility !== req.scope.visibility) return false;
-  if (memory.visibility === "project" && (!req.project_id || memory.project_id !== req.project_id)) return false;
-  if (memory.visibility === "channel" && (!req.channel.id || memory.channel_id !== req.channel.id || !contextMatches(memory, req))) return false;
-  if (memory.visibility === "personal" && (memory.runtime_name !== req.runtime.name || !contextMatches(memory, req))) return false;
+  if (
+    ["superseded", "rejected", "disputed"].includes(memory.lifecycle_status)
+  ) return false;
+  if (!req.scope.include_stale && memory.lifecycle_status === "stale") {
+    return false;
+  }
+  if (
+    !req.scope.include_unconfirmed && memory.requires_user_confirmation &&
+    memory.review_status === "pending"
+  ) return false;
+  if (req.scope.visibility && memory.visibility !== req.scope.visibility) {
+    return false;
+  }
+  if (
+    memory.visibility === "project" &&
+    (!req.project_id || memory.project_id !== req.project_id)
+  ) return false;
+  if (
+    memory.visibility === "channel" &&
+    (!req.channel.id || memory.channel_id !== req.channel.id ||
+      !contextMatches(memory, req))
+  ) return false;
+  if (
+    memory.visibility === "personal" &&
+    (memory.runtime_name !== req.runtime.name || !contextMatches(memory, req))
+  ) return false;
   if (memory.visibility === "organization") return false;
-  if (!memory.can_use_as_instruction && !memory.can_use_as_evidence) return false;
+  if (!memory.can_use_as_instruction && !memory.can_use_as_evidence) {
+    return false;
+  }
   return true;
 }
 
@@ -328,11 +499,16 @@ function isRecent(memory: AgentMemory, recencyDays?: number | null): boolean {
   return Number.isFinite(freshness) && freshness >= cutoff;
 }
 
-function estimatedTokens(memory: Pick<AgentMemory, "summary" | "content">): number {
+function estimatedTokens(
+  memory: Pick<AgentMemory, "summary" | "content">,
+): number {
   return Math.ceil((memory.summary.length + memory.content.length) / 4);
 }
 
-function applyTokenBudget<T extends AgentMemory>(ranked: T[], maxTokens: number): T[] {
+function applyTokenBudget<T extends AgentMemory>(
+  ranked: T[],
+  maxTokens: number,
+): T[] {
   const selected: T[] = [];
   let used = 0;
   for (const memory of ranked) {
@@ -344,33 +520,12 @@ function applyTokenBudget<T extends AgentMemory>(ranked: T[], maxTokens: number)
   return selected;
 }
 
-const visibilityRank: Record<Visibility, number> = {
-  workspace: 0,
-  project: 1,
-  channel: 2,
-  personal: 3,
-};
-
-function canRestrictVisibility(memory: AgentMemory, requested: Visibility): boolean {
-  const current = memory.visibility as Visibility;
-  if (!(current in visibilityRank) || visibilityRank[requested] < visibilityRank[current]) return false;
-  if (requested === "project" && !memory.project_id) return false;
-  if (requested === "channel" && !memory.channel_id) return false;
-  return true;
-}
-
 function rankMemory(memory: AgentMemory, similarity = 0): number {
-  const provenance = memory.provenance_status === "user_confirmed" ? 0.3
-    : memory.provenance_status === "imported" ? 0.22
-    : memory.provenance_status === "observed" ? 0.15
-    : memory.provenance_status === "generated" ? 0.05
-    : 0;
+  const provenance = memory.provenance_status === "user_confirmed" ? 0.3 : memory.provenance_status === "imported" ? 0.22 : memory.provenance_status === "observed" ? 0.15 : memory.provenance_status === "generated" ? 0.05 : 0;
   const policy = memory.can_use_as_instruction ? 0.2 : memory.can_use_as_evidence ? 0.08 : -0.2;
-  const review = memory.review_status === "confirmed" ? 0.15
-    : memory.review_status === "evidence_only" ? 0.05
-    : memory.review_status === "pending" ? -0.08
-    : -0.25;
-  return similarity + provenance + policy + review + Number(memory.confidence || 0) * 0.15;
+  const review = memory.review_status === "confirmed" ? 0.15 : memory.review_status === "evidence_only" ? 0.05 : memory.review_status === "pending" ? -0.08 : -0.25;
+  return similarity + provenance + policy + review +
+    Number(memory.confidence || 0) * 0.15;
 }
 
 function responseMemory(memory: AgentMemory) {
@@ -412,15 +567,103 @@ function responseMemory(memory: AgentMemory) {
 }
 
 function recallResponseSchema(reqSchemaVersion: string) {
-  return reqSchemaVersion === "openbrain.openclaw.recall.v1"
-    ? "openbrain.openclaw.recall_response.v1"
-    : "openbrain.agent_memory.recall_response.v1";
+  return reqSchemaVersion === "openbrain.openclaw.recall.v1" ? "openbrain.openclaw.recall_response.v1" : "openbrain.agent_memory.recall_response.v1";
 }
 
 function writebackResponseSchema(reqSchemaVersion: string) {
-  return reqSchemaVersion === "openbrain.openclaw.writeback.v1"
-    ? "openbrain.openclaw.writeback_response.v1"
-    : "openbrain.agent_memory.writeback_response.v1";
+  return reqSchemaVersion === "openbrain.openclaw.writeback.v1" ? "openbrain.openclaw.writeback_response.v1" : "openbrain.agent_memory.writeback_response.v1";
+}
+
+type PostgrestFailure = {
+  code?: string;
+  message?: string;
+  details?: string;
+  hint?: string;
+};
+
+function internalServerError(c: Context, operation: string, detail: unknown) {
+  const correlationId = crypto.randomUUID().replaceAll("-", "").slice(0, 10);
+  console.error("agent-memory-api internal error", {
+    correlation_id: correlationId,
+    operation,
+    detail,
+  });
+  return c.json(
+    { error: "Internal server error", correlation_id: correlationId },
+    500,
+    corsHeaders,
+  );
+}
+
+function transactionalRpcError(
+  c: Context,
+  operation: "writeback" | "review",
+  error: PostgrestFailure,
+) {
+  const message = error.message ?? "";
+  const normalized = message.toLowerCase();
+  if (error.code === "PGRST202") {
+    return c.json({ error: TRANSACTIONAL_RPC_MISSING_ERROR }, 503, corsHeaders);
+  }
+  if (
+    operation === "writeback" && normalized.includes("idempotency") &&
+    /(different|mismatch|conflict)/.test(normalized)
+  ) {
+    return c.json(
+      { error: "Idempotency key was already used with different content" },
+      409,
+      corsHeaders,
+    );
+  }
+  if (
+    operation === "review" &&
+    /^(memory )?not found in workspace$/.test(normalized)
+  ) {
+    return c.json({ error: "Memory not found" }, 404, corsHeaders);
+  }
+  if (
+    operation === "review" &&
+    /(invalid|illegal|cannot).*(transition|review)|transition.*(invalid|illegal|cannot)/
+      .test(normalized)
+  ) {
+    return c.json({ error: "Invalid review transition" }, 409, corsHeaders);
+  }
+  if (
+    operation === "review" && (
+      normalized.includes("related memory") ||
+      normalized.includes("related_memory_id") ||
+      normalized.includes("cannot be related to itself") ||
+      normalized.includes("restrict_scope") ||
+      normalized.includes("visibility")
+    )
+  ) {
+    return c.json(
+      { error: message || "Invalid review request" },
+      400,
+      corsHeaders,
+    );
+  }
+  if (error.code === "22023") {
+    return c.json(
+      { error: message || `Invalid ${operation} request` },
+      400,
+      corsHeaders,
+    );
+  }
+  return internalServerError(c, `agent_memory_${operation}_tx`, error);
+}
+
+function rpcMemoryResult(
+  value: unknown,
+): { memory: AgentMemory; replayed: boolean } | null {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  if (!isRecord(candidate)) return null;
+  const memory = isRecord(candidate.memory) ? candidate.memory : candidate;
+  if (typeof memory.id !== "string") return null;
+  return {
+    memory: memory as AgentMemory,
+    replayed: candidate.replayed === true,
+  };
 }
 
 async function audit(event_type: string, payload: Record<string, unknown>) {
@@ -436,7 +679,9 @@ async function audit(event_type: string, payload: Record<string, unknown>) {
     task_id: payload.task_id ?? null,
     payload,
   });
-  if (error) throw new Error(`Agent Memory audit insert failed: ${error.message}`);
+  if (error) {
+    throw new Error(`Agent Memory audit insert failed: ${error.message}`);
+  }
 }
 
 const app = new Hono();
@@ -444,51 +689,105 @@ const app = new Hono();
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
 app.use("*", async (c, next) => {
-  if (!MCP_ACCESS_KEY) return c.json({ error: "Service misconfigured: auth key not set" }, 503, corsHeaders);
-  if (!auth(c)) return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+  if (!MCP_ACCESS_KEY) {
+    return c.json(
+      { error: "Service misconfigured: auth key not set" },
+      503,
+      corsHeaders,
+    );
+  }
+  if (!auth(c)) {
+    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+  }
   await next();
 });
 
 app.use("*", async (c, next) => {
   if (!["POST", "PATCH"].includes(c.req.method)) return next();
   const declaredLength = Number(c.req.header("content-length") ?? "0");
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) return c.json({ error: `Request body exceeds ${MAX_REQUEST_BYTES} bytes` }, 413, corsHeaders);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_REQUEST_BYTES) {
+    return c.json(
+      { error: `Request body exceeds ${MAX_REQUEST_BYTES} bytes` },
+      413,
+      corsHeaders,
+    );
+  }
   const body = await c.req.raw.clone().arrayBuffer();
-  if (body.byteLength > MAX_REQUEST_BYTES) return c.json({ error: `Request body exceeds ${MAX_REQUEST_BYTES} bytes` }, 413, corsHeaders);
+  if (body.byteLength > MAX_REQUEST_BYTES) {
+    return c.json(
+      { error: `Request body exceeds ${MAX_REQUEST_BYTES} bytes` },
+      413,
+      corsHeaders,
+    );
+  }
   await next();
 });
 
 app.onError((error, c) => {
-  console.error("agent-memory-api request failed", error);
-  return c.json({ error: "Internal server error" }, 500, corsHeaders);
+  return internalServerError(c, "unhandled_request", error);
 });
 
-app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.1.0" }, 200, corsHeaders));
+app.get(
+  "/health",
+  (c) =>
+    c.json(
+      { ok: true, service: "agent-memory-api", version: "0.1.0" },
+      200,
+      corsHeaders,
+    ),
+);
 
 app.post("/recall", async (c) => {
   let body: unknown;
-  try { body = await c.req.json(); } catch { return c.json({ error: "Request body must be valid JSON" }, 400, corsHeaders); }
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(
+      { error: "Request body must be valid JSON" },
+      400,
+      corsHeaders,
+    );
+  }
   const parsed = recallSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: "Invalid recall payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid recall payload", details: parsed.error.flatten() },
+      400,
+      corsHeaders,
+    );
+  }
   const req = parsed.data;
 
-  const embedding = await getEmbedding(req.query);
-  const { data: matches, error: matchError } = await supabase.rpc("match_thoughts", {
-    query_embedding: embedding,
-    match_threshold: 0.25,
-    match_count: Math.max(req.limits.max_items * 4, 20),
-  });
-  if (matchError) return c.json({ error: matchError.message }, 500, corsHeaders);
+  const embedding = validateEmbedding(await getEmbedding(req.query));
+  const { data: matches, error: matchError } = await supabase.rpc(
+    "match_thoughts",
+    {
+      query_embedding: embedding,
+      match_threshold: 0.25,
+      match_count: Math.max(req.limits.max_items * 4, 20),
+    },
+  );
+  if (matchError) {
+    return internalServerError(c, "recall_match_thoughts", matchError);
+  }
 
   const similarityByThought = new Map<string, number>();
-  for (const item of matches || []) similarityByThought.set(item.id, item.similarity);
+  for (const item of matches || []) {
+    similarityByThought.set(item.id, item.similarity);
+  }
   const thoughtIds = Array.from(similarityByThought.keys());
 
   // Live OB1 exposes match_thoughts(query_embedding, match_threshold, match_count).
   let rawMemories: unknown[] = [];
   if (thoughtIds.length > 0) {
-    const { data, error: memoryError } = await supabase.from("agent_memories").select("*").eq("workspace_id", req.workspace_id).in("thought_id", thoughtIds).order("created_at", { ascending: false }).limit(100);
-    if (memoryError) return c.json({ error: memoryError.message }, 500, corsHeaders);
+    const { data, error: memoryError } = await supabase.from("agent_memories")
+      .select("*").eq("workspace_id", req.workspace_id).in(
+        "thought_id",
+        thoughtIds,
+      ).order("created_at", { ascending: false }).limit(100);
+    if (memoryError) {
+      return internalServerError(c, "recall_load_memories", memoryError);
+    }
     rawMemories = data || [];
   }
 
@@ -503,7 +802,9 @@ app.post("/recall", async (c) => {
   const ranked = applyTokenBudget(rankedByRelevance, req.limits.max_tokens)
     .slice(0, req.limits.max_items);
 
-  const { data: trace, error: traceError } = await supabase.from("agent_memory_recall_traces").insert({
+  const { data: trace, error: traceError } = await supabase.from(
+    "agent_memory_recall_traces",
+  ).insert({
     workspace_id: req.workspace_id,
     project_id: req.project_id ?? null,
     runtime_name: req.runtime.name,
@@ -523,10 +824,14 @@ app.post("/recall", async (c) => {
       include_unconfirmed: req.scope.include_unconfirmed,
     },
   }).select("*").single();
-  if (traceError) return c.json({ error: traceError.message }, 500, corsHeaders);
+  if (traceError) {
+    return internalServerError(c, "recall_trace_insert", traceError);
+  }
 
   if (ranked.length > 0) {
-    const { error: itemInsertError } = await supabase.from("agent_memory_recall_items").insert(ranked.map((memory, index) => ({
+    const { error: itemInsertError } = await supabase.from(
+      "agent_memory_recall_items",
+    ).insert(ranked.map((memory, index) => ({
       trace_id: trace.id,
       memory_id: memory.id,
       rank: index + 1,
@@ -538,7 +843,9 @@ app.post("/recall", async (c) => {
         requires_user_confirmation: memory.requires_user_confirmation,
       },
     })));
-    if (itemInsertError) return c.json({ error: itemInsertError.message }, 500, corsHeaders);
+    if (itemInsertError) {
+      return internalServerError(c, "recall_items_insert", itemInsertError);
+    }
   }
 
   await audit("recall_requested", {
@@ -549,78 +856,115 @@ app.post("/recall", async (c) => {
     task_id: req.task_id,
     returned_count: ranked.length,
   });
-  for (const memory of ranked) await audit("memory_returned", {
-    workspace_id: req.workspace_id,
-    project_id: req.project_id,
-    trace_id: trace.id,
-    memory_id: memory.id,
-    runtime_name: req.runtime.name,
-    task_id: req.task_id,
-    can_use_as_instruction: memory.can_use_as_instruction,
-    can_use_as_evidence: memory.can_use_as_evidence,
-  });
+  for (const memory of ranked) {
+    await audit("memory_returned", {
+      workspace_id: req.workspace_id,
+      project_id: req.project_id,
+      trace_id: trace.id,
+      memory_id: memory.id,
+      runtime_name: req.runtime.name,
+      task_id: req.task_id,
+      can_use_as_instruction: memory.can_use_as_instruction,
+      can_use_as_evidence: memory.can_use_as_evidence,
+    });
+  }
 
-  return c.json({
-    schema_version: recallResponseSchema(req.schema_version),
-    request_id: trace.request_id,
-    memories: ranked.map(responseMemory),
-  }, 200, corsHeaders);
+  return c.json(
+    {
+      schema_version: recallResponseSchema(req.schema_version),
+      request_id: trace.request_id,
+      memories: ranked.map(responseMemory),
+    },
+    200,
+    corsHeaders,
+  );
 });
 
 app.post("/writeback", async (c) => {
   let body: unknown;
-  try { body = await c.req.json(); } catch { return c.json({ error: "Request body must be valid JSON" }, 400, corsHeaders); }
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(
+      { error: "Request body must be valid JSON" },
+      400,
+      corsHeaders,
+    );
+  }
   const parsed = writebackSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: "Invalid write-back payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid write-back payload", details: parsed.error.flatten() },
+      400,
+      corsHeaders,
+    );
+  }
   const req = parsed.data;
   const rows = memoryRows(req);
-  if (rows.length === 0) return c.json({ error: "memory_payload produced no memory rows" }, 400, corsHeaders);
-
-  const canonicalRows = rows.map(({ memory_type, content }) => ({ memory_type, content }));
-  const requestContentHash = await sha256Hex(JSON.stringify(canonicalRows));
-  if (req.content_hash && req.content_hash.toLowerCase() !== requestContentHash) return c.json({ error: "content_hash does not match the canonical memory rows" }, 409, corsHeaders);
-
-  const unsafe = rows.flatMap((row) => unsafeReasons(row.content).map((reason) => ({ reason, memory_type: row.memory_type })));
-  if (unsafe.length > 0) {
-    await audit("memory_rejected", {
-      workspace_id: req.workspace_id,
-      project_id: req.project_id,
-      runtime_name: req.runtime.name,
-      task_id: req.task_id,
-      actor_kind: "system",
-      reason: "unsafe_writeback",
-      unsafe,
-    });
-    return c.json({ error: "Unsafe write-back blocked", unsafe }, 422, corsHeaders);
+  if (rows.length === 0) {
+    return c.json(
+      { error: "memory_payload produced no memory rows" },
+      400,
+      corsHeaders,
+    );
   }
 
-  const created = [];
+  const canonicalRows = rows.map(({ memory_type, content }) => ({
+    memory_type,
+    content,
+  }));
+  const requestContentHash = await sha256Hex(JSON.stringify(canonicalRows));
+  if (
+    req.content_hash && req.content_hash.toLowerCase() !== requestContentHash
+  ) {
+    return c.json(
+      { error: "content_hash does not match the canonical memory rows" },
+      409,
+      corsHeaders,
+    );
+  }
+
+  const unsafe = rows.flatMap((row) =>
+    unsafeReasons(row.content).map((reason) => ({
+      reason,
+      memory_type: row.memory_type,
+    }))
+  );
+  if (unsafe.length > 0) {
+    return c.json(
+      { error: "Unsafe write-back blocked", unsafe },
+      422,
+      corsHeaders,
+    );
+  }
+
+  const created: Array<{ memory: AgentMemory; replayed: boolean }> = [];
   const provider = req.models_used[0]?.provider ?? null;
   const model = req.models_used[0]?.model ?? null;
 
   for (const [index, row] of rows.entries()) {
     const rowContentHash = await sha256Hex(`${row.memory_type}:${row.content}`);
     const idempotency_key = `${req.idempotency_key}:${index}`;
-
-    const { data: existing, error: existingError } = await supabase
-      .from("agent_memories")
-      .select("*")
-      .eq("workspace_id", req.workspace_id)
-      .eq("idempotency_key", idempotency_key)
-      .maybeSingle();
-    if (existingError) return c.json({ error: existingError.message }, 500, corsHeaders);
-    if (existing) {
-      const existingRequestHash = isRecord(existing.metadata) ? existing.metadata.request_content_hash : null;
-      const existingWritebackHash = isRecord(existing.metadata) ? existing.metadata.writeback_content_hash ?? existing.content_hash : existing.content_hash;
-      if (existingWritebackHash !== rowContentHash || existingRequestHash !== requestContentHash) return c.json({ error: "Idempotency key was already used with different content" }, 409, corsHeaders);
-      created.push(existing);
-      continue;
-    }
-
-    const embedding = await getEmbedding(row.content);
-    const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
-      p_content: row.content,
-      p_payload: {
+    const embedding = validateEmbedding(await getEmbedding(row.content));
+    const summary = row.content.replace(/\s+/g, " ").slice(0, 140);
+    const memory = {
+      project_id: req.project_id ?? null,
+      channel_kind: req.channel.kind ?? null,
+      channel_id: req.channel.id ?? null,
+      channel_thread_id: req.channel.thread_id ?? null,
+      visibility: defaultVisibility(req),
+      memory_type: row.memory_type,
+      summary,
+      content: row.content,
+      runtime_name: req.runtime.name,
+      runtime_version: req.runtime.version ?? null,
+      provider,
+      model,
+      task_id: req.task_id ?? null,
+      flow_id: req.flow_id ?? null,
+      stale_after: staleAfter(req.retention.stale_after_days),
+      embedding,
+      thought_payload: {
         metadata: {
           source: "agent_memory",
           source_type: "agent_memory",
@@ -635,42 +979,6 @@ app.post("/writeback", async (c) => {
           },
         },
       },
-    });
-    if (upsertError) return c.json({ error: upsertError.message }, 500, corsHeaders);
-
-    const thoughtId = extractThoughtId(upsertResult);
-    if (!thoughtId) return c.json({ error: "upsert_thought returned no UUID thought id" }, 500, corsHeaders);
-    const { error: embeddingError } = await supabase.from("thoughts").update({ embedding }).eq("id", thoughtId);
-    if (embeddingError) return c.json({ error: embeddingError.message }, 500, corsHeaders);
-
-    const { data: memory, error: memoryError } = await supabase.from("agent_memories").insert({
-      thought_id: thoughtId,
-      workspace_id: req.workspace_id,
-      project_id: req.project_id ?? null,
-      channel_kind: req.channel.kind ?? null,
-      channel_id: req.channel.id ?? null,
-      channel_thread_id: req.channel.thread_id ?? null,
-      visibility: defaultVisibility(req),
-      memory_type: row.memory_type,
-      summary: row.content.replace(/\s+/g, " ").slice(0, 140),
-      content: row.content,
-      provenance_status: req.provenance.default_status,
-      confidence: req.provenance.confidence,
-      created_by: "agent",
-      runtime_name: req.runtime.name,
-      runtime_version: req.runtime.version ?? null,
-      provider,
-      model,
-      task_id: req.task_id ?? null,
-      flow_id: req.flow_id ?? null,
-      can_use_as_instruction: false,
-      can_use_as_evidence: true,
-      requires_user_confirmation: true,
-      review_status: "pending",
-      last_confirmed_at: null,
-      stale_after: staleAfter(req.retention.stale_after_days),
-      idempotency_key,
-      content_hash: rowContentHash,
       metadata: {
         source_refs: req.source_refs,
         models_used: req.models_used,
@@ -679,77 +987,131 @@ app.post("/writeback", async (c) => {
         request_content_hash: requestContentHash,
         writeback_content_hash: rowContentHash,
       },
-    }).select("*").single();
-    if (memoryError) {
-      if (memoryError.code === "23505") {
-        const { data: concurrent } = await supabase.from("agent_memories").select("*").eq("workspace_id", req.workspace_id).eq("idempotency_key", idempotency_key).maybeSingle();
-        const concurrentRequestHash = isRecord(concurrent?.metadata) ? concurrent.metadata.request_content_hash : null;
-        const concurrentWritebackHash = isRecord(concurrent?.metadata) ? concurrent.metadata.writeback_content_hash ?? concurrent?.content_hash : concurrent?.content_hash;
-        if (concurrentWritebackHash === rowContentHash && concurrentRequestHash === requestContentHash) { created.push(concurrent); continue; }
-        return c.json({ error: "Idempotency key was concurrently used with different content" }, 409, corsHeaders);
-      }
-      return c.json({ error: memoryError.message }, 500, corsHeaders);
-    }
-
-    if (req.source_refs.length > 0) {
-      const { error: sourceError } = await supabase.from("agent_memory_source_refs").insert(req.source_refs.map((source: z.infer<typeof writebackSchema>["source_refs"][number]) => ({
-        memory_id: memory.id,
-        source_kind: source.kind,
-        uri: source.uri ?? null,
-        title: source.title ?? null,
-        source_timestamp: source.timestamp ?? null,
-      })));
-      if (sourceError) return c.json({ error: sourceError.message }, 500, corsHeaders);
-    }
-
-    if (row.memory_type === "artifact_reference" && row.artifact) {
-      const { error: artifactError } = await supabase.from("agent_memory_artifacts").insert({
-        memory_id: memory.id,
-        artifact_kind: row.artifact.kind,
-        uri: row.artifact.uri,
-        description: row.artifact.description ?? null,
-      });
-      if (artifactError) return c.json({ error: artifactError.message }, 500, corsHeaders);
-    }
-
-    await audit("memory_written", {
-      workspace_id: req.workspace_id,
-      project_id: req.project_id,
-      memory_id: memory.id,
-      runtime_name: req.runtime.name,
-      task_id: req.task_id,
-      actor_kind: "agent",
-      provenance_status: req.provenance.default_status,
-      review_status: "pending",
+    };
+    const { data, error } = await supabase.rpc("agent_memory_writeback_tx", {
+      p_workspace_id: req.workspace_id,
+      p_idempotency_key: idempotency_key,
+      p_content_hash: rowContentHash,
+      p_memory: memory,
+      p_provenance: req.provenance,
+      p_source_refs: req.source_refs,
+      p_artifacts: row.artifact ? [row.artifact] : [],
+      p_created_by: "agent",
+      p_request_context: {
+        schema_version: req.schema_version,
+        request_content_hash: requestContentHash,
+        runtime: req.runtime,
+        task_id: req.task_id ?? null,
+        flow_id: req.flow_id ?? null,
+        step_id: req.step_id ?? null,
+        models_used: req.models_used,
+        retention: req.retention,
+      },
     });
-    created.push(memory);
+    if (error) return transactionalRpcError(c, "writeback", error);
+    const result = rpcMemoryResult(data);
+    if (!result) {
+      return internalServerError(c, "agent_memory_writeback_tx_result", data);
+    }
+    created.push(result);
   }
 
-  return c.json({ schema_version: writebackResponseSchema(req.schema_version), memories: created.map(responseMemory) }, 200, corsHeaders);
+  return c.json(
+    {
+      schema_version: writebackResponseSchema(req.schema_version),
+      replayed: created.every((result) => result.replayed),
+      memories: created.map((result) => ({
+        ...responseMemory(result.memory),
+        replayed: result.replayed,
+      })),
+    },
+    200,
+    corsHeaders,
+  );
 });
 
 app.post("/recall/:request_id/usage", async (c) => {
   const request_id = c.req.param("request_id");
-  if (!z.string().uuid().safeParse(request_id).success) return c.json({ error: "Invalid request_id" }, 400, corsHeaders);
+  if (!z.string().uuid().safeParse(request_id).success) {
+    return c.json({ error: "Invalid request_id" }, 400, corsHeaders);
+  }
   let body: unknown;
-  try { body = await c.req.json(); } catch { return c.json({ error: "Request body must be valid JSON" }, 400, corsHeaders); }
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(
+      { error: "Request body must be valid JSON" },
+      400,
+      corsHeaders,
+    );
+  }
   const parsed = usageSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: "Invalid usage payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid usage payload", details: parsed.error.flatten() },
+      400,
+      corsHeaders,
+    );
+  }
 
-  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const { data: trace, error } = await supabase.from(
+    "agent_memory_recall_traces",
+  ).select("*").eq("request_id", request_id).single();
+  if (error) {
+    if (error.code === "PGRST116") {
+      return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
+    }
+    return internalServerError(c, "usage_trace_lookup", error);
+  }
 
   for (const memory_id of parsed.data.used_memory_ids) {
-    const { data: item, error: itemError } = await supabase.from("agent_memory_recall_items").update({ used: true }).eq("trace_id", trace.id).eq("memory_id", memory_id).select("id").maybeSingle();
-    if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
-    if (!item) return c.json({ error: `Memory ${memory_id} was not returned by this recall` }, 400, corsHeaders);
-    await audit("memory_used", { workspace_id: trace.workspace_id, project_id: trace.project_id, trace_id: trace.id, memory_id, runtime_name: trace.runtime_name, task_id: trace.task_id });
+    const { data: item, error: itemError } = await supabase.from(
+      "agent_memory_recall_items",
+    ).update({ used: true }).eq("trace_id", trace.id).eq("memory_id", memory_id)
+      .select("id").maybeSingle();
+    if (itemError) return internalServerError(c, "usage_mark_used", itemError);
+    if (!item) {
+      return c.json(
+        { error: `Memory ${memory_id} was not returned by this recall` },
+        400,
+        corsHeaders,
+      );
+    }
+    await audit("memory_used", {
+      workspace_id: trace.workspace_id,
+      project_id: trace.project_id,
+      trace_id: trace.id,
+      memory_id,
+      runtime_name: trace.runtime_name,
+      task_id: trace.task_id,
+    });
   }
   for (const ignored of parsed.data.ignored) {
-    const { data: item, error: itemError } = await supabase.from("agent_memory_recall_items").update({ used: false, ignored_reason: ignored.reason ?? null }).eq("trace_id", trace.id).eq("memory_id", ignored.memory_id).select("id").maybeSingle();
-    if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
-    if (!item) return c.json({ error: `Memory ${ignored.memory_id} was not returned by this recall` }, 400, corsHeaders);
-    await audit("memory_ignored", { workspace_id: trace.workspace_id, project_id: trace.project_id, trace_id: trace.id, memory_id: ignored.memory_id, reason: ignored.reason });
+    const { data: item, error: itemError } = await supabase.from(
+      "agent_memory_recall_items",
+    ).update({ used: false, ignored_reason: ignored.reason ?? null }).eq(
+      "trace_id",
+      trace.id,
+    ).eq("memory_id", ignored.memory_id).select("id").maybeSingle();
+    if (itemError) {
+      return internalServerError(c, "usage_mark_ignored", itemError);
+    }
+    if (!item) {
+      return c.json(
+        {
+          error: `Memory ${ignored.memory_id} was not returned by this recall`,
+        },
+        400,
+        corsHeaders,
+      );
+    }
+    await audit("memory_ignored", {
+      workspace_id: trace.workspace_id,
+      project_id: trace.project_id,
+      trace_id: trace.id,
+      memory_id: ignored.memory_id,
+      reason: ignored.reason,
+    });
   }
 
   return c.json({ ok: true }, 200, corsHeaders);
@@ -757,20 +1119,35 @@ app.post("/recall/:request_id/usage", async (c) => {
 
 app.get("/memories/review", async (c) => {
   const workspace_id = c.req.query("workspace_id");
-  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  if (!workspace_id) {
+    return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  }
   const project_id = c.req.query("project_id");
-  let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
+  let q = supabase.from("agent_memories").select("*").eq(
+    "workspace_id",
+    workspace_id,
+  ).eq("review_status", "pending").order("created_at", { ascending: false })
+    .limit(100);
   if (project_id) q = q.eq("project_id", project_id);
   const { data, error } = await q;
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ memories: (data || []).map(responseMemory) }, 200, corsHeaders);
+  if (error) return internalServerError(c, "review_queue_list", error);
+  return c.json(
+    { memories: (data || []).map(responseMemory) },
+    200,
+    corsHeaders,
+  );
 });
 
 app.get("/memories", async (c) => {
   const workspace_id = c.req.query("workspace_id");
-  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  if (!workspace_id) {
+    return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  }
 
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") || "50", 10), 1), 200);
+  const limit = Math.min(
+    Math.max(parseInt(c.req.query("limit") || "50", 10), 1),
+    200,
+  );
   let q = supabase
     .from("agent_memories")
     .select("*")
@@ -793,150 +1170,115 @@ app.get("/memories", async (c) => {
   if (task_id_prefix) q = q.like("task_id", `${task_id_prefix}%`);
 
   const { data, error } = await q;
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ memories: (data || []).map(responseMemory), count: data?.length || 0 }, 200, corsHeaders);
+  if (error) return internalServerError(c, "memories_list", error);
+  return c.json(
+    { memories: (data || []).map(responseMemory), count: data?.length || 0 },
+    200,
+    corsHeaders,
+  );
 });
 
 app.get("/memories/:id", async (c) => {
   const id = c.req.param("id");
-  if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Invalid memory id" }, 400, corsHeaders);
+  if (!z.string().uuid().safeParse(id).success) {
+    return c.json({ error: "Invalid memory id" }, 400, corsHeaders);
+  }
   const workspace_id = c.req.query("workspace_id");
-  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
-  const { data, error } = await supabase.from("agent_memories").select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)").eq("id", id).eq("workspace_id", workspace_id).maybeSingle();
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!workspace_id) {
+    return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  }
+  const { data, error } = await supabase.from("agent_memories").select(
+    "*, agent_memory_source_refs(*), agent_memory_artifacts(*)",
+  ).eq("id", id).eq("workspace_id", workspace_id).maybeSingle();
+  if (error) return internalServerError(c, "memory_lookup", error);
   if (!data) return c.json({ error: "Memory not found" }, 404, corsHeaders);
   return c.json({ memory: data }, 200, corsHeaders);
 });
 
 app.patch("/memories/:id/review", async (c) => {
   const id = c.req.param("id");
-  if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Invalid memory id" }, 400, corsHeaders);
+  if (!z.string().uuid().safeParse(id).success) {
+    return c.json({ error: "Invalid memory id" }, 400, corsHeaders);
+  }
   let body: unknown;
-  try { body = await c.req.json(); } catch { return c.json({ error: "Request body must be valid JSON" }, 400, corsHeaders); }
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(
+      { error: "Request body must be valid JSON" },
+      400,
+      corsHeaders,
+    );
+  }
   const parsed = reviewSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: "Invalid review payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (!parsed.success) {
+    return c.json(
+      { error: "Invalid review payload", details: parsed.error.flatten() },
+      400,
+      corsHeaders,
+    );
+  }
   const req = parsed.data;
-
-  const { data: before, error: beforeError } = await supabase.from("agent_memories").select("*").eq("id", id).eq("workspace_id", req.workspace_id).maybeSingle();
-  if (beforeError) return c.json({ error: beforeError.message }, 500, corsHeaders);
-  if (!before) return c.json({ error: "Memory not found" }, 404, corsHeaders);
-  if (req.related_memory_id === id) return c.json({ error: "A memory cannot be related to itself" }, 400, corsHeaders);
-  if (req.related_memory_id) {
-    const { data: related, error: relatedError } = await supabase.from("agent_memories").select("id").eq("id", req.related_memory_id).eq("workspace_id", before.workspace_id).maybeSingle();
-    if (relatedError) return c.json({ error: relatedError.message }, 500, corsHeaders);
-    if (!related) return c.json({ error: "Related memory must exist in the same workspace" }, 400, corsHeaders);
+  if (req.related_memory_id === id) {
+    return c.json(
+      { error: "A memory cannot be related to itself" },
+      400,
+      corsHeaders,
+    );
   }
-
-  const updates: Record<string, unknown> = {};
-  if (req.action === "confirm") {
-    updates.review_status = "confirmed";
-    updates.provenance_status = "user_confirmed";
-    updates.can_use_as_instruction = true;
-    updates.requires_user_confirmation = false;
-    updates.last_confirmed_at = new Date().toISOString();
-  } else if (req.action === "evidence_only") {
-    updates.review_status = "evidence_only";
-    updates.can_use_as_instruction = false;
-    updates.can_use_as_evidence = true;
-    updates.requires_user_confirmation = false;
-  } else if (req.action === "reject") {
-    updates.review_status = "rejected";
-    updates.lifecycle_status = "rejected";
-    updates.can_use_as_instruction = false;
-    updates.can_use_as_evidence = false;
-  } else if (req.action === "mark_stale") {
-    updates.review_status = "stale";
-    updates.lifecycle_status = "stale";
-    updates.can_use_as_instruction = false;
-  } else if (req.action === "dispute") {
-    updates.lifecycle_status = "disputed";
-    updates.provenance_status = "disputed";
-    updates.can_use_as_instruction = false;
-    updates.can_use_as_evidence = false;
-    updates.requires_user_confirmation = true;
-  } else if (req.action === "restrict_scope") {
-    if (!canRestrictVisibility(before as AgentMemory, req.visibility!)) {
-      return c.json({ error: "restrict_scope may only reduce the existing visibility" }, 400, corsHeaders);
+  if (req.content) {
+    const unsafe = unsafeReasons(req.content);
+    if (unsafe.length > 0) {
+      return c.json(
+        { error: "Unsafe review edit blocked", unsafe },
+        422,
+        corsHeaders,
+      );
     }
-    updates.review_status = "restricted";
-    updates.visibility = req.visibility;
-  } else if (req.action === "edit") {
-    if (req.content) {
-      const unsafe = unsafeReasons(req.content);
-      if (unsafe.length > 0) return c.json({ error: "Unsafe review edit blocked", unsafe }, 422, corsHeaders);
-      const embedding = await getEmbedding(req.content);
-      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", { p_content: req.content, p_payload: { metadata: { source: "agent_memory_review", agent_memory_id: id } } });
-      if (upsertError) return c.json({ error: upsertError.message }, 500, corsHeaders);
-      const thoughtId = extractThoughtId(upsertResult);
-      if (!thoughtId) return c.json({ error: "upsert_thought returned no UUID thought id" }, 500, corsHeaders);
-      const { error: embeddingError } = await supabase.from("thoughts").update({ embedding }).eq("id", thoughtId);
-      if (embeddingError) return c.json({ error: embeddingError.message }, 500, corsHeaders);
-      updates.content = req.content;
-      updates.content_hash = await sha256Hex(`${before.memory_type}:${req.content}`);
-      updates.thought_id = thoughtId;
-    }
-    if (req.summary) updates.summary = req.summary;
-  } else if (req.action === "merge") {
-    Object.assign(updates, { review_status: "merged", lifecycle_status: "superseded", can_use_as_instruction: false, can_use_as_evidence: false, requires_user_confirmation: false });
-  } else if (req.action === "supersede") {
-    Object.assign(updates, { review_status: "stale", lifecycle_status: "superseded", can_use_as_instruction: false, can_use_as_evidence: false, requires_user_confirmation: false });
   }
 
-  const { data: after, error: updateError } = await supabase.from("agent_memories").update(updates).eq("id", id).eq("workspace_id", req.workspace_id).select("*").single();
-  if (updateError) return c.json({ error: updateError.message }, 500, corsHeaders);
-
-  const { error: reviewActionError } = await supabase.from("agent_memory_review_actions").insert({
-    memory_id: id,
-    action: req.action,
-    actor_id: req.actor_id ?? null,
-    actor_label: req.actor_label ?? null,
-    notes: req.notes ?? null,
-    before,
-    after,
+  const { data, error } = await supabase.rpc("agent_memory_review_tx", {
+    p_memory_id: id,
+    p_workspace_id: req.workspace_id,
+    p_action: req.action,
+    p_actor_id: req.actor_id ?? req.actor_label!,
+    p_notes: req.notes ?? null,
+    p_related_memory_id: req.related_memory_id ?? null,
+    p_content: req.content ?? null,
+    p_summary: req.summary ?? null,
+    p_visibility: req.visibility ?? null,
   });
-  if (reviewActionError) return c.json({ error: reviewActionError.message }, 500, corsHeaders);
-
-  if (req.related_memory_id && ["merge", "supersede"].includes(req.action)) {
-    const { error: relationError } = await supabase.from("agent_memory_relations").insert({
-      from_memory_id: id,
-      to_memory_id: req.related_memory_id,
-      relation: req.action === "merge" ? "merged_into" : "superseded_by",
-      confidence: 1,
-    });
-    if (relationError) return c.json({ error: relationError.message }, 500, corsHeaders);
+  if (error) return transactionalRpcError(c, "review", error);
+  const result = rpcMemoryResult(data);
+  if (!result) {
+    return internalServerError(c, "agent_memory_review_tx_result", data);
   }
-
-  const eventMap: Record<string, string> = {
-    confirm: "memory_confirmed",
-    edit: "memory_edited",
-    reject: "memory_rejected",
-    supersede: "memory_superseded",
-    dispute: "memory_disputed",
-  };
-  await audit(eventMap[req.action] || "memory_edited", {
-    workspace_id: before.workspace_id,
-    project_id: before.project_id,
-    memory_id: id,
-    actor_kind: "user",
-    actor_label: req.actor_label ?? req.actor_id,
-    action: req.action,
-    notes: req.notes,
-    related_memory_id: req.related_memory_id,
-  });
-
-  return c.json({ memory: after }, 200, corsHeaders);
+  return c.json({ memory: result.memory }, 200, corsHeaders);
 });
 
 app.get("/recall-traces/:request_id", async (c) => {
   const request_id = c.req.param("request_id");
-  if (!z.string().uuid().safeParse(request_id).success) return c.json({ error: "Invalid request_id" }, 400, corsHeaders);
+  if (!z.string().uuid().safeParse(request_id).success) {
+    return c.json({ error: "Invalid request_id" }, 400, corsHeaders);
+  }
   const workspace_id = c.req.query("workspace_id");
-  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
-  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).eq("workspace_id", workspace_id).maybeSingle();
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  if (!trace) return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
-  const { data: items, error: itemError } = await supabase.from("agent_memory_recall_items").select("*, agent_memories(*)").eq("trace_id", trace.id).order("rank");
-  if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
+  if (!workspace_id) {
+    return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  }
+  const { data: trace, error } = await supabase.from(
+    "agent_memory_recall_traces",
+  ).select("*").eq("request_id", request_id).eq("workspace_id", workspace_id)
+    .maybeSingle();
+  if (error) return internalServerError(c, "recall_trace_lookup", error);
+  if (!trace) {
+    return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
+  }
+  const { data: items, error: itemError } = await supabase.from(
+    "agent_memory_recall_items",
+  ).select("*, agent_memories(*)").eq("trace_id", trace.id).order("rank");
+  if (itemError) {
+    return internalServerError(c, "recall_trace_items_lookup", itemError);
+  }
   return c.json({ trace, items }, 200, corsHeaders);
 });
 

@@ -1,5 +1,30 @@
 \set ON_ERROR_STOP on
 
+DO $upgrade$
+BEGIN
+  IF to_regprocedure(
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy seven-argument hybrid_search_thoughts still exists';
+  END IF;
+  IF to_regprocedure(
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision)'
+  ) IS NULL THEN
+    RAISE EXCEPTION 'current eight-argument hybrid_search_thoughts is missing';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'thought_audit' AND column_name = 'actor'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'thought_audit' AND column_name = 'session_id'
+  ) THEN
+    RAISE EXCEPTION 'legacy thought_audit was not upgraded with actor/session_id';
+  END IF;
+  RAISE NOTICE 'PASS upgrade replaced the 7-argument RPC and extended legacy thought_audit';
+END
+$upgrade$;
+
 CREATE OR REPLACE FUNCTION pg_temp.unit_vector(p_position INT)
 RETURNS vector(1536)
 LANGUAGE sql

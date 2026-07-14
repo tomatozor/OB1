@@ -6,8 +6,12 @@ Deno.env.set("MCP_ACCESS_KEY", "test-mcp-key");
 const {
   fuseRrf,
   isMissingDatabaseObjectError,
+  isMissingEnhancedThoughtsError,
   isMissingHybridRpcError,
+  isHybridThresholdSignatureError,
   retrieveHybrid,
+  timingSafeEqualStrings,
+  validateEmbedding,
 } = await import("./index.ts");
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -164,5 +168,66 @@ Deno.test("missing database object detection accepts PostgREST and SQL absence o
       "thought_edges",
     ),
     "permission error was misclassified as an absent object",
+  );
+});
+
+Deno.test("auth comparison hashes values and handles different lengths", async () => {
+  assert(
+    await timingSafeEqualStrings("test-mcp-key", "test-mcp-key"),
+    "equal keys did not match",
+  );
+  assert(
+    !(await timingSafeEqualStrings("test-mcp-ke", "test-mcp-key")),
+    "shorter key matched",
+  );
+  assert(
+    !(await timingSafeEqualStrings("test-mcp-keyx", "test-mcp-key")),
+    "longer key matched",
+  );
+});
+
+Deno.test("embedding validation requires exactly 1536 finite numbers", () => {
+  const valid = Array(1536).fill(0.25);
+  assert(validateEmbedding(valid) === valid, "valid embedding was copied");
+  for (const invalid of [valid.slice(1), [...valid.slice(0, -1), Infinity]]) {
+    let rejected = false;
+    try {
+      validateEmbedding(invalid);
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, "invalid embedding was accepted");
+  }
+});
+
+Deno.test("base-schema and threshold-signature errors are narrowly classified", () => {
+  assert(
+    isMissingEnhancedThoughtsError({
+      code: "42703",
+      message: "column thoughts.quality_score does not exist",
+    }),
+    "undefined enhanced column was not detected",
+  );
+  assert(
+    isMissingEnhancedThoughtsError({
+      code: "PGRST204",
+      message: "Could not find quality_score in the schema cache",
+    }),
+    "PostgREST missing enhanced column was not detected",
+  );
+  assert(
+    isHybridThresholdSignatureError({
+      code: "PGRST202",
+      message:
+        "Could not find hybrid_search_thoughts(p_query, p_semantic_threshold)",
+    }),
+    "threshold signature mismatch was not detected",
+  );
+  assert(
+    !isHybridThresholdSignatureError({
+      code: "PGRST202",
+      message: "Could not find hybrid_search_thoughts(p_query)",
+    }),
+    "missing hybrid RPC was misclassified as a threshold mismatch",
   );
 });

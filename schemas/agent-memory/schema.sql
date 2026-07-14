@@ -95,6 +95,16 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
 
 -- Keep repeat applications aligned with the runtime-neutral four-level scope
 -- model, including databases created by an earlier version of this schema.
+UPDATE public.agent_memories
+  SET idempotency_key = 'legacy:' || id::TEXT
+  WHERE idempotency_key IS NULL;
+UPDATE public.agent_memories
+  SET content_hash = 'legacy:' || id::TEXT
+  WHERE content_hash IS NULL;
+ALTER TABLE public.agent_memories
+  ALTER COLUMN idempotency_key SET NOT NULL,
+  ALTER COLUMN content_hash SET NOT NULL;
+
 ALTER TABLE public.agent_memories
   ALTER COLUMN visibility SET DEFAULT 'workspace';
 UPDATE public.agent_memories
@@ -107,7 +117,10 @@ ALTER TABLE public.agent_memories
     visibility IN ('personal', 'channel', 'project', 'workspace')
   );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memories_idempotency_key
+-- origin/main used this name for a global partial unique index. Drop that
+-- superseded definition before creating the workspace-scoped replacement.
+DROP INDEX IF EXISTS public.idx_agent_memories_idempotency_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memories_workspace_idempotency_key
   ON public.agent_memories (workspace_id, idempotency_key);
 
 CREATE INDEX IF NOT EXISTS idx_agent_memories_scope
@@ -277,6 +290,10 @@ RETURNS TRIGGER AS $$
 DECLARE
   lifecycle_event TEXT;
 BEGIN
+  IF current_setting('ob1.agent_memory_skip_lifecycle_audit', true) = 'on' THEN
+    RETURN NEW;
+  END IF;
+
   IF NEW.lifecycle_status IS DISTINCT FROM OLD.lifecycle_status
     AND NEW.lifecycle_status IN ('stale', 'superseded', 'disputed', 'rejected') THEN
     lifecycle_event := CASE NEW.lifecycle_status
@@ -357,6 +374,470 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.agent_memory_writeback_tx(
+  p_workspace_id TEXT,
+  p_idempotency_key TEXT,
+  p_content_hash TEXT,
+  p_memory JSONB,
+  p_provenance JSONB,
+  p_source_refs JSONB DEFAULT '[]'::jsonb,
+  p_artifacts JSONB DEFAULT '[]'::jsonb,
+  p_created_by TEXT DEFAULT NULL,
+  p_request_context JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $agent_memory_writeback_tx$
+DECLARE
+  v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
+  v_idempotency_key TEXT := nullif(btrim(p_idempotency_key), '');
+  v_content_hash TEXT := nullif(btrim(p_content_hash), '');
+  v_memory_input JSONB := coalesce(p_memory, '{}'::jsonb);
+  v_provenance_input JSONB := coalesce(p_provenance, '{}'::jsonb);
+  v_request_context JSONB := coalesce(p_request_context, '{}'::jsonb);
+  v_visibility TEXT;
+  v_memory_type TEXT;
+  v_provenance_status TEXT;
+  v_created_by TEXT := coalesce(nullif(btrim(p_created_by), ''), 'agent');
+  v_existing public.agent_memories%ROWTYPE;
+  v_memory public.agent_memories%ROWTYPE;
+BEGIN
+  IF v_workspace_id IS NULL THEN
+    RAISE EXCEPTION 'workspace_id is required' USING ERRCODE = '22023';
+  END IF;
+  IF v_idempotency_key IS NULL THEN
+    RAISE EXCEPTION 'idempotency_key is required' USING ERRCODE = '22023';
+  END IF;
+  IF v_content_hash IS NULL THEN
+    RAISE EXCEPTION 'content_hash is required' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(v_memory_input) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'memory must be a JSON object' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(v_provenance_input) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'provenance must be a JSON object' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(v_request_context) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION 'request_context must be a JSON object' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(coalesce(p_source_refs, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'source_refs must be a JSON array' USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(coalesce(p_artifacts, '[]'::jsonb)) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'artifacts must be a JSON array' USING ERRCODE = '22023';
+  END IF;
+
+  v_visibility := coalesce(nullif(btrim(v_memory_input->>'visibility'), ''), 'workspace');
+  IF v_visibility NOT IN ('personal', 'channel', 'project', 'workspace') THEN
+    RAISE EXCEPTION 'invalid visibility: %', v_visibility USING ERRCODE = '22023';
+  END IF;
+  IF v_visibility = 'project'
+    AND nullif(btrim(coalesce(v_memory_input->>'project_id', v_request_context->>'project_id')), '') IS NULL THEN
+    RAISE EXCEPTION 'project visibility requires project_id' USING ERRCODE = '22023';
+  END IF;
+  IF v_visibility = 'channel'
+    AND nullif(btrim(coalesce(v_memory_input->>'channel_id', v_request_context->>'channel_id')), '') IS NULL THEN
+    RAISE EXCEPTION 'channel visibility requires channel_id' USING ERRCODE = '22023';
+  END IF;
+
+  v_memory_type := nullif(btrim(v_memory_input->>'memory_type'), '');
+  IF v_memory_type IS NULL OR v_memory_type NOT IN (
+    'decision', 'output', 'lesson', 'constraint', 'open_question',
+    'failure', 'artifact_reference', 'work_log'
+  ) THEN
+    RAISE EXCEPTION 'invalid memory_type: %', coalesce(v_memory_type, '<null>')
+      USING ERRCODE = '22023';
+  END IF;
+  IF nullif(btrim(v_memory_input->>'summary'), '') IS NULL THEN
+    RAISE EXCEPTION 'memory summary is required' USING ERRCODE = '22023';
+  END IF;
+  IF nullif(btrim(v_memory_input->>'content'), '') IS NULL THEN
+    RAISE EXCEPTION 'memory content is required' USING ERRCODE = '22023';
+  END IF;
+
+  v_provenance_status := coalesce(
+    nullif(btrim(v_provenance_input->>'provenance_status'), ''),
+    nullif(btrim(v_provenance_input->>'default_status'), ''),
+    'generated'
+  );
+  IF v_provenance_status NOT IN ('observed', 'inferred', 'generated') THEN
+    RAISE EXCEPTION 'invalid writeback provenance_status: %', v_provenance_status
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_created_by NOT IN ('user', 'agent', 'system', 'import') THEN
+    RAISE EXCEPTION 'invalid created_by: %', v_created_by USING ERRCODE = '22023';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(v_workspace_id || E'\x1f' || v_idempotency_key, 0)
+  );
+
+  SELECT *
+  INTO v_existing
+  FROM public.agent_memories
+  WHERE workspace_id = v_workspace_id
+    AND idempotency_key = v_idempotency_key
+  FOR UPDATE;
+
+  IF FOUND THEN
+    IF v_existing.content_hash = v_content_hash THEN
+      RETURN to_jsonb(v_existing) || jsonb_build_object('replayed', true);
+    END IF;
+    RAISE EXCEPTION 'idempotency key already used with different content hash'
+      USING ERRCODE = '23505';
+  END IF;
+
+  INSERT INTO public.agent_memories (
+    thought_id,
+    workspace_id,
+    project_id,
+    channel_kind,
+    channel_id,
+    channel_thread_id,
+    visibility,
+    memory_type,
+    summary,
+    content,
+    lifecycle_status,
+    provenance_status,
+    confidence,
+    created_by,
+    runtime_name,
+    runtime_version,
+    provider,
+    model,
+    task_id,
+    flow_id,
+    can_use_as_instruction,
+    can_use_as_evidence,
+    requires_user_confirmation,
+    review_status,
+    stale_after,
+    idempotency_key,
+    content_hash,
+    metadata
+  ) VALUES (
+    nullif(v_memory_input->>'thought_id', '')::UUID,
+    v_workspace_id,
+    nullif(btrim(coalesce(v_memory_input->>'project_id', v_request_context->>'project_id')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'channel_kind', v_request_context->>'channel_kind')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'channel_id', v_request_context->>'channel_id')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'channel_thread_id', v_request_context->>'channel_thread_id')), ''),
+    v_visibility,
+    v_memory_type,
+    btrim(v_memory_input->>'summary'),
+    btrim(v_memory_input->>'content'),
+    'active',
+    v_provenance_status,
+    coalesce(nullif(v_provenance_input->>'confidence', '')::NUMERIC, 0.50),
+    v_created_by,
+    nullif(btrim(coalesce(v_memory_input->>'runtime_name', v_request_context->>'runtime_name')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'runtime_version', v_request_context->>'runtime_version')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'provider', v_request_context->>'provider')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'model', v_request_context->>'model')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'task_id', v_request_context->>'task_id')), ''),
+    nullif(btrim(coalesce(v_memory_input->>'flow_id', v_request_context->>'flow_id')), ''),
+    false,
+    true,
+    true,
+    'pending',
+    nullif(v_memory_input->>'stale_after', '')::TIMESTAMPTZ,
+    v_idempotency_key,
+    v_content_hash,
+    coalesce(v_memory_input->'metadata', '{}'::jsonb)
+      || jsonb_build_object(
+        'provenance', v_provenance_input,
+        'request_context', v_request_context
+      )
+  )
+  RETURNING * INTO v_memory;
+
+  INSERT INTO public.agent_memory_source_refs (
+    memory_id, source_kind, uri, title, source_timestamp, metadata
+  )
+  SELECT
+    v_memory.id,
+    coalesce(nullif(btrim(item->>'source_kind'), ''), nullif(btrim(item->>'kind'), '')),
+    nullif(btrim(item->>'uri'), ''),
+    nullif(btrim(item->>'title'), ''),
+    nullif(coalesce(item->>'source_timestamp', item->>'timestamp'), '')::TIMESTAMPTZ,
+    coalesce(item->'metadata', '{}'::jsonb)
+  FROM jsonb_array_elements(coalesce(p_source_refs, '[]'::jsonb)) AS source(item);
+
+  INSERT INTO public.agent_memory_artifacts (
+    memory_id, artifact_kind, uri, description, metadata
+  )
+  SELECT
+    v_memory.id,
+    coalesce(nullif(btrim(item->>'artifact_kind'), ''), nullif(btrim(item->>'kind'), '')),
+    nullif(btrim(item->>'uri'), ''),
+    nullif(btrim(item->>'description'), ''),
+    coalesce(item->'metadata', '{}'::jsonb)
+  FROM jsonb_array_elements(coalesce(p_artifacts, '[]'::jsonb)) AS artifact(item);
+
+  INSERT INTO public.agent_memory_audit_events (
+    event_type,
+    workspace_id,
+    project_id,
+    memory_id,
+    actor_kind,
+    actor_label,
+    runtime_name,
+    task_id,
+    payload
+  ) VALUES (
+    'memory_written',
+    v_memory.workspace_id,
+    v_memory.project_id,
+    v_memory.id,
+    v_created_by,
+    nullif(btrim(v_request_context->>'actor_label'), ''),
+    v_memory.runtime_name,
+    v_memory.task_id,
+    jsonb_build_object(
+      'idempotency_key', v_idempotency_key,
+      'content_hash', v_content_hash,
+      'provenance_status', v_provenance_status,
+      'review_status', 'pending'
+    )
+  );
+
+  RETURN to_jsonb(v_memory) || jsonb_build_object('replayed', false);
+END;
+$agent_memory_writeback_tx$;
+
+CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
+  p_memory_id UUID,
+  p_workspace_id TEXT,
+  p_action TEXT,
+  p_actor_id TEXT,
+  p_notes TEXT DEFAULT NULL,
+  p_related_memory_id UUID DEFAULT NULL,
+  p_content TEXT DEFAULT NULL,
+  p_summary TEXT DEFAULT NULL,
+  p_visibility TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $agent_memory_review_tx$
+DECLARE
+  v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
+  v_action TEXT := lower(nullif(btrim(p_action), ''));
+  v_actor_id TEXT := nullif(btrim(p_actor_id), '');
+  v_visibility TEXT := lower(nullif(btrim(p_visibility), ''));
+  v_before JSONB;
+  v_memory public.agent_memories%ROWTYPE;
+  v_after public.agent_memories%ROWTYPE;
+  v_related_id UUID;
+  v_current_scope_rank INT;
+  v_new_scope_rank INT;
+  v_event_type TEXT;
+BEGIN
+  IF v_workspace_id IS NULL THEN
+    RAISE EXCEPTION 'workspace_id is required' USING ERRCODE = '22023';
+  END IF;
+  IF v_actor_id IS NULL THEN
+    RAISE EXCEPTION 'actor_id is required' USING ERRCODE = '22023';
+  END IF;
+  IF v_action = 'approve' THEN
+    v_action := 'confirm';
+  END IF;
+  IF v_action IS NULL OR v_action NOT IN (
+    'confirm', 'evidence_only', 'edit', 'restrict_scope', 'mark_stale',
+    'merge', 'supersede', 'reject', 'dispute'
+  ) THEN
+    RAISE EXCEPTION 'invalid review action: %', coalesce(v_action, '<null>')
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT *
+  INTO v_memory
+  FROM public.agent_memories
+  WHERE id = p_memory_id
+    AND workspace_id = v_workspace_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'not found in workspace' USING ERRCODE = 'P0002';
+  END IF;
+  v_before := to_jsonb(v_memory);
+
+  IF v_memory.lifecycle_status <> 'active' THEN
+    RAISE EXCEPTION 'invalid transition: action % requires active memory, found %',
+      v_action, v_memory.lifecycle_status USING ERRCODE = '22023';
+  END IF;
+
+  IF v_action = 'confirm' AND v_memory.review_status NOT IN ('pending', 'evidence_only', 'restricted') THEN
+    RAISE EXCEPTION 'invalid transition: cannot confirm review_status %', v_memory.review_status
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_action = 'evidence_only' AND v_memory.review_status NOT IN ('pending', 'confirmed', 'restricted') THEN
+    RAISE EXCEPTION 'invalid transition: cannot mark review_status % evidence-only', v_memory.review_status
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_action = 'edit'
+    AND nullif(btrim(p_content), '') IS NULL
+    AND nullif(btrim(p_summary), '') IS NULL THEN
+    RAISE EXCEPTION 'edit requires content or summary' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_action = 'restrict_scope' THEN
+    IF v_visibility IS NULL OR v_visibility NOT IN ('personal', 'channel', 'project', 'workspace') THEN
+      RAISE EXCEPTION 'restrict_scope requires a valid visibility' USING ERRCODE = '22023';
+    END IF;
+    v_current_scope_rank := CASE v_memory.visibility
+      WHEN 'workspace' THEN 4 WHEN 'project' THEN 3 WHEN 'channel' THEN 2 WHEN 'personal' THEN 1
+    END;
+    v_new_scope_rank := CASE v_visibility
+      WHEN 'workspace' THEN 4 WHEN 'project' THEN 3 WHEN 'channel' THEN 2 WHEN 'personal' THEN 1
+    END;
+    IF v_new_scope_rank >= v_current_scope_rank THEN
+      RAISE EXCEPTION 'restrict_scope may only reduce the existing visibility'
+        USING ERRCODE = '22023';
+    END IF;
+    IF v_visibility = 'project' AND v_memory.project_id IS NULL THEN
+      RAISE EXCEPTION 'project visibility requires project_id' USING ERRCODE = '22023';
+    END IF;
+    IF v_visibility = 'channel' AND v_memory.channel_id IS NULL THEN
+      RAISE EXCEPTION 'channel visibility requires channel_id' USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  IF v_action IN ('merge', 'supersede') THEN
+    IF p_related_memory_id IS NULL OR p_related_memory_id = p_memory_id THEN
+      RAISE EXCEPTION '% requires a different related_memory_id', v_action
+        USING ERRCODE = '22023';
+    END IF;
+    SELECT id
+    INTO v_related_id
+    FROM public.agent_memories
+    WHERE id = p_related_memory_id
+      AND workspace_id = v_workspace_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'related memory not found in workspace' USING ERRCODE = 'P0002';
+    END IF;
+  END IF;
+
+  PERFORM set_config('ob1.agent_memory_skip_lifecycle_audit', 'on', true);
+
+  UPDATE public.agent_memories
+  SET review_status = CASE v_action
+        WHEN 'confirm' THEN 'confirmed'
+        WHEN 'evidence_only' THEN 'evidence_only'
+        WHEN 'restrict_scope' THEN 'restricted'
+        WHEN 'mark_stale' THEN 'stale'
+        WHEN 'merge' THEN 'merged'
+        WHEN 'supersede' THEN 'stale'
+        WHEN 'reject' THEN 'rejected'
+        ELSE review_status
+      END,
+      lifecycle_status = CASE v_action
+        WHEN 'mark_stale' THEN 'stale'
+        WHEN 'merge' THEN 'superseded'
+        WHEN 'supersede' THEN 'superseded'
+        WHEN 'reject' THEN 'rejected'
+        WHEN 'dispute' THEN 'disputed'
+        ELSE lifecycle_status
+      END,
+      provenance_status = CASE v_action
+        WHEN 'confirm' THEN 'user_confirmed'
+        WHEN 'dispute' THEN 'disputed'
+        ELSE provenance_status
+      END,
+      can_use_as_instruction = CASE
+        WHEN v_action = 'confirm' THEN true
+        WHEN v_action IN ('evidence_only', 'mark_stale', 'merge', 'supersede', 'reject', 'dispute') THEN false
+        ELSE can_use_as_instruction
+      END,
+      can_use_as_evidence = CASE
+        WHEN v_action IN ('merge', 'supersede', 'reject', 'dispute') THEN false
+        WHEN v_action = 'evidence_only' THEN true
+        ELSE can_use_as_evidence
+      END,
+      requires_user_confirmation = CASE
+        WHEN v_action IN ('confirm', 'evidence_only', 'merge', 'supersede') THEN false
+        WHEN v_action = 'dispute' THEN true
+        ELSE requires_user_confirmation
+      END,
+      last_confirmed_at = CASE WHEN v_action = 'confirm' THEN now() ELSE last_confirmed_at END,
+      content = CASE WHEN v_action = 'edit' AND nullif(btrim(p_content), '') IS NOT NULL
+        THEN btrim(p_content) ELSE content END,
+      summary = CASE WHEN v_action = 'edit' AND nullif(btrim(p_summary), '') IS NOT NULL
+        THEN btrim(p_summary) ELSE summary END,
+      content_hash = CASE WHEN v_action = 'edit' AND nullif(btrim(p_content), '') IS NOT NULL
+        THEN public.agent_memory_hash_text(memory_type || ':' || btrim(p_content)) ELSE content_hash END,
+      visibility = CASE WHEN v_action = 'restrict_scope' THEN v_visibility ELSE visibility END
+  WHERE id = p_memory_id
+    AND workspace_id = v_workspace_id
+  RETURNING * INTO v_after;
+
+  PERFORM set_config('ob1.agent_memory_skip_lifecycle_audit', 'off', true);
+
+  INSERT INTO public.agent_memory_review_actions (
+    memory_id, action, actor_id, notes, before, after
+  ) VALUES (
+    p_memory_id, v_action, v_actor_id, p_notes, v_before, to_jsonb(v_after)
+  );
+
+  IF v_action IN ('merge', 'supersede') THEN
+    INSERT INTO public.agent_memory_relations (
+      from_memory_id, to_memory_id, relation, confidence
+    ) VALUES (
+      p_memory_id,
+      v_related_id,
+      CASE WHEN v_action = 'merge' THEN 'merged_into' ELSE 'superseded_by' END,
+      1
+    );
+  END IF;
+
+  v_event_type := CASE v_action
+    WHEN 'confirm' THEN 'memory_confirmed'
+    WHEN 'reject' THEN 'memory_rejected'
+    WHEN 'merge' THEN 'memory_superseded'
+    WHEN 'supersede' THEN 'memory_superseded'
+    WHEN 'dispute' THEN 'memory_disputed'
+    ELSE 'memory_edited'
+  END;
+
+  INSERT INTO public.agent_memory_audit_events (
+    event_type,
+    workspace_id,
+    project_id,
+    memory_id,
+    actor_kind,
+    actor_label,
+    runtime_name,
+    task_id,
+    payload
+  ) VALUES (
+    v_event_type,
+    v_after.workspace_id,
+    v_after.project_id,
+    v_after.id,
+    'user',
+    v_actor_id,
+    v_after.runtime_name,
+    v_after.task_id,
+    jsonb_build_object(
+      'action', v_action,
+      'notes', p_notes,
+      'related_memory_id', p_related_memory_id,
+      'before_review_status', v_memory.review_status,
+      'after_review_status', v_after.review_status,
+      'before_lifecycle_status', v_memory.lifecycle_status,
+      'after_lifecycle_status', v_after.lifecycle_status
+    )
+  );
+
+  RETURN jsonb_build_object('memory', to_jsonb(v_after), 'action', v_action);
+END;
+$agent_memory_review_tx$;
+
 ALTER TABLE public.agent_memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_memory_source_refs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_memory_artifacts ENABLE ROW LEVEL SECURITY;
@@ -400,6 +881,15 @@ END $$;
 
 -- The public API exposes lifecycle updates, never physical row deletion.
 -- Accordingly, the service role receives no DELETE grant on these tables.
+REVOKE DELETE ON TABLE public.agent_memories FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_source_refs FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_artifacts FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_relations FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_review_actions FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_recall_traces FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_recall_items FROM service_role;
+REVOKE DELETE ON TABLE public.agent_memory_audit_events FROM service_role;
+
 GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memories TO service_role;
 GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_source_refs TO service_role;
 GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_artifacts TO service_role;
@@ -409,6 +899,19 @@ GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_recall_traces TO servi
 GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_recall_items TO service_role;
 GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_audit_events TO service_role;
 GRANT EXECUTE ON FUNCTION public.agent_memory_hash_text(TEXT) TO service_role;
+
+REVOKE ALL ON FUNCTION public.agent_memory_writeback_tx(
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
+) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.agent_memory_writeback_tx(
+  TEXT, TEXT, TEXT, JSONB, JSONB, JSONB, JSONB, TEXT, JSONB
+) TO service_role;
+GRANT EXECUTE ON FUNCTION public.agent_memory_review_tx(
+  UUID, TEXT, TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT
+) TO service_role;
 
 NOTIFY pgrst, 'reload schema';
 

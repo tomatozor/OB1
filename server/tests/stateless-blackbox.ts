@@ -15,6 +15,13 @@ const MEMORY_A_ID = "66666666-6666-4666-8666-666666666666";
 const MEMORY_B_ID = "77777777-7777-4777-8777-777777777777";
 const MEMORY_PENDING_ID = "88888888-8888-4888-8888-888888888888";
 const MEMORY_OUTSIDE_TRACE_ID = "99999999-9999-4999-8999-999999999999";
+const DELETED_STRING_ID = "aaaaaaaa-1111-4111-8111-111111111111";
+const BASE_SCHEMA_ID = "aaaaaaaa-2222-4222-8222-222222222222";
+const HYBRID_RPC_ID = "aaaaaaaa-3333-4333-8333-333333333333";
+const VALID_EMBEDDING = Array.from(
+  { length: 1536 },
+  (_, index) => index < 3 ? [0.1, 0.2, 0.3][index] : 0,
+);
 
 Deno.env.set("SUPABASE_URL", "http://postgrest.invalid");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
@@ -22,10 +29,18 @@ Deno.env.set("OPENROUTER_API_KEY", "test-openrouter-key");
 Deno.env.set("OPENROUTER_BASE_URL", "http://openrouter.invalid");
 Deno.env.set("MCP_ACCESS_KEY", ACCESS_KEY);
 
-type MockRequest = { method: string; url: string; body: string };
+type MockRequest = {
+  method: string;
+  url: string;
+  body: string;
+  hasSignal: boolean;
+};
 const requests: MockRequest[] = [];
 let memorySequence = 10;
 let traceSequence = 20;
+let failNextAudit = false;
+const embeddingAttempts = new Map<string, number>();
+const writebackByKey = new Map<string, Record<string, any>>();
 const agentMemories: Array<Record<string, any>> = [
   {
     id: MEMORY_A_ID,
@@ -143,12 +158,28 @@ globalThis.fetch = (async (
 ): Promise<Response> => {
   const request = input instanceof Request ? input : new Request(input, init);
   const rawBody = request.body ? await request.text() : "";
-  const entry = { method: request.method, url: request.url, body: rawBody };
+  const entry = {
+    method: request.method,
+    url: request.url,
+    body: rawBody,
+    hasSignal: Boolean(init?.signal),
+  };
   requests.push(entry);
   const url = new URL(request.url);
 
   if (url.hostname === "openrouter.invalid" && url.pathname === "/embeddings") {
-    return json(200, { data: [{ embedding: [0.1, 0.2, 0.3] }] });
+    const inputText = String(JSON.parse(rawBody).input ?? "");
+    const attempt = (embeddingAttempts.get(inputText) ?? 0) + 1;
+    embeddingAttempts.set(inputText, attempt);
+    if (inputText === "retry-embedding" && attempt < 3) {
+      return json(429, { message: "rate limited internal detail" });
+    }
+    if (inputText === "bad-embedding") {
+      return json(200, { data: [{ embedding: [0.1, 0.2] }] });
+    }
+    const embedding = [...VALID_EMBEDDING];
+    if (inputText === "base-schema") embedding[0] = 0.42;
+    return json(200, { data: [{ embedding }] });
   }
   if (
     url.hostname === "openrouter.invalid" &&
@@ -171,6 +202,13 @@ globalThis.fetch = (async (
 
   const rpc = url.pathname.match(/\/rest\/v1\/rpc\/([^/]+)$/)?.[1];
   if (rpc === "search_thoughts_text") {
+    if (JSON.parse(rawBody).p_query === "base-schema") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.search_thoughts_text in the schema cache",
+      });
+    }
     return json(200, [{
       id: "text-visible",
       content: "visible matching thought",
@@ -210,6 +248,38 @@ globalThis.fetch = (async (
     }]);
   }
   if (rpc === "hybrid_search_thoughts") {
+    const payload = JSON.parse(rawBody);
+    if (payload.p_query === "hybrid-rpc") {
+      if (payload.p_semantic_threshold !== 0.83) {
+        return json(400, { code: "P0001", message: "threshold missing" });
+      }
+      return json(200, [{
+        id: HYBRID_RPC_ID,
+        similarity: 0.9,
+        content: "hybrid RPC result",
+        metadata: {},
+        created_at: "2026-07-14T00:00:00.000Z",
+      }]);
+    }
+    if (
+      payload.p_query === "hybrid-legacy" &&
+      Object.hasOwn(payload, "p_semantic_threshold")
+    ) {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.hybrid_search_thoughts(p_query, p_semantic_threshold) in the schema cache",
+      });
+    }
+    if (payload.p_query === "hybrid-legacy") {
+      return json(200, [{
+        id: HYBRID_RPC_ID,
+        similarity: 0.88,
+        content: "legacy hybrid RPC result",
+        metadata: {},
+        created_at: "2026-07-14T00:00:00.000Z",
+      }]);
+    }
     return json(404, {
       code: "PGRST202",
       message:
@@ -217,7 +287,96 @@ globalThis.fetch = (async (
     });
   }
   if (rpc === "match_thoughts") {
+    if (JSON.parse(rawBody).query_embedding?.[0] === 0.42) {
+      return json(200, [{ id: BASE_SCHEMA_ID, similarity: 0.89 }]);
+    }
     return json(200, [{ id: "semantic-visible", similarity: 0.91 }]);
+  }
+  if (rpc === "agent_memory_writeback_tx") {
+    const payload = JSON.parse(rawBody);
+    if (payload.p_workspace_id === "rpc-absent") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.agent_memory_writeback_tx in the schema cache",
+      });
+    }
+    const key = `${payload.p_workspace_id}:${payload.p_idempotency_key}`;
+    const existing = writebackByKey.get(key);
+    if (existing) {
+      if (existing.content_hash !== payload.p_content_hash) {
+        return json(400, {
+          code: "P0001",
+          message: "Idempotency key was already used with different content",
+        });
+      }
+      return json(200, { ...existing, replayed: true });
+    }
+    memorySequence++;
+    const row = {
+      id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(memorySequence).padStart(12, "0")}`,
+      thought_id: null,
+      workspace_id: payload.p_workspace_id,
+      project_id: payload.p_memory.project_id,
+      channel_id: payload.p_memory.channel_id,
+      visibility: payload.p_memory.visibility,
+      memory_type: payload.p_memory.type,
+      summary: payload.p_memory.summary,
+      content: payload.p_memory.content,
+      lifecycle_status: "active",
+      provenance_status: payload.p_provenance.status,
+      confidence: 0.5,
+      created_by: payload.p_created_by,
+      runtime_name: payload.p_request_context.runtime_name,
+      can_use_as_instruction: false,
+      can_use_as_evidence: true,
+      requires_user_confirmation: true,
+      review_status: "pending",
+      last_confirmed_at: null,
+      stale_after: null,
+      idempotency_key: payload.p_idempotency_key,
+      content_hash: payload.p_content_hash,
+      metadata: {},
+      created_at: "2026-07-14T00:00:00.000Z",
+    };
+    writebackByKey.set(key, row);
+    agentMemories.push(row);
+    return json(200, { ...row, replayed: false });
+  }
+  if (rpc === "agent_memory_review_tx") {
+    const payload = JSON.parse(rawBody);
+    if (payload.p_workspace_id === "rpc-absent") {
+      return json(404, {
+        code: "PGRST202",
+        message:
+          "Could not find the function public.agent_memory_review_tx in the schema cache",
+      });
+    }
+    const memory = agentMemories.find((row) =>
+      row.id === payload.p_memory_id &&
+      row.workspace_id === payload.p_workspace_id
+    );
+    if (!memory) {
+      return json(400, {
+        code: "P0001",
+        message: "Memory not found in workspace",
+      });
+    }
+    if (payload.p_action === "confirm") {
+      if (memory.review_status === "confirmed") {
+        return json(400, {
+          code: "P0001",
+          message: "Invalid transition: memory is already confirmed",
+        });
+      }
+      Object.assign(memory, {
+        review_status: "confirmed",
+        provenance_status: "user_confirmed",
+        can_use_as_instruction: true,
+        requires_user_confirmation: false,
+      });
+    }
+    return json(200, memory);
   }
   if (rpc === "capture_thought_atomic") {
     const payload = JSON.parse(rawBody);
@@ -352,8 +511,14 @@ globalThis.fetch = (async (
 
   if (url.pathname === "/rest/v1/agent_memory_recall_traces") {
     if (request.method === "POST") {
-      traceSequence++;
       const payload = JSON.parse(rawBody);
+      if (payload.workspace_id === "trace-write-fail") {
+        return json(500, {
+          code: "XX000",
+          message: "private trace storage detail",
+        });
+      }
+      traceSequence++;
       const row = {
         ...payload,
         id: `bbbbbbbb-bbbb-4bbb-8bbb-${
@@ -409,6 +574,13 @@ globalThis.fetch = (async (
 
   if (url.pathname === "/rest/v1/agent_memory_audit_events") {
     if (request.method === "POST") {
+      if (failNextAudit) {
+        failNextAudit = false;
+        return json(500, {
+          code: "XX000",
+          message: "private audit storage detail",
+        });
+      }
       const payload = JSON.parse(rawBody);
       memoryAuditEvents.push(...(Array.isArray(payload) ? payload : [payload]));
       return json(201, []);
@@ -439,12 +611,23 @@ globalThis.fetch = (async (
   if (url.pathname === "/rest/v1/thoughts" && request.method === "GET") {
     const idFilter = url.searchParams.get("id");
     if (idFilter?.startsWith("in.")) {
+      const select = url.searchParams.get("select") ?? "";
+      if (
+        idFilter.includes(BASE_SCHEMA_ID) && select.includes("quality_score")
+      ) {
+        return json(400, {
+          code: "42703",
+          message: "column thoughts.quality_score does not exist",
+        });
+      }
       const ids = [
         "semantic-visible",
         "text-visible",
         "text-deleted",
         "text-deleted-string",
         "text-metadata-source",
+        BASE_SCHEMA_ID,
+        HYBRID_RPC_ID,
       ].filter((id) => idFilter.includes(id));
       return json(
         200,
@@ -466,8 +649,34 @@ globalThis.fetch = (async (
       );
     }
     if (idFilter?.startsWith("eq.")) {
+      const requestedId = idFilter.slice(3);
+      const select = url.searchParams.get("select") ?? "";
+      if (requestedId === BASE_SCHEMA_ID && select.includes("quality_score")) {
+        return json(400, {
+          code: "PGRST204",
+          message:
+            "Could not find the 'quality_score' column in the schema cache",
+        });
+      }
+      if (requestedId === BASE_SCHEMA_ID) {
+        return json(200, {
+          id: BASE_SCHEMA_ID,
+          content: "base schema thought",
+          metadata: { topics: ["base"] },
+          created_at: "2026-07-14T00:00:00.000Z",
+        });
+      }
+      if (requestedId === DELETED_STRING_ID) {
+        return json(200, {
+          id: DELETED_STRING_ID,
+          content: "deleted string row",
+          metadata: { deleted: "true" },
+          created_at: "2026-07-01T00:00:00.000Z",
+          updated_at: "2026-07-10T12:00:00.000Z",
+        });
+      }
       return json(200, {
-        id: idFilter.slice(3),
+        id: requestedId,
         content: "original",
         metadata: { topics: ["launch"] },
         created_at: "2026-07-01T00:00:00.000Z",
@@ -672,6 +881,27 @@ assert(
   })).response.status === 200,
   "Authorization Bearer -> 200",
 );
+for (
+  const [label, key] of [
+    ["shorter", ACCESS_KEY.slice(0, -1)],
+    ["longer", `${ACCESS_KEY}x`],
+  ] as const
+) {
+  assert(
+    (await mcp("initialize", {}, {
+      "content-type": "application/json",
+      "x-brain-key": key,
+    })).response.status === 401,
+    `x-brain-key ${label} key -> 401`,
+  );
+  assert(
+    (await mcp("initialize", {}, {
+      "content-type": "application/json",
+      authorization: `Bearer ${key}`,
+    })).response.status === 401,
+    `Authorization Bearer ${label} key -> 401`,
+  );
+}
 const tools = await mcp("tools/list");
 assert(tools.response.status === 200, "tools/list -> 200");
 assert(
@@ -801,6 +1031,96 @@ assert(
   semanticCall && JSON.parse(semanticCall.body).match_threshold === 0.77,
   "hybrid fallback semantic leg honors the caller threshold",
 );
+const hybridRpc = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: {
+    query: "hybrid-rpc",
+    mode: "hybrid",
+    threshold: 0.83,
+  },
+});
+assert(
+  hybridRpc.body?.result?.isError !== true &&
+    toolResult(hybridRpc.body!).source === "hybrid_rpc",
+  "installed hybrid RPC path succeeds",
+);
+assert(
+  requests.some((entry) =>
+    entry.url.includes("/rpc/hybrid_search_thoughts") &&
+    JSON.parse(entry.body).p_query === "hybrid-rpc" &&
+    JSON.parse(entry.body).p_semantic_threshold === 0.83
+  ),
+  "hybrid RPC receives p_semantic_threshold",
+);
+const legacyHybrid = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: { query: "hybrid-legacy", mode: "hybrid", threshold: 0.64 },
+});
+const legacyHybridCalls = requests.filter((entry) =>
+  entry.url.includes("/rpc/hybrid_search_thoughts") &&
+  JSON.parse(entry.body).p_query === "hybrid-legacy"
+);
+assert(
+  legacyHybrid.body?.result?.isError !== true &&
+    legacyHybridCalls.length === 2 &&
+    Object.hasOwn(
+      JSON.parse(legacyHybridCalls[0].body),
+      "p_semantic_threshold",
+    ) &&
+    !Object.hasOwn(
+      JSON.parse(legacyHybridCalls[1].body),
+      "p_semantic_threshold",
+    ),
+  "hybrid RPC retries without threshold only for the legacy signature",
+);
+
+const baseSearch = await mcp("tools/call", {
+  name: "search",
+  arguments: { query: "base-schema" },
+});
+assert(
+  baseSearch.body?.result?.isError !== true &&
+    toolResult(baseSearch.body!).results[0]?.id === BASE_SCHEMA_ID,
+  "ChatGPT search degrades to semantic-only on the base OB1 schema",
+);
+const baseFetch = await mcp("tools/call", {
+  name: "fetch",
+  arguments: { id: BASE_SCHEMA_ID },
+});
+assert(
+  baseFetch.body?.result?.isError !== true &&
+    toolResult(baseFetch.body!).text === "base schema thought",
+  "ChatGPT fetch retries a base-column select when enrichment columns are absent",
+);
+
+const retryEmbedding = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: { query: "retry-embedding", mode: "semantic" },
+});
+assert(
+  retryEmbedding.body?.result?.isError !== true &&
+    embeddingAttempts.get("retry-embedding") === 3,
+  "embedding requests retry twice on 429 then succeed",
+);
+const badEmbedding = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: { query: "bad-embedding", mode: "semantic" },
+});
+const badEmbeddingText = badEmbedding.body?.result?.content?.[0]?.text ?? "";
+assert(
+  badEmbedding.body?.result?.isError === true &&
+    /Internal failure \(reference [0-9a-f]{8}\)/.test(badEmbeddingText) &&
+    !badEmbeddingText.includes("1536"),
+  "invalid embeddings return a generic correlated client error",
+);
+assert(
+  requests.some((entry) =>
+    entry.url.includes("openrouter.invalid/embeddings") && entry.hasSignal
+  ) && requests.some((entry) =>
+    entry.url.includes("postgrest.invalid/rest/v1") && entry.hasSignal
+  ),
+  "OpenRouter and PostgREST requests carry timeout signals",
+);
 
 const list = await mcp("tools/call", {
   name: "list_thoughts",
@@ -836,6 +1156,27 @@ assert(
     entry.method === "PATCH"
   ),
   "STALE_READ emits no PATCH",
+);
+const beforeDeletedStringUpdate = requests.length;
+const deletedStringUpdate = await mcp("tools/call", {
+  name: "update_thought",
+  arguments: {
+    id: DELETED_STRING_ID,
+    metadata_patch: { topic: "must-not-write" },
+  },
+});
+assert(
+  deletedStringUpdate.body?.result?.isError === true &&
+    deletedStringUpdate.body.result.content[0].text.includes(
+      "is logically deleted",
+    ),
+  'update_thought refuses metadata.deleted="true"',
+);
+assert(
+  !requests.slice(beforeDeletedStringUpdate).some((entry) =>
+    entry.method === "PATCH"
+  ),
+  'metadata.deleted="true" refusal emits no PATCH',
 );
 const beforeRefusedDelete = requests.length;
 const refused = await mcp("tools/call", {
@@ -882,6 +1223,20 @@ assert(
   ),
   "memory_recall persists returned recall items",
 );
+const failedTraceRecall = await mcp("tools/call", {
+  name: "memory_recall",
+  arguments: { workspace_id: "trace-write-fail" },
+});
+assert(
+  failedTraceRecall.body?.result?.isError === true &&
+    failedTraceRecall.body.result.content[0].text.includes(
+      "Internal failure",
+    ) &&
+    !failedTraceRecall.body.result.content[0].text.includes(
+      "private trace storage detail",
+    ),
+  "memory_recall fails closed with a generic error when trace persistence fails",
+);
 
 const writebackArguments = {
   workspace_id: "workspace-a",
@@ -893,6 +1248,7 @@ const writebackArguments = {
   },
   provenance: { status: "generated" },
 };
+const beforeWriteback = requests.length;
 const writebackOne = await mcp("tools/call", {
   name: "memory_writeback",
   arguments: writebackArguments,
@@ -919,6 +1275,26 @@ assert(
     writtenMemory?.review_status === "pending",
   "memory_writeback always starts evidence-only and pending review",
 );
+const writebackRequests = requests.slice(beforeWriteback).filter((entry) =>
+  entry.url.includes("agent_memory_writeback_tx")
+);
+const firstWritebackPayload = JSON.parse(writebackRequests[0].body);
+assert(
+  writebackRequests.length === 2 &&
+    /^[0-9a-f]{64}$/.test(firstWritebackPayload.p_content_hash) &&
+    firstWritebackPayload.p_memory.content ===
+      writebackArguments.memory.content &&
+    Array.isArray(firstWritebackPayload.p_source_refs) &&
+    Array.isArray(firstWritebackPayload.p_artifacts),
+  "memory_writeback sends normalized content hash and the full pinned RPC contract",
+);
+assert(
+  !requests.slice(beforeWriteback).some((entry) =>
+    entry.url.includes("/rpc/upsert_thought") || entry.method === "PATCH" ||
+    entry.url.includes("/rest/v1/agent_memory_source_refs")
+  ),
+  "memory_writeback performs no legacy multi-write sequence",
+);
 const writebackConflict = await mcp("tools/call", {
   name: "memory_writeback",
   arguments: {
@@ -936,6 +1312,21 @@ assert(
     ),
   "memory_writeback rejects changed content under a reused key",
 );
+const writebackRpcAbsent = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: {
+    ...writebackArguments,
+    workspace_id: "rpc-absent",
+    idempotency_key: "rpc-absent-key",
+  },
+});
+assert(
+  writebackRpcAbsent.body?.result?.isError === true &&
+    writebackRpcAbsent.body.result.content[0].text.includes(
+      "Agent Memory transactional RPCs not installed — apply schemas/agent-memory",
+    ),
+  "memory_writeback fails closed when its transactional RPC is absent",
+);
 
 const usageOutsideTrace = await mcp("tools/call", {
   name: "memory_usage_report",
@@ -951,6 +1342,24 @@ assert(
     ),
   "memory_usage_report rejects memory IDs outside the trace before updates",
 );
+failNextAudit = true;
+const usageAuditFailure = await mcp("tools/call", {
+  name: "memory_usage_report",
+  arguments: {
+    request_id: memoryRecallResult.request_id,
+    used_memory_ids: [MEMORY_A_ID],
+  },
+});
+assert(
+  usageAuditFailure.body?.result?.isError === true &&
+    usageAuditFailure.body.result.content[0].text.includes(
+      "Internal failure",
+    ) &&
+    !usageAuditFailure.body.result.content[0].text.includes(
+      "private audit storage detail",
+    ),
+  "memory_usage_report never reports success when its audit write fails",
+);
 
 const reviewWithoutActor = await mcp("tools/call", {
   name: "memory_review",
@@ -965,6 +1374,7 @@ assert(
   "memory_review requires actor_id at the MCP schema boundary",
 );
 
+const beforeReview = requests.length;
 const approvedMemory = await mcp("tools/call", {
   name: "memory_review",
   arguments: {
@@ -980,6 +1390,49 @@ assert(
     agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.review_status ===
       "confirmed",
   "memory_review maps approve to confirm and promotes instruction use",
+);
+assert(
+  requests.slice(beforeReview).filter((entry) =>
+        entry.url.includes("/rpc/agent_memory_review_tx")
+      ).length === 1 &&
+    !requests.slice(beforeReview).some((entry) =>
+      entry.method === "PATCH" ||
+      entry.url.includes("agent_memory_review_actions") ||
+      entry.url.includes("agent_memory_relations")
+    ),
+  "memory_review uses one transactional RPC and no legacy writes",
+);
+const invalidReviewTransition = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "workspace-a",
+    action: "approve",
+    actor_id: "reviewer-2",
+  },
+});
+assert(
+  invalidReviewTransition.body?.result?.isError === true &&
+    invalidReviewTransition.body.result.content[0].text.includes(
+      "Invalid transition",
+    ),
+  "memory_review preserves actionable transactional transition errors",
+);
+const reviewRpcAbsent = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "rpc-absent",
+    action: "approve",
+    actor_id: "reviewer-3",
+  },
+});
+assert(
+  reviewRpcAbsent.body?.result?.isError === true &&
+    reviewRpcAbsent.body.result.content[0].text.includes(
+      "Agent Memory transactional RPCs not installed — apply schemas/agent-memory",
+    ),
+  "memory_review fails closed when its transactional RPC is absent",
 );
 
 const schemaAbsent = await mcp("tools/call", {
@@ -1013,7 +1466,7 @@ const atomicCaptureRpc = atomicCaptureRequests.find((entry) =>
 );
 assert(
   atomicCaptureRpc &&
-    JSON.parse(atomicCaptureRpc.body).p_embedding === "[0.1,0.2,0.3]",
+    JSON.parse(JSON.parse(atomicCaptureRpc.body).p_embedding).length === 1536,
   "capture_thought_atomic receives the precomputed embedding",
 );
 assert(
@@ -1047,7 +1500,7 @@ assert(
 assert(
   fallbackCaptureRequests.some((entry) =>
     entry.method === "PATCH" &&
-    JSON.parse(entry.body).embedding === "[0.1,0.2,0.3]"
+    JSON.parse(JSON.parse(entry.body).embedding).length === 1536
   ),
   "capture_thought fallback persists the embedding",
 );
@@ -1084,27 +1537,24 @@ const deleted = await mcp("tools/call", {
   name: "delete_thought",
   arguments: { id: FALLBACK_DELETE_ID, confirm: true },
 });
-const deletedResult = toolResult(deleted.body!);
 assert(
-  deleted.body?.result?.isError !== true && deletedResult.atomic === false &&
-    deletedResult.via === "fallback_non_atomic",
-  "delete_thought signals the legacy fallback when RPC is absent",
+  deleted.body?.result?.isError === true &&
+    deleted.body.result.content[0].text.includes(
+      "soft_delete_thought RPC not installed — apply schemas/hybrid-recall before using delete_thought",
+    ),
+  "delete_thought fails closed with installation guidance when RPC is absent",
 );
 const fallbackDeleteRequests = requests.slice(beforeFallbackDelete);
 assert(
-  fallbackDeleteRequests[0]?.url.includes("/rpc/soft_delete_thought"),
-  "delete_thought attempts soft_delete_thought before fallback",
-);
-const deletePatch = fallbackDeleteRequests.find((entry) =>
-  entry.method === "PATCH"
+  fallbackDeleteRequests.length === 1 &&
+    fallbackDeleteRequests[0]?.url.includes("/rpc/soft_delete_thought"),
+  "delete_thought makes no read or fallback write when RPC is absent",
 );
 assert(
-  deletePatch && JSON.parse(deletePatch.body).metadata.deleted === true,
-  "logical delete PATCH writes metadata.deleted=true",
-);
-assert(
-  !requests.some((entry) => entry.method === "DELETE"),
-  "delete_thought never makes an HTTP DELETE",
+  !fallbackDeleteRequests.some((entry) =>
+    entry.method === "PATCH" || entry.method === "DELETE"
+  ),
+  "delete_thought absent-RPC path emits no mutation",
 );
 
 const stats = await mcp("tools/call", {

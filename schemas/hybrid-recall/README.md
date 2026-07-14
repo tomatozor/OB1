@@ -6,7 +6,7 @@
 
 ## What It Does
 
-This additive schema fuses pgvector cosine retrieval and PostgreSQL full-text search with Reciprocal Rank Fusion (RRF). It also makes common write and maintenance paths safer: one-transaction capture, bounded source backfill, auditable logical deletion, restoration, and exact unpaginated statistics.
+This data-additive, in-place schema upgrade fuses pgvector cosine retrieval and PostgreSQL full-text search with Reciprocal Rank Fusion (RRF). It also makes common write and maintenance paths safer: one-transaction capture, bounded source backfill, auditable logical deletion, restoration, and exact unpaginated statistics. It preserves thought and audit rows while replacing superseded helper-function signatures.
 
 ```text
 query + embedding
@@ -50,6 +50,8 @@ Upstream credit remains separate: this contribution builds on the practical Open
 ![Step 2](https://img.shields.io/badge/Step_2-Run_the_Schema-5B4BDB?style=for-the-badge)
 
 Copy the complete contents of [`schema.sql`](schema.sql) into the editor and click **Run**. Run it as one ordered script. It is safe to run again.
+
+The complete migration is enclosed by one `BEGIN`/`COMMIT`. Function-signature replacement, audit-table extension, indexes, grants, triggers, and helper definitions therefore become visible together, or PostgreSQL rolls the migration back on error.
 
 > [!IMPORTANT]
 > The trigram GIN index is built normally for SQL Editor compatibility. On a large, write-active table, schedule the migration because index construction consumes I/O and briefly blocks conflicting writes.
@@ -111,6 +113,14 @@ The read RPCs `hybrid_search_thoughts` and `thought_stats_exact` remain executab
 
 An `AFTER INSERT OR UPDATE` trigger on `thoughts` is the single mutation-audit path. Inserts record `capture`; ordinary updates record `update`; `metadata.deleted` transitions record `delete` or `restore`. Update diffs contain only changed audit indicators: `content_changed`, `metadata_keys_changed`, and `embedding_set`. Capture/delete/restore helpers do not call `log_thought_audit` explicitly, which avoids double counting. `thought_audit` has no trigger, so logging cannot recurse.
 
+Audit atomicity is database-local: the thought mutation and its trigger-created audit row share the same PostgreSQL transaction, so an audit insert failure aborts that mutation. This does not make upstream model calls, embedding requests, or other external side effects transactional.
+
+## Upgrade Behavior
+
+On an existing installation, the migration adds `actor` and `session_id` only when they are missing from `thought_audit`, preserving existing audit rows and columns. It drops the superseded seven-parameter `hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int)` immediately before creating the eight-parameter replacement with `p_semantic_threshold`; because the whole script is one transaction, callers do not observe a committed state between those operations. The two-parameter logical-delete/restore signatures are likewise replaced atomically by their confirmation-gated three-parameter forms.
+
+The normal trigram and timestamp indexes are created inside that transaction (not `CONCURRENTLY`). On a large or write-active table, the transaction can take locks and retain them until commit. Test on a representative staging copy and schedule the production upgrade accordingly.
+
 ## Logical Rollback
 
 The schema is additive, so leaving the indexes and audit history in place is the safest rollback. To retire only the callable surface, review and run the following lines individually. They are commented to prevent accidental execution.
@@ -155,7 +165,7 @@ schemas/hybrid-recall/test/local-test.sh
 docker rm -f ob-thanos-pg
 ```
 
-The harness creates the full minimal live-compatible `thoughts` shape, installs the schema twice, loads nine synthetic rows through its assertions, and verifies grants, hybrid recall and thresholding, filters, capture validation and deduplication, backfill, gated logical deletion/restoration, trigger audit counts and compact diffs, and exact statistics.
+The harness first creates a legacy seven-parameter `hybrid_search_thoughts` stub and a legacy-compatible `thought_audit` without `actor` or `session_id`. It then installs the schema twice, verifies replacement of the old signature and extension of the old table, loads nine synthetic rows through its assertions, and verifies grants, hybrid recall and thresholding, filters, capture validation and deduplication, backfill, gated logical deletion/restoration, trigger audit counts and compact diffs, and exact statistics.
 
 ## Expected Outcome
 

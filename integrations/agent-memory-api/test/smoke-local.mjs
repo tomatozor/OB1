@@ -79,6 +79,14 @@ class MemoryQuery {
 
   execute() {
     const table = this.store.tables[this.table] ||= [];
+    const fault = this.store.queryFaults.get(`${this.operation}:${this.table}`);
+    if (fault) return { data: null, error: structuredClone(fault) };
+    if (["insert", "update"].includes(this.operation)) {
+      this.store.directWrites.push({
+        operation: this.operation,
+        table: this.table,
+      });
+    }
     let rows;
     if (this.operation === "insert") {
       rows = this.values.map((value) => {
@@ -126,18 +134,14 @@ class MemoryQuery {
         this.columns?.includes("agent_memories")
       ) {
         result.agent_memories = structuredClone(
-          this.store.tables.agent_memories.find((memory) =>
-            memory.id === row.memory_id
-          ) || null,
+          this.store.tables.agent_memories.find((memory) => memory.id === row.memory_id) || null,
         );
       }
       return result;
     });
 
     if (this.cardinality === "single") {
-      return rows.length === 1
-        ? { data: rows[0], error: null }
-        : { data: null, error: { message: `Expected one ${this.table} row` } };
+      return rows.length === 1 ? { data: rows[0], error: null } : { data: null, error: { message: `Expected one ${this.table} row` } };
     }
     if (this.cardinality === "maybeSingle") {
       return rows.length <= 1 ? { data: rows[0] || null, error: null } : {
@@ -152,6 +156,12 @@ class MemoryQuery {
 class MemoryStore {
   constructor() {
     this.sequence = 1;
+    this.rpcCalls = [];
+    this.directWrites = [];
+    this.missingRpcs = new Set();
+    this.rpcFaults = new Map();
+    this.queryFaults = new Map();
+    this.failReviewActionInsert = false;
     this.tables = {
       thoughts: [],
       agent_memories: [],
@@ -166,9 +176,7 @@ class MemoryStore {
   }
 
   uuid() {
-    return `00000000-0000-4000-8000-${
-      String(this.sequence++).padStart(12, "0")
-    }`;
+    return `00000000-0000-4000-8000-${String(this.sequence++).padStart(12, "0")}`;
   }
 
   from(table) {
@@ -176,6 +184,18 @@ class MemoryStore {
   }
 
   async rpc(name, args) {
+    this.rpcCalls.push({ name, args: structuredClone(args) });
+    if (this.missingRpcs.has(name)) {
+      return {
+        data: null,
+        error: {
+          code: "PGRST202",
+          message: `Could not find the function public.${name}`,
+        },
+      };
+    }
+    const injected = this.rpcFaults.get(name);
+    if (injected) return { data: null, error: structuredClone(injected) };
     if (name === "match_thoughts") {
       const matches = this.tables.agent_memories
         .filter((memory) => memory.thought_id)
@@ -185,6 +205,226 @@ class MemoryStore {
         }))
         .slice(0, args.match_count);
       return { data: matches, error: null };
+    }
+    if (name === "agent_memory_writeback_tx") {
+      const existing = this.tables.agent_memories.find((memory) =>
+        memory.workspace_id === args.p_workspace_id &&
+        memory.idempotency_key === args.p_idempotency_key
+      );
+      if (existing) {
+        if (existing.content_hash !== args.p_content_hash) {
+          return {
+            data: null,
+            error: {
+              code: "23505",
+              message: "idempotency key already used with different content hash",
+            },
+          };
+        }
+        return {
+          data: { ...structuredClone(existing), replayed: true },
+          error: null,
+        };
+      }
+
+      const now = new Date().toISOString();
+      const thought = {
+        id: this.uuid(),
+        content: args.p_memory.content,
+        embedding: structuredClone(args.p_memory.embedding),
+      };
+      const memory = {
+        id: this.uuid(),
+        thought_id: thought.id,
+        workspace_id: args.p_workspace_id,
+        lifecycle_status: "active",
+        provenance_status: args.p_provenance.default_status,
+        confidence: args.p_provenance.confidence,
+        created_by: args.p_created_by || "agent",
+        can_use_as_instruction: false,
+        can_use_as_evidence: true,
+        requires_user_confirmation: true,
+        review_status: "pending",
+        last_confirmed_at: null,
+        idempotency_key: args.p_idempotency_key,
+        content_hash: args.p_content_hash,
+        created_at: now,
+        ...structuredClone(args.p_memory),
+      };
+      delete memory.embedding;
+      delete memory.thought_payload;
+      const sourceRefs = args.p_source_refs.map((source) => ({
+        id: this.uuid(),
+        memory_id: memory.id,
+        source_kind: source.kind,
+        uri: source.uri ?? null,
+        title: source.title ?? null,
+        source_timestamp: source.timestamp ?? null,
+      }));
+      const artifacts = args.p_artifacts.map((artifact) => ({
+        id: this.uuid(),
+        memory_id: memory.id,
+        artifact_kind: artifact.kind,
+        uri: artifact.uri,
+        description: artifact.description ?? null,
+      }));
+      const audit = {
+        id: this.uuid(),
+        event_type: "memory_written",
+        workspace_id: args.p_workspace_id,
+        memory_id: memory.id,
+      };
+      this.tables.thoughts.push(thought);
+      this.tables.agent_memories.push(memory);
+      this.tables.agent_memory_source_refs.push(...sourceRefs);
+      this.tables.agent_memory_artifacts.push(...artifacts);
+      this.tables.agent_memory_audit_events.push(audit);
+      return {
+        data: { ...structuredClone(memory), replayed: false },
+        error: null,
+      };
+    }
+    if (name === "agent_memory_review_tx") {
+      const memory = this.tables.agent_memories.find((candidate) =>
+        candidate.id === args.p_memory_id &&
+        candidate.workspace_id === args.p_workspace_id
+      );
+      if (!memory) {
+        return {
+          data: null,
+          error: { code: "P0001", message: "Memory not found in workspace" },
+        };
+      }
+      const related = args.p_related_memory_id
+        ? this.tables.agent_memories.find((candidate) =>
+          candidate.id === args.p_related_memory_id &&
+          candidate.workspace_id === args.p_workspace_id
+        )
+        : null;
+      if (args.p_related_memory_id && !related) {
+        return {
+          data: null,
+          error: {
+            code: "P0001",
+            message: "Related memory must exist in the same workspace",
+          },
+        };
+      }
+
+      const before = structuredClone(memory);
+      const after = structuredClone(memory);
+      if (args.p_action === "confirm") {
+        Object.assign(after, {
+          review_status: "confirmed",
+          provenance_status: "user_confirmed",
+          can_use_as_instruction: true,
+          requires_user_confirmation: false,
+          last_confirmed_at: new Date().toISOString(),
+        });
+      } else if (args.p_action === "evidence_only") {
+        Object.assign(after, {
+          review_status: "evidence_only",
+          can_use_as_instruction: false,
+          can_use_as_evidence: true,
+          requires_user_confirmation: false,
+        });
+      } else if (args.p_action === "reject") {
+        Object.assign(after, {
+          review_status: "rejected",
+          lifecycle_status: "rejected",
+          can_use_as_instruction: false,
+          can_use_as_evidence: false,
+        });
+      } else if (args.p_action === "mark_stale") {
+        Object.assign(after, {
+          review_status: "stale",
+          lifecycle_status: "stale",
+          can_use_as_instruction: false,
+        });
+      } else if (args.p_action === "dispute") {
+        Object.assign(after, {
+          lifecycle_status: "disputed",
+          provenance_status: "disputed",
+          can_use_as_instruction: false,
+          can_use_as_evidence: false,
+          requires_user_confirmation: true,
+        });
+      } else if (args.p_action === "restrict_scope") {
+        const rank = { workspace: 0, project: 1, channel: 2, personal: 3 };
+        const invalid = rank[args.p_visibility] < rank[after.visibility] ||
+          (args.p_visibility === "project" && !after.project_id) ||
+          (args.p_visibility === "channel" && !after.channel_id);
+        if (invalid) {
+          return {
+            data: null,
+            error: {
+              code: "P0001",
+              message: "restrict_scope may only reduce the existing visibility",
+            },
+          };
+        }
+        Object.assign(after, {
+          review_status: "restricted",
+          visibility: args.p_visibility,
+        });
+      } else if (args.p_action === "edit") {
+        if (args.p_content) after.content = args.p_content;
+        if (args.p_summary) after.summary = args.p_summary;
+      } else if (args.p_action === "merge") {
+        Object.assign(after, {
+          review_status: "merged",
+          lifecycle_status: "superseded",
+          can_use_as_instruction: false,
+          can_use_as_evidence: false,
+          requires_user_confirmation: false,
+        });
+      } else if (args.p_action === "supersede") {
+        Object.assign(after, {
+          review_status: "stale",
+          lifecycle_status: "superseded",
+          can_use_as_instruction: false,
+          can_use_as_evidence: false,
+          requires_user_confirmation: false,
+        });
+      }
+
+      if (this.failReviewActionInsert) {
+        return {
+          data: null,
+          error: {
+            code: "XX000",
+            message: "sensitive review action insert failure: audit partition missing",
+          },
+        };
+      }
+      Object.assign(memory, after);
+      this.tables.agent_memory_review_actions.push({
+        id: this.uuid(),
+        memory_id: memory.id,
+        action: args.p_action,
+        actor_id: args.p_actor_id,
+        notes: args.p_notes,
+        before,
+        after: structuredClone(after),
+      });
+      if (
+        args.p_related_memory_id &&
+        ["merge", "supersede"].includes(args.p_action)
+      ) {
+        this.tables.agent_memory_relations.push({
+          id: this.uuid(),
+          from_memory_id: memory.id,
+          to_memory_id: args.p_related_memory_id,
+          relation: args.p_action === "merge" ? "merged_into" : "superseded_by",
+        });
+      }
+      this.tables.agent_memory_audit_events.push({
+        id: this.uuid(),
+        event_type: args.p_action === "confirm" ? "memory_confirmed" : "memory_edited",
+        workspace_id: memory.workspace_id,
+        memory_id: memory.id,
+      });
+      return { data: { memory: structuredClone(after) }, error: null };
     }
     if (name === "upsert_thought") {
       const thought = {
@@ -202,7 +442,7 @@ class MemoryStore {
 const store = new MemoryStore();
 configureAgentMemoryTestDependencies({
   supabase: store,
-  getEmbedding: async () => [0.1, 0.2, 0.3],
+  getEmbedding: async () => Array(1536).fill(0.1),
 });
 
 function seedMemory(overrides = {}) {
@@ -264,9 +504,7 @@ async function expectStatus(name, expected, path, options = {}) {
   const result = await api(path, options);
   if (result.status !== expected) {
     throw new Error(
-      `${name}: expected ${expected}, got ${result.status}: ${
-        JSON.stringify(result.body)
-      }`,
+      `${name}: expected ${expected}, got ${result.status}: ${JSON.stringify(result.body)}`,
     );
   }
   console.log(`PASS ${name}: ${result.status}`);
@@ -358,6 +596,36 @@ await expectStatus(
     body: writebackPayload("local-smoke", { visibility: "project" }),
   },
 );
+
+configureAgentMemoryTestDependencies({ getEmbedding: async () => [0.1, 0.2] });
+const shortEmbedding = await expectStatus(
+  "short embedding fails closed",
+  500,
+  "/recall",
+  {
+    method: "POST",
+    body: recallPayload("invalid-embedding-length"),
+  },
+);
+assert(
+  "short embedding error is generic",
+  shortEmbedding.error === "Internal server error" &&
+    /^[a-f0-9]{10}$/.test(shortEmbedding.correlation_id),
+);
+configureAgentMemoryTestDependencies({
+  getEmbedding: async () => {
+    const embedding = Array(1536).fill(0.1);
+    embedding[1535] = Number.POSITIVE_INFINITY;
+    return embedding;
+  },
+});
+await expectStatus("non-finite embedding fails closed", 500, "/recall", {
+  method: "POST",
+  body: recallPayload("invalid-embedding-number"),
+});
+configureAgentMemoryTestDependencies({
+  getEmbedding: async () => Array(1536).fill(0.1),
+});
 
 const workspaceA = seedMemory({
   summary: "workspace-a",
@@ -482,10 +750,74 @@ const defaultRecall = await expectStatus(
 );
 assert(
   "writeback and recall defaults are symmetric",
-  defaultRecall.memories.some((memory) =>
-    memory.memory_id === defaultMemory.memory_id
-  ),
+  defaultRecall.memories.some((memory) => memory.memory_id === defaultMemory.memory_id),
 );
+
+const replayPayload = writebackPayload("writeback-replay", {
+  idempotency_key: "writeback:fixed-replay",
+  memory_payload: { lessons: ["Stable replay content."] },
+});
+const firstWriteback = await expectStatus(
+  "writeback first commit",
+  200,
+  "/writeback",
+  {
+    method: "POST",
+    body: replayPayload,
+  },
+);
+assert(
+  "writeback first commit is not replayed",
+  firstWriteback.replayed === false &&
+    firstWriteback.memories[0].replayed === false,
+);
+const replayedWriteback = await expectStatus(
+  "writeback same key and hash replays",
+  200,
+  "/writeback",
+  {
+    method: "POST",
+    body: replayPayload,
+  },
+);
+assert(
+  "writeback replay is explicit and returns the same memory",
+  replayedWriteback.replayed === true &&
+    replayedWriteback.memories[0].replayed === true &&
+    replayedWriteback.memories[0].memory_id ===
+      firstWriteback.memories[0].memory_id,
+);
+await expectStatus(
+  "writeback same key with different hash conflicts",
+  409,
+  "/writeback",
+  {
+    method: "POST",
+    body: {
+      ...replayPayload,
+      memory_payload: { lessons: ["Changed content under the same key."] },
+    },
+  },
+);
+
+store.missingRpcs.add("agent_memory_writeback_tx");
+const missingRpc = await expectStatus(
+  "transactional RPC missing fails closed",
+  503,
+  "/writeback",
+  {
+    method: "POST",
+    body: writebackPayload("missing-rpc", {
+      idempotency_key: "writeback:missing-rpc",
+    }),
+  },
+);
+assert(
+  "transactional RPC upgrade error is explicit",
+  missingRpc.error ===
+    "transactional RPCs not installed — apply schemas/agent-memory (upgrade)",
+);
+store.missingRpcs.delete("agent_memory_writeback_tx");
 
 const crossMemoryId = workspaceB.id;
 await expectStatus(
@@ -526,6 +858,83 @@ await expectStatus(
   },
 );
 
+const missingReviewRpcCandidate = seedMemory({
+  workspace_id: "missing-review-rpc",
+  review_status: "pending",
+  provenance_status: "generated",
+  can_use_as_instruction: false,
+  requires_user_confirmation: true,
+});
+store.missingRpcs.add("agent_memory_review_tx");
+const missingReviewRpc = await expectStatus(
+  "review transactional RPC missing fails closed",
+  503,
+  `/memories/${missingReviewRpcCandidate.id}/review`,
+  {
+    method: "PATCH",
+    body: {
+      workspace_id: "missing-review-rpc",
+      action: "confirm",
+      actor_label: "local smoke",
+    },
+  },
+);
+store.missingRpcs.delete("agent_memory_review_tx");
+assert(
+  "review missing RPC returns upgrade error without promotion",
+  missingReviewRpc.error ===
+      "transactional RPCs not installed — apply schemas/agent-memory (upgrade)" &&
+    missingReviewRpcCandidate.review_status === "pending" &&
+    missingReviewRpcCandidate.can_use_as_instruction === false,
+);
+
+const promotionCandidate = seedMemory({
+  workspace_id: "review-fault",
+  review_status: "pending",
+  provenance_status: "generated",
+  can_use_as_instruction: false,
+  requires_user_confirmation: true,
+  summary: "promotion candidate",
+  content: "promotion candidate",
+});
+const reviewRpcCallsBefore = store.rpcCalls.length;
+const directWritesBefore = store.directWrites.length;
+const reviewActionsBefore = store.tables.agent_memory_review_actions.length;
+store.failReviewActionInsert = true;
+const failedReview = await expectStatus(
+  "review action insert fault fails transaction",
+  500,
+  `/memories/${promotionCandidate.id}/review`,
+  {
+    method: "PATCH",
+    body: {
+      workspace_id: "review-fault",
+      action: "confirm",
+      actor_label: "local smoke",
+    },
+  },
+);
+store.failReviewActionInsert = false;
+assert(
+  "review fault returns generic 500 with short correlation id",
+  failedReview.error === "Internal server error" &&
+    /^[a-f0-9]{10}$/.test(failedReview.correlation_id) &&
+    !JSON.stringify(failedReview).includes("audit partition missing"),
+);
+assert(
+  "review fault leaves memory evidence-only and pending",
+  promotionCandidate.review_status === "pending" &&
+    promotionCandidate.provenance_status === "generated" &&
+    promotionCandidate.can_use_as_instruction === false &&
+    promotionCandidate.requires_user_confirmation === true,
+);
+assert(
+  "review route emits one transactional RPC and no separate write",
+  store.rpcCalls.slice(reviewRpcCallsBefore).filter((call) => call.name === "agent_memory_review_tx").length === 1 &&
+    store.directWrites.length === directWritesBefore &&
+    store.tables.agent_memory_review_actions.length === reviewActionsBefore,
+);
+
 await expectStatus(
   "recall trace requires workspace_id",
   400,
@@ -541,6 +950,57 @@ await expectStatus(
   200,
   `/recall-traces/${scopedRecall.request_id}?workspace_id=scope-a`,
 );
+
+store.queryFaults.set("insert:agent_memory_recall_traces", {
+  code: "XX000",
+  message: "sensitive trace storage detail",
+});
+const traceWriteFailure = await expectStatus(
+  "recall trace failure fails closed",
+  500,
+  "/recall",
+  {
+    method: "POST",
+    body: recallPayload("trace-fault"),
+  },
+);
+assert(
+  "recall trace failure is generic",
+  traceWriteFailure.error === "Internal server error" &&
+    /^[a-f0-9]{10}$/.test(traceWriteFailure.correlation_id) &&
+    !JSON.stringify(traceWriteFailure).includes(
+      "sensitive trace storage detail",
+    ),
+);
+store.queryFaults.delete("insert:agent_memory_recall_traces");
+
+seedMemory({
+  workspace_id: "item-fault",
+  summary: "item fault candidate",
+  content: "item fault candidate",
+});
+store.queryFaults.set("insert:agent_memory_recall_items", {
+  code: "XX000",
+  message: "sensitive recall item storage detail",
+});
+const itemWriteFailure = await expectStatus(
+  "recall item failure fails closed",
+  500,
+  "/recall",
+  {
+    method: "POST",
+    body: recallPayload("item-fault"),
+  },
+);
+assert(
+  "recall item failure is generic",
+  itemWriteFailure.error === "Internal server error" &&
+    /^[a-f0-9]{10}$/.test(itemWriteFailure.correlation_id) &&
+    !JSON.stringify(itemWriteFailure).includes(
+      "sensitive recall item storage detail",
+    ),
+);
+store.queryFaults.delete("insert:agent_memory_recall_items");
 
 const restrictable = seedMemory({
   visibility: "workspace",
@@ -671,9 +1131,7 @@ const artifactWriteback = await expectStatus(
     }),
   },
 );
-const artifactMemories = artifactWriteback.memories.map((memory) =>
-  memory.memory_id
-);
+const artifactMemories = artifactWriteback.memories.map((memory) => memory.memory_id);
 const insertedArtifacts = store.tables.agent_memory_artifacts.slice(
   artifactCountBefore,
 );
@@ -699,4 +1157,4 @@ assert(
     ),
 );
 
-console.log("PASS local Agent Memory smoke: 39 checks");
+console.log("PASS local Agent Memory smoke: all checks");

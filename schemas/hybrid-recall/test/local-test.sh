@@ -83,7 +83,33 @@ BEGIN
   RETURN jsonb_build_object('id', v_id, 'fingerprint', v_fingerprint);
 END;
 $$;
+
+-- Minimal reproduction of the superseded install state. The current migration
+-- must replace the seven-argument RPC and extend this audit table atomically.
+CREATE TABLE public.thought_audit (
+  id BIGSERIAL PRIMARY KEY,
+  thought_id UUID NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('capture', 'update', 'delete')),
+  diff JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE FUNCTION public.hybrid_search_thoughts(
+  p_query TEXT,
+  p_query_embedding vector(1536),
+  p_limit INT,
+  p_offset INT,
+  p_filter JSONB,
+  p_include_restricted BOOLEAN,
+  p_rrf_k INT
+)
+RETURNS SETOF UUID
+LANGUAGE sql
+STABLE
+AS $$ SELECT NULL::UUID WHERE false $$;
 SQL
+
+echo "==> Seeded upgrade state: legacy 7-argument hybrid RPC and audit table"
 
 echo "==> Applying schema.sql (pass 1)"
 psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${SCHEMA_FILE}"
