@@ -121,7 +121,7 @@ CREATE OR REPLACE FUNCTION public.log_thought_audit(
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_diff JSONB := coalesce(p_diff, '{}'::jsonb);
@@ -169,7 +169,7 @@ CREATE OR REPLACE FUNCTION public.audit_thought_mutation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_action TEXT;
@@ -547,7 +547,7 @@ CREATE OR REPLACE FUNCTION public.backfill_source_type(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_by_source JSONB;
@@ -635,7 +635,7 @@ CREATE OR REPLACE FUNCTION public.soft_delete_thought(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_before JSONB;
@@ -701,7 +701,7 @@ CREATE OR REPLACE FUNCTION public.restore_thought(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
   v_before JSONB;
@@ -774,7 +774,7 @@ RETURNS JSONB
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $$
   WITH totals AS (
     SELECT
