@@ -70,6 +70,68 @@ repository/server paths, and symlinked destinations are refused. Building is
 not deployment: the command has no network behavior and does not contact or
 modify Supabase.
 
+## MCP annotations and recall observability
+
+`tools/list` returns all four MCP behavior annotations for every tool. The
+closed-world, idempotent read tools are `search`, `fetch`, `search_thoughts`,
+`recall_context`, `list_thoughts`, `thought_stats`, `related_thoughts`,
+`memory_review_queue`, and `audit_entities`; each advertises
+`readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and
+`openWorldHint=false`.
+
+The remaining tools are not read-only. `memory_recall` is intentionally in
+this group because a successful recall persists trace, item, and audit rows.
+`memory_writeback` advertises idempotency; `delete_thought` advertises
+idempotency and destructiveness because it performs a confirmed logical
+deletion. `capture_thought`, `update_thought`, `memory_recall`,
+`memory_usage_report`, and `memory_review` are non-idempotent. All seven
+advertise `openWorldHint=false`; all except `delete_thought` advertise
+`destructiveHint=false`.
+
+Every accepted invocation of `search`, `search_thoughts`, `recall_context`, or
+`memory_recall` writes exactly one single-line JSON object to the process log:
+
+```json
+{"event":"open_brain.recall_invocation","tool_name":"search_thoughts","client_id":"desktop-agent","correlation_id":"00000000-0000-4000-8000-000000000000"}
+```
+
+The correlation ID is freshly generated once per authenticated MCP HTTP
+request and is reused by any recall handler executed for that request. The
+resolved multi-client `client_id` is request-local; legacy authentication logs
+`client_id: null`. The event contains no query, result, key, digest, content,
+scope, or database detail and is never persisted by this server.
+
+## Manual local agentic proof
+
+The opt-in proof harness starts the canonical Hono/MCP app on loopback with
+fake multi-client authentication and an in-memory PostgREST fixture, then runs
+fresh non-interactive `codex exec` read and mutation-boundary scenarios:
+
+```sh
+scripts/prove-agentic-recall.sh
+```
+
+It requires local Codex authentication and availability of model
+`gpt-5.6-sol`. Codex runs ephemerally with user configuration and rules
+ignored, approval policy `never`, a read-only sandbox, and only the loopback
+Open Brain MCP server configured. The server's tool approval mode is explicitly
+`writes`: read-only tools remain callable while non-read-only tools require an
+approval that the non-interactive `never` policy cannot grant. The fake MCP key
+is supplied through an environment-backed HTTP header. The harness validates
+completed JSONL `mcp_tool_call` evidence for `search_thoughts`, a successful
+tool result, the content-safe server event, the exact server-side
+`capture_thought` annotations, either an explicit refusal event or Codex keeping
+that tool unavailable, and zero fake-backend mutations. Outputs remain under
+`.edge-build/agentic-proof/`; this manual proof is intentionally not a CI
+dependency.
+
+This proves local invocability of the canonical committed server. It is not a
+production activation, and it does not prove that a model read, understood, or
+used the returned context. The current remote server remains stale until an
+explicit Gate 3 deployment. Lease or gateway enforcement is a later packet,
+after invocability has been proven; this server adds no lease, hook, persistent
+flag, or usage claim.
+
 ## Tools
 
 - `search(query)` and `fetch(id)` preserve the ChatGPT search/fetch contract.

@@ -954,7 +954,7 @@ globalThis.fetch = (async (
   });
 }) as typeof fetch;
 
-const { app } = await import("../index.ts");
+const { app, createApp, parseAuthConfig } = await import("../index.ts");
 
 const BASE_HEADERS = {
   "content-type": "application/json",
@@ -979,6 +979,65 @@ const expectedTools = [
   "memory_review",
   "audit_entities",
 ].sort();
+const readOnlyAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const expectedAnnotations = {
+  search: readOnlyAnnotations,
+  fetch: readOnlyAnnotations,
+  search_thoughts: readOnlyAnnotations,
+  recall_context: readOnlyAnnotations,
+  list_thoughts: readOnlyAnnotations,
+  thought_stats: readOnlyAnnotations,
+  related_thoughts: readOnlyAnnotations,
+  capture_thought: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  update_thought: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  delete_thought: {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  memory_recall: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  memory_writeback: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  memory_usage_report: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  memory_review_queue: readOnlyAnnotations,
+  memory_review: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  audit_entities: readOnlyAnnotations,
+};
 
 let passed = 0;
 let failed = 0;
@@ -997,8 +1056,9 @@ async function mcp(
   params: Record<string, unknown> = {},
   headers: Record<string, string> = BASE_HEADERS,
   url = "http://mcp.invalid",
+  targetApp = app,
 ) {
-  const response = await app.request(url, {
+  const response = await targetApp.request(url, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
@@ -1163,6 +1223,96 @@ assert(
   ) === JSON.stringify(expectedTools),
   "tools/list contains exactly the sixteen v2 tools",
 );
+const listedAnnotations = Object.fromEntries(
+  tools.body?.result.tools.map((tool: {
+    name: string;
+    annotations: Record<string, boolean>;
+  }) => [tool.name, tool.annotations]) ?? [],
+);
+assert(
+  Object.entries(expectedAnnotations).every(([name, expected]) => {
+    const actual = listedAnnotations[name];
+    return actual &&
+      Object.keys(actual).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([key, value]) => actual[key] === value);
+  }) && Object.keys(listedAnnotations).length === 16,
+  "tools/list exposes exact complete annotations for all sixteen tools",
+);
+assert(
+  ["search", "search_thoughts", "recall_context"].every((name) =>
+    listedAnnotations[name]?.readOnlyHint === true
+  ),
+  "read-only recall and search tools advertise readOnlyHint=true",
+);
+assert(
+  [
+    "capture_thought",
+    "update_thought",
+    "delete_thought",
+    "memory_recall",
+    "memory_writeback",
+    "memory_usage_report",
+    "memory_review",
+  ].every((name) => listedAnnotations[name]?.readOnlyHint === false),
+  "mutation and trace-writing tools are never mislabeled read-only",
+);
+
+const recallEvents: Array<Record<string, unknown>> = [];
+let correlationSequence = 0;
+const observabilityApp = createApp(
+  parseAuthConfig(
+    JSON.stringify([
+      { client_id: "client-a", key_sha256: ACCESS_KEY_SHA256 },
+    ]),
+    undefined,
+  ),
+  null,
+  {
+    createCorrelationId: () => `fixture-correlation-${++correlationSequence}`,
+    log: (event) => recallEvents.push(event),
+  },
+);
+const sensitiveQuery = "SENSITIVE_QUERY_MARKER_DO_NOT_LOG";
+const observedSearchOne = await mcp(
+  "tools/call",
+  {
+    name: "search_thoughts",
+    arguments: { query: sensitiveQuery, mode: "text", limit: 1 },
+  },
+  BASE_HEADERS,
+  "http://mcp.invalid",
+  observabilityApp,
+);
+assert(
+  observedSearchOne.body?.result?.isError !== true && recallEvents.length === 1,
+  "search_thoughts succeeds and emits exactly one recall invocation event",
+);
+assert(
+  JSON.stringify(recallEvents[0]) === JSON.stringify({
+        event: "open_brain.recall_invocation",
+        tool_name: "search_thoughts",
+        client_id: "client-a",
+        correlation_id: "fixture-correlation-1",
+      }) && !JSON.stringify(recallEvents[0]).includes(sensitiveQuery),
+  "recall invocation log contains only safe expected fields",
+);
+await mcp(
+  "tools/call",
+  {
+    name: "search_thoughts",
+    arguments: { query: "second request", mode: "text", limit: 1 },
+  },
+  BASE_HEADERS,
+  "http://mcp.invalid",
+  observabilityApp,
+);
+assert(
+  recallEvents.length === 2 &&
+    recallEvents[0]?.correlation_id === "fixture-correlation-1" &&
+    recallEvents[1]?.correlation_id === "fixture-correlation-2" &&
+    new Set(recallEvents.map((event) => event.correlation_id)).size === 2,
+  "separate MCP HTTP requests receive distinct correlation IDs",
+);
 
 console.log("\n[2] Deterministic and filtered tool contracts");
 const auditRequestStart = requests.length;
@@ -1316,7 +1466,8 @@ assert(
   'text search treats metadata.deleted="true" as deleted',
 );
 const textCall = requests.find((entry) =>
-  entry.url.includes("search_thoughts_text")
+  entry.url.includes("search_thoughts_text") &&
+  JSON.parse(entry.body).p_query === "launch"
 );
 assert(
   textCall && JSON.parse(textCall.body).p_query === "launch",

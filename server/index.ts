@@ -45,6 +45,41 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 type JsonObject = Record<string, unknown>;
 
+export type RecallInvocationEvent = {
+  event: "open_brain.recall_invocation";
+  tool_name: "search" | "search_thoughts" | "recall_context" | "memory_recall";
+  client_id: string | null;
+  correlation_id: string;
+};
+
+type RecallRequestContext = {
+  clientId: string | null;
+  correlationId: string;
+  log: (event: RecallInvocationEvent) => void;
+};
+
+export type RecallObservabilityDependencies = {
+  createCorrelationId: () => string;
+  log: (event: RecallInvocationEvent) => void;
+};
+
+const defaultRecallObservability: RecallObservabilityDependencies = {
+  createCorrelationId: () => crypto.randomUUID(),
+  log: (event) => console.log(JSON.stringify(event)),
+};
+
+function logRecallInvocation(
+  context: RecallRequestContext,
+  toolName: RecallInvocationEvent["tool_name"],
+): void {
+  context.log({
+    event: "open_brain.recall_invocation",
+    tool_name: toolName,
+    client_id: context.clientId,
+    correlation_id: context.correlationId,
+  });
+}
+
 type ThoughtRecord = {
   id: string;
   content: string;
@@ -1048,7 +1083,10 @@ async function fetchThoughtForChatGpt(
   };
 }
 
-function registerAgentMemoryTools(server: McpServer): void {
+function registerAgentMemoryTools(
+  server: McpServer,
+  recallContext: RecallRequestContext,
+): void {
   const visibilitySchema = z.enum([
     "workspace",
     "project",
@@ -1078,7 +1116,12 @@ function registerAgentMemoryTools(server: McpServer): void {
       title: "Recall Governed Agent Memory",
       description:
         "Recall strictly scoped Agent Memory records. A non-empty query uses workspace-bound agent_memory_match semantic candidates; otherwise results use confidence/freshness/id deterministic ordering. Every response is traced.",
-      annotations: { readOnlyHint: false, openWorldHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
       inputSchema: {
         workspace_id: z.string().trim().min(1).max(256),
         query: z.string().trim().min(1).max(8_000).optional(),
@@ -1108,6 +1151,7 @@ function registerAgentMemoryTools(server: McpServer): void {
       limits,
       restrict_scope,
     }) => {
+      logRecallInvocation(recallContext, "memory_recall");
       try {
         const maxResults = limits?.max_results ?? 10;
         const maxTokens = limits?.max_tokens ?? 4_000;
@@ -1473,7 +1517,7 @@ function registerAgentMemoryTools(server: McpServer): void {
         readOnlyHint: false,
         openWorldHint: false,
         destructiveHint: false,
-        idempotentHint: true,
+        idempotentHint: false,
       },
       inputSchema: {
         request_id: z.string().uuid(),
@@ -1595,7 +1639,12 @@ function registerAgentMemoryTools(server: McpServer): void {
       title: "List Pending Agent Memories",
       description:
         "List pending memories in one workspace, oldest first, with offset pagination.",
-      annotations: { readOnlyHint: true, openWorldHint: false },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         workspace_id: z.string().trim().min(1).max(256),
         limit: z.number().int().min(1).max(100).default(20).optional(),
@@ -1784,13 +1833,13 @@ function registerAgentMemoryTools(server: McpServer): void {
   );
 }
 
-function buildServer(): McpServer {
+function buildServer(recallContext: RecallRequestContext): McpServer {
   const server = new McpServer({
     name: "open-brain",
     version: "2.0.0",
   });
 
-  registerAgentMemoryTools(server);
+  registerAgentMemoryTools(server, recallContext);
 
   server.registerTool(
     "search",
@@ -1798,12 +1847,18 @@ function buildServer(): McpServer {
       title: "Search Open Brain",
       description:
         "Search Open Brain memories. This read-only compatibility tool preserves the ChatGPT search/fetch contract.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         query: z.string().min(1).describe("The search query to run"),
       },
     },
     async ({ query }) => {
+      logRecallInvocation(recallContext, "search");
       try {
         const result = await runSearch({
           query,
@@ -1838,7 +1893,12 @@ function buildServer(): McpServer {
       title: "Fetch Open Brain Thought",
       description:
         "Fetch one visible Open Brain thought by ID, including metadata and best-effort connections.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         id: z.string().uuid().describe("Thought UUID returned by search"),
       },
@@ -1896,7 +1956,12 @@ function buildServer(): McpServer {
       title: "Search Thoughts v2",
       description:
         "Filtered, paginated hybrid, semantic, or full-text retrieval. Hybrid mode tries the database RPC first and falls back to deterministic server-side RRF.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         query: z.string().min(1),
         mode: z.enum(["hybrid", "semantic", "text"]).default("hybrid")
@@ -1929,6 +1994,7 @@ function buildServer(): McpServer {
       semantic_weight = DEFAULT_SEMANTIC_WEIGHT,
       text_weight = DEFAULT_TEXT_WEIGHT,
     }) => {
+      logRecallInvocation(recallContext, "search_thoughts");
       try {
         const normalizedStartDate = parseDateInput("start_date", start_date);
         const normalizedEndDate = parseDateInput("end_date", end_date);
@@ -1971,7 +2037,12 @@ function buildServer(): McpServer {
       title: "Recall Context",
       description:
         "Deterministically recall recent important context without embeddings or model calls.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         scope_topics: z.array(z.string().min(1)).optional(),
         scope_people: z.array(z.string().min(1)).optional(),
@@ -1989,6 +2060,7 @@ function buildServer(): McpServer {
       min_importance = 0,
       include_restricted = false,
     }) => {
+      logRecallInvocation(recallContext, "recall_context");
       try {
         let query = supabase
           .from("thoughts")
@@ -2041,7 +2113,12 @@ function buildServer(): McpServer {
     {
       title: "List Thoughts",
       description: "List visible thoughts with filters and offset pagination.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         limit: z.number().int().min(1).max(50).default(10).optional(),
         offset: z.number().int().min(0).default(0).optional(),
@@ -2127,7 +2204,12 @@ function buildServer(): McpServer {
       title: "Thought Statistics v2",
       description:
         "Return exact server-side aggregates without downloading thought rows.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         since_days: z.number().int().min(0).max(3650).default(3650).optional(),
         include_restricted: z.boolean().default(false).optional(),
@@ -2158,7 +2240,12 @@ function buildServer(): McpServer {
     {
       title: "Related Thoughts",
       description: "Find visible connections for a thought.",
-      annotations: { readOnlyHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       inputSchema: {
         thought_id: z.string().uuid(),
         limit: z.number().int().min(1).max(50).default(10).optional(),
@@ -2892,6 +2979,8 @@ const allowedOrigins = parseAllowedOrigins(MCP_ALLOWED_ORIGINS);
 export function createApp(
   requestAuthConfig: AuthConfig = authConfig,
   requestAllowedOrigins: ReadonlySet<string> | null = allowedOrigins,
+  recallObservability: RecallObservabilityDependencies =
+    defaultRecallObservability,
 ): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
@@ -2938,7 +3027,12 @@ export function createApp(
       });
     }
 
-    const server = buildServer();
+    const recallContext: RecallRequestContext = {
+      clientId: authentication.clientId ?? null,
+      correlationId: recallObservability.createCorrelationId(),
+      log: recallObservability.log,
+    };
+    const server = buildServer(recallContext);
     const transport = new StreamableHTTPTransport();
     await server.connect(transport);
     const response = await transport.handleRequest(context);
