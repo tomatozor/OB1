@@ -12,6 +12,7 @@ const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY");
 const MCP_CLIENT_KEYS = Deno.env.get("MCP_CLIENT_KEYS");
 const MCP_ALLOWED_ORIGINS = Deno.env.get("MCP_ALLOWED_ORIGINS");
+const ALLOW_QUERY_KEY = Deno.env.get("MCP_ALLOW_QUERY_KEY") === "true";
 
 const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
   "https://openrouter.ai/api/v1";
@@ -2926,6 +2927,7 @@ export async function timingSafeEqualStrings(
 export async function authenticateRequest(
   headers: Headers,
   config: AuthConfig,
+  queryKey = "",
 ): Promise<AuthResult> {
   const headerKey = headers.get("x-brain-key") ?? "";
   const authorization = headers.get("authorization") ?? "";
@@ -2934,18 +2936,24 @@ export async function authenticateRequest(
   if (config.mode === "legacy") {
     const hasConfiguredKey = typeof config.accessKey === "string" &&
       config.accessKey.length > 0;
-    const [headerMatches, bearerMatches] = hasConfiguredKey
+    const [headerMatches, bearerMatches, queryMatches] = hasConfiguredKey
       ? await Promise.all([
         timingSafeEqualStrings(headerKey, config.accessKey!),
         timingSafeEqualStrings(bearerKey, config.accessKey!),
+        queryKey.length > 0
+          ? timingSafeEqualStrings(queryKey, config.accessKey!)
+          : Promise.resolve(false),
       ])
-      : [false, false];
+      : [false, false, false];
     return {
-      authenticated: hasConfiguredKey && (headerMatches || bearerMatches),
+      authenticated: hasConfiguredKey &&
+        (headerMatches || bearerMatches || queryMatches),
     };
   }
 
-  const presentedKeys = [headerKey, bearerKey].filter((key) => key.length > 0);
+  const presentedKeys = [headerKey, bearerKey, queryKey].filter((key) =>
+    key.length > 0
+  );
   if (presentedKeys.length === 0) return { authenticated: false };
 
   const presentedDigests = await Promise.all(presentedKeys.map(sha256Bytes));
@@ -2996,9 +3004,17 @@ export function createApp(
       context.req.header("origin"),
       requestAllowedOrigins,
     );
+    // Compat connecteurs distants (claude.ai/Desktop/iPhone : URL seule, pas de
+    // headers) : la clé en query param n'est acceptée QUE si l'opérateur active
+    // explicitement MCP_ALLOW_QUERY_KEY=true — risque de fuite dans les logs
+    // documenté et assumé pour ces clients. Désactivé par défaut.
+    const queryKey = ALLOW_QUERY_KEY
+      ? (new URL(context.req.raw.url).searchParams.get("key") ?? "")
+      : "";
     const authentication = await authenticateRequest(
       context.req.raw.headers,
       requestAuthConfig,
+      queryKey,
     );
     if (!authentication.authenticated) {
       return context.json(
