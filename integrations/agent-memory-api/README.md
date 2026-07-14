@@ -9,13 +9,13 @@ sequenceDiagram
   participant OB1 as OB1 database
   participant Human as Human reviewer
   Runtime->>API: POST /recall
-  API->>OB1: semantic search + policy ranking
+  API->>OB1: agent_memory_match (workspace-scoped)
   API-->>Runtime: scoped memories + use policy
   Runtime->>API: POST /writeback
-  API->>API: block secrets/transcripts/reasoning dumps
-  API->>OB1: agent_memory_writeback_tx (memory + provenance + sources + artifacts + audit)
-  Human->>API: PATCH /memories/:id/review
-  API->>OB1: agent_memory_review_tx (state + review + relation + audit)
+  API->>API: validate every row and generate every embedding
+  API->>OB1: one agent_memory_writeback_batch_tx call
+  Human->>API: PATCH /memories/:id/review + x-reviewer-key
+  API->>OB1: agent_memory_review_tx(..., p_actor_kind = human)
 ```
 
 ## What It Does
@@ -24,10 +24,12 @@ This Edge Function exposes the v1 OB1 Agent Memory contract. OpenClaw is the fir
 
 ## Prerequisites
 
-- Working Open Brain setup ([guide](../../docs/01-getting-started.md))
-- [`schemas/agent-memory`](../../schemas/agent-memory/) applied
-- Supabase CLI installed
-- `OPENROUTER_API_KEY` and `MCP_ACCESS_KEY` configured as Supabase secrets
+1. A working Open Brain setup ([guide](../../docs/01-getting-started.md)).
+1. The current [`schemas/agent-memory`](../../schemas/agent-memory/) upgrade applied; older installations do not expose the required batch, match, and reviewer-authority contracts.
+1. Supabase CLI installed and authenticated for the target project.
+1. `OPENROUTER_API_KEY` configured for `openai/text-embedding-3-small` embeddings.
+1. A strong `MCP_ACCESS_KEY` configured for all API callers.
+1. An optional, separate `REVIEWER_ACCESS_KEY`. It is required in production if humans must `confirm`, `approve`, `merge`, or `supersede` memories. Never reuse `MCP_ACCESS_KEY` for this value.
 
 ## Credential Tracker
 
@@ -38,6 +40,7 @@ AGENT MEMORY API -- CREDENTIAL TRACKER
 FROM YOUR OPEN BRAIN SETUP
   Supabase Project ref:       ____________
   MCP Access Key:             ____________
+  Reviewer Access Key:        ____________
   OpenRouter API Key:         ____________
 
 GENERATED DURING SETUP
@@ -46,18 +49,29 @@ GENERATED DURING SETUP
 --------------------------------------
 ```
 
-## Steps
+## Setup
 
-![Step 1](https://img.shields.io/badge/Step_1-Install_the_Schema-1E88E5?style=for-the-badge)
+1. **Install or upgrade the schema.**
 
 Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql).
 
-**Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist and PostgREST exposes both `agent_memory_writeback_tx` and `agent_memory_review_tx`.
+   **Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist and PostgREST exposes `agent_memory_writeback_batch_tx`, `agent_memory_writeback_tx` with `p_embedding vector(1536)`, `agent_memory_review_tx` with `p_actor_kind`, and `agent_memory_match`.
 
-> [!CAUTION]
-> Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. Existing installations must re-apply the current schema upgrade so the transactional RPCs are installed. The sidecar tables remain isolated from existing thought content.
+   > [!CAUTION]
+   > Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. Existing installations must re-apply the current schema upgrade. The sidecar tables remain isolated from existing thought content.
 
-![Step 2](https://img.shields.io/badge/Step_2-Deploy_the_Edge_Function-1E88E5?style=for-the-badge)
+1. **Configure secrets.**
+
+   ```bash
+   supabase secrets set \
+     OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY" \
+     MCP_ACCESS_KEY="YOUR_AGENT_ACCESS_KEY" \
+     REVIEWER_ACCESS_KEY="YOUR_SEPARATE_REVIEWER_KEY"
+   ```
+
+   Omit `REVIEWER_ACCESS_KEY` only when reviewer-only actions must remain disabled. Those actions then return `403 reviewer key not configured`.
+
+1. **Deploy the Edge Function.**
 
 Copy this folder into your Supabase project:
 
@@ -72,9 +86,9 @@ The `--no-verify-jwt` flag delegates authentication to this function's mandatory
 
 If the Supabase project already declares `verify_jwt = false` for this function in `supabase/config.toml`, the equivalent deployment command is `supabase functions deploy agent-memory-api`.
 
-**Done when:** `supabase functions list` shows `agent-memory-api` as active.
+   **Done when:** `supabase functions list` shows `agent-memory-api` as active.
 
-![Step 3](https://img.shields.io/badge/Step_3-Test_Health-1E88E5?style=for-the-badge)
+1. **Test health.**
 
 ```bash
 curl \
@@ -82,7 +96,7 @@ curl \
   "https://YOUR_PROJECT_REF.supabase.co/functions/v1/agent-memory-api/health"
 ```
 
-**Done when:** the response includes `"ok": true`.
+   **Done when:** the response includes `"ok": true`.
 
 ## API Surface
 
@@ -104,7 +118,7 @@ The API accepts the runtime-neutral core schema versions and the OpenClaw launch
 | `/memories` | GET | List memories by workspace, project, status, runtime, type, or task prefix |
 | `/memories/review` | GET | List pending agent-written memories |
 | `/memories/:id` | GET | Inspect one memory with source/artifact details |
-| `/memories/:id/review` | PATCH | Confirm, edit, reject, restrict, stale, dispute, or supersede |
+| `/memories/:id/review` | PATCH | Confirm/approve, edit, reject, restrict, stale, dispute, merge, or supersede |
 | `/recall-traces/:request_id` | GET | Debug what was recalled and how it was used |
 
 `workspace_id` is mandatory on every memory-bearing operation. Pass it in the
@@ -148,7 +162,36 @@ Authorization: Bearer YOUR_MCP_ACCESS_KEY
 
 Credentials in `?key=...` are rejected so they cannot leak into URL, proxy, CDN, or function logs. Header credentials are compared in constant time. JSON request bodies are capped at 64 KiB.
 
-`POST /writeback` requires `idempotency_key`. The server computes a SHA-256 `content_hash` for every generated memory row and a canonical request hash for the complete row set. The canonical bytes are the UTF-8 compact JSON encoding of the ordered `[{"memory_type":"...","content":"..."}]` rows produced by the request. Reusing the same key in the same workspace returns the existing rows with `replayed=true` only when the hash matches; changed content returns `409`. A caller may send the canonical request hash in `content_hash` for end-to-end verification.
+The agent credential authenticates the caller but does not grant human review
+authority. For `confirm`, `approve`, `merge`, and `supersede`, also send the
+separately managed reviewer credential:
+
+```text
+x-reviewer-key: YOUR_REVIEWER_ACCESS_KEY
+```
+
+Both credentials are SHA-256 hashed and only their fixed 32-byte digests are
+compared. A missing or invalid reviewer header is treated as `actor_kind=agent`;
+reviewer-only actions are rejected with `403` before PostgREST is called. If
+`REVIEWER_ACCESS_KEY` is absent on the server, those actions fail closed with
+`403 reviewer key not configured`. Other actions remain available to agents.
+In particular, an agent `edit` demotes instruction-grade memory back to pending
+evidence that requires human review.
+
+`POST /writeback` requires `idempotency_key`. The server computes a SHA-256 `content_hash` for every generated memory row and a canonical request hash for the complete row set. The canonical bytes are the UTF-8 compact JSON encoding of the ordered `[{"memory_type":"...","content":"..."}]` rows produced by the request. Reusing the same per-row key in the same workspace returns that row with `replayed=true` only when the hash matches; changed content returns `409`. A caller may send the canonical request hash in `content_hash` for end-to-end verification.
+
+Write-back is atomic across the complete request. The API first generates and
+strictly validates one 1536-number finite embedding per row. Timeout, HTTP 429,
+and HTTP 5xx failures are attempted at most three times with exponential jitter;
+other errors and invalid embeddings are not retried. If any row fails, the API
+returns a generic server/upstream failure before any database RPC. Only after
+every embedding succeeds does it make one
+`agent_memory_writeback_batch_tx(p_workspace_id, p_items, p_created_by,
+p_request_context)` call. Each item carries its `idempotency_key`,
+`content_hash`, `memory`, `provenance`, optional sources/artifacts, and the real
+embedding array. The database commits or rolls back the entire batch, including
+mixed replay/new-item batches. A missing RPC returns `503` with an explicit
+instruction to re-apply `schemas/agent-memory (upgrade)`.
 
 Agent write-back accepts only `observed`, `inferred`, or `generated` provenance and always starts as evidence: `can_use_as_instruction=false`, `can_use_as_evidence=true`, `requires_user_confirmation=true`, and `review_status=pending`. Human confirmation through the review endpoint is the only API path that promotes a row to instruction-grade. Trusted bulk imports need a separately approved import path; this endpoint does not silently promote them.
 
@@ -156,13 +199,18 @@ Lifecycle-changing review actions (`mark_stale`, `merge`, `reject`, `dispute`, a
 
 Outbound calls are bounded: OpenRouter embedding requests time out after 15 seconds and PostgREST requests after 10 seconds. Embeddings are rejected unless they contain exactly 1536 finite numbers. Unexpected server errors return only a generic message and a short correlation id; detailed diagnostics remain in function logs.
 
-The recall adapter deliberately calls the live three-argument RPC signature:
+Query recall calls only the workspace-aware Agent Memory RPC:
 
 ```text
-match_thoughts(query_embedding, match_threshold, match_count)
+agent_memory_match(p_workspace_id, p_query_embedding, p_limit, p_threshold)
 ```
 
-No optional `filter` argument is assumed. Workspace, project, lifecycle, review, visibility, and use-policy filtering is applied to the matched Agent Memory rows after semantic retrieval.
+The RPC returns `(memory_id, similarity)` and enforces the workspace boundary
+inside semantic matching. The API then reloads those memory ids with the same
+workspace predicate before applying project, lifecycle, review, visibility,
+recency, token-budget, and use-policy filters. It never joins through
+`match_thoughts` or `thought_id`. A missing `agent_memory_match` RPC returns an
+explicit schema-upgrade `503`.
 
 `limits.recency_days` keeps a memory when its newest freshness timestamp
 (`created_at` or `last_confirmed_at`) is within the requested window.
@@ -171,9 +219,14 @@ before return: each memory costs approximately
 `ceil((summary characters + content characters) / 4)` tokens. Selection stops
 before the first item that would exceed the budget, preserving ranking order.
 
-## Expected Outcome
+## Expected outcome
 
-An agent runtime can recall relevant context, write back compact memories, and leave a trace that explains what happened. Unsafe write-backs are blocked before durable storage.
+An agent runtime can atomically write a multi-memory batch with its real
+embeddings, recall those memories only inside the requested workspace, and
+leave an auditable trace. A failed embedding or failed item persists nothing.
+Agent credentials cannot promote evidence to instruction-grade memory; the
+separate reviewer credential is required for human-authority transitions.
+Unsafe write-backs are blocked before durable storage.
 
 The trust model is documented in [Safe Agent Memory and Provenance](../../docs/safe-agent-memory-provenance.md).
 
@@ -185,13 +238,16 @@ Run the protocol-only local smoke test before deployment. It exercises the expor
 deno run --allow-env test/smoke-local.mjs
 ```
 
-It uses an in-memory Supabase/OpenRouter mock and verifies protocol guards,
+It uses a faithful in-memory PostgREST/OpenRouter mock and verifies protocol guards,
 strict cross-workspace/project/channel/runtime isolation, by-id workspace
 binding, monotone `restrict_scope`, recency and token budgets, symmetric
-writeback defaults, one-to-one artifact persistence, idempotent replay and
-conflict behavior, missing-RPC fail-closed behavior, opaque `500` responses,
-recall trace/item failures, and transactional review rollback under injected
-review-action failure.
+writeback defaults, a three-item all-or-nothing batch failure, real embedding
+transmission followed by same-workspace recall, one-to-one artifact persistence,
+idempotent replay and conflict behavior, fixed-digest key comparison,
+reviewer-only promotion, agent-edit demotion, missing-RPC fail-closed behavior,
+opaque `500` responses, recall trace/item failures, and transactional review
+rollback under injected review-action failure. The mock does not fabricate
+legacy `thoughts`; matching runs over the embeddings inserted by the batch RPC.
 
 Use the live smoke harness only after the production/staging installation gate and an intentional deployment or secret rotation:
 
@@ -228,8 +284,14 @@ Solution: Confirm write-back has created `agent_memories`, and that those memori
 **Issue: write-back blocked as unsafe**
 Solution: Store a compact summary and artifact links. Do not submit raw transcripts, reasoning traces, secrets, or large code blocks.
 
-**Issue: `transactional RPCs not installed — apply schemas/agent-memory (upgrade)`**
-Solution: Apply the current [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql), refresh the PostgREST schema cache if needed, and retry only after both transactional RPCs are visible.
+**Issue: an `agent_memory_* RPC not installed — re-apply schemas/agent-memory (upgrade)` error**
+Solution: Apply the current [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql), refresh the PostgREST schema cache if needed, and retry only after the batch writeback, match, and review RPC signatures are visible.
+
+**Issue: `Review action requires reviewer key`**
+Solution: Keep the normal agent credential and add `x-reviewer-key` with the separately managed `REVIEWER_ACCESS_KEY`. Do not put either credential in the URL.
+
+**Issue: `reviewer key not configured`**
+Solution: Set `REVIEWER_ACCESS_KEY` as a Supabase secret and redeploy before enabling human-authority review actions.
 
 ## Tool Surface Area
 

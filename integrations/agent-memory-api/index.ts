@@ -9,12 +9,19 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
   "";
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY") ?? "";
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY") ?? "";
+let reviewerAccessKey = Deno.env.get("REVIEWER_ACCESS_KEY") ?? "";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const OPENROUTER_TIMEOUT_MS = 15_000;
 const POSTGREST_TIMEOUT_MS = 10_000;
 const EMBEDDING_DIMENSIONS = 1536;
-const TRANSACTIONAL_RPC_MISSING_ERROR = "transactional RPCs not installed — apply schemas/agent-memory (upgrade)";
+const EMBEDDING_MAX_ATTEMPTS = 3;
+const WRITEBACK_RPC_MISSING_ERROR =
+  "agent_memory_writeback_batch_tx RPC not installed — re-apply schemas/agent-memory (upgrade)";
+const REVIEW_RPC_MISSING_ERROR =
+  "agent_memory_review_tx RPC not installed — re-apply schemas/agent-memory (upgrade)";
+const MATCH_RPC_MISSING_ERROR =
+  "agent_memory_match RPC not installed — re-apply schemas/agent-memory (upgrade)";
 
 const postgrestFetch: typeof fetch = (input, init = {}) =>
   fetch(input, {
@@ -28,7 +35,8 @@ let supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-brain-key, x-reviewer-key",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
 };
 
@@ -184,6 +192,7 @@ const reviewSchemaBase = z.object({
   workspace_id: z.string().trim().min(1).max(256),
   action: z.enum([
     "confirm",
+    "approve",
     "edit",
     "evidence_only",
     "restrict_scope",
@@ -289,7 +298,9 @@ type MemoryRow = {
 async function sha256Hex(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(digest)).map((b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -308,62 +319,124 @@ function validateEmbedding(value: unknown): number[] {
   return value;
 }
 
-async function fetchEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
-      input: text,
-    }),
-    signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
-  });
+export class EmbeddingUpstreamError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = "EmbeddingUpstreamError";
+  }
+}
+
+async function fetchEmbeddingAttempt(text: string): Promise<number[]> {
+  let r: Response;
+  try {
+    r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "openai/text-embedding-3-small",
+        input: text,
+      }),
+      signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new EmbeddingUpstreamError("OpenRouter embedding timeout", true);
+    }
+    throw new EmbeddingUpstreamError(
+      "OpenRouter embedding request failed",
+      false,
+    );
+  }
   if (!r.ok) {
-    throw new Error(
-      `OpenRouter embeddings failed: ${r.status} ${await r.text()}`,
+    throw new EmbeddingUpstreamError(
+      `OpenRouter embedding HTTP ${r.status}`,
+      r.status === 429 || r.status >= 500,
     );
   }
   const d: unknown = await r.json();
-  const embedding = isRecord(d) && Array.isArray(d.data) && isRecord(d.data[0]) ? d.data[0].embedding : null;
+  const embedding = isRecord(d) && Array.isArray(d.data) && isRecord(d.data[0])
+    ? d.data[0].embedding
+    : null;
   return validateEmbedding(embedding);
 }
 
-let getEmbedding = fetchEmbedding;
+let embeddingAttempt = fetchEmbeddingAttempt;
+
+async function getEmbeddingWithRetry(text: string): Promise<number[]> {
+  for (let attempt = 1; attempt <= EMBEDDING_MAX_ATTEMPTS; attempt++) {
+    try {
+      return validateEmbedding(await embeddingAttempt(text));
+    } catch (error) {
+      const retryable = error instanceof EmbeddingUpstreamError &&
+        error.retryable;
+      if (!retryable || attempt === EMBEDDING_MAX_ATTEMPTS) throw error;
+      const exponentialDelay = 100 * 2 ** (attempt - 1);
+      const jitter = Math.floor(Math.random() * 100);
+      await new Promise((resolve) =>
+        setTimeout(resolve, exponentialDelay + jitter)
+      );
+    }
+  }
+  throw new Error("Embedding retries exhausted");
+}
 
 export function configureAgentMemoryTestDependencies(dependencies: {
   supabase?: ReturnType<typeof createClient>;
   getEmbedding?: (text: string) => Promise<number[]>;
+  reviewerAccessKey?: string;
 }) {
   if (dependencies.supabase) supabase = dependencies.supabase;
-  if (dependencies.getEmbedding) getEmbedding = dependencies.getEmbedding;
+  if (dependencies.getEmbedding) embeddingAttempt = dependencies.getEmbedding;
+  if ("reviewerAccessKey" in dependencies) {
+    reviewerAccessKey = dependencies.reviewerAccessKey ?? "";
+  }
 }
 
-function timingSafeEqualStrings(provided: string, expected: string): boolean {
-  const encoder = new TextEncoder();
-  const providedBytes = encoder.encode(provided);
-  const expectedBytes = encoder.encode(expected);
-  let difference = providedBytes.byteLength ^ expectedBytes.byteLength;
-  for (let index = 0; index < expectedBytes.byteLength; index++) {
-    difference |= (providedBytes[index] ?? 0) ^ expectedBytes[index];
+async function sha256Bytes(value: string): Promise<Uint8Array> {
+  return new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  );
+}
+
+async function hashCompareKeys(
+  provided: string,
+  expected: string,
+): Promise<boolean> {
+  const [providedHash, expectedHash] = await Promise.all([
+    sha256Bytes(provided),
+    sha256Bytes(expected),
+  ]);
+  let difference = providedHash.byteLength ^ expectedHash.byteLength;
+  for (let index = 0; index < 32; index++) {
+    difference |= (providedHash[index] ?? 0) ^ (expectedHash[index] ?? 0);
   }
   return difference === 0;
 }
 
-function auth(
+async function auth(
   c: { req: { header: (name: string) => string | undefined } },
-): boolean {
+): Promise<boolean> {
   const headerKey = c.req.header("x-brain-key")?.trim();
   const bearerKey = c.req.header("authorization")?.match(
     /^Bearer\s+([^\s]+)\s*$/i,
   )?.[1];
   const provided = headerKey || bearerKey;
-  return Boolean(
-    provided && MCP_ACCESS_KEY &&
-      timingSafeEqualStrings(provided, MCP_ACCESS_KEY.trim()),
-  );
+  if (!provided || !MCP_ACCESS_KEY) return false;
+  return await hashCompareKeys(provided, MCP_ACCESS_KEY.trim());
+}
+
+async function isReviewer(
+  c: { req: { header: (name: string) => string | undefined } },
+): Promise<boolean> {
+  const provided = c.req.header("x-reviewer-key")?.trim();
+  if (!provided || !reviewerAccessKey) return false;
+  return await hashCompareKeys(provided, reviewerAccessKey.trim());
 }
 
 function unsafeReasons(text: string): string[] {
@@ -383,7 +456,9 @@ function unsafeReasons(text: string): string[] {
   ) reasons.push("large_code_block");
   if (
     text.length > 15000 ||
-    text.split("\n").filter((l) => /^(user|assistant|system|agent|human):/i.test(l.trim())).length > 8
+    text.split("\n").filter((l) =>
+        /^(user|assistant|system|agent|human):/i.test(l.trim())
+      ).length > 8
   ) reasons.push("raw_transcript_like");
   return reasons;
 }
@@ -422,7 +497,9 @@ function memoryRows(payload: z.infer<typeof writebackSchema>) {
   for (const artifact of p.artifacts) {
     rows.push({
       memory_type: "artifact_reference",
-      content: `${artifact.kind}: ${artifact.description || artifact.uri}\n${artifact.uri}`,
+      content: `${artifact.kind}: ${
+        artifact.description || artifact.uri
+      }\n${artifact.uri}`,
       artifact,
     });
   }
@@ -494,7 +571,9 @@ function isRecent(memory: AgentMemory, recencyDays?: number | null): boolean {
   const cutoff = Date.now() - recencyDays * 24 * 60 * 60 * 1000;
   const freshness = Math.max(
     Date.parse(memory.created_at),
-    memory.last_confirmed_at ? Date.parse(memory.last_confirmed_at) : Number.NEGATIVE_INFINITY,
+    memory.last_confirmed_at
+      ? Date.parse(memory.last_confirmed_at)
+      : Number.NEGATIVE_INFINITY,
   );
   return Number.isFinite(freshness) && freshness >= cutoff;
 }
@@ -521,9 +600,27 @@ function applyTokenBudget<T extends AgentMemory>(
 }
 
 function rankMemory(memory: AgentMemory, similarity = 0): number {
-  const provenance = memory.provenance_status === "user_confirmed" ? 0.3 : memory.provenance_status === "imported" ? 0.22 : memory.provenance_status === "observed" ? 0.15 : memory.provenance_status === "generated" ? 0.05 : 0;
-  const policy = memory.can_use_as_instruction ? 0.2 : memory.can_use_as_evidence ? 0.08 : -0.2;
-  const review = memory.review_status === "confirmed" ? 0.15 : memory.review_status === "evidence_only" ? 0.05 : memory.review_status === "pending" ? -0.08 : -0.25;
+  const provenance = memory.provenance_status === "user_confirmed"
+    ? 0.3
+    : memory.provenance_status === "imported"
+    ? 0.22
+    : memory.provenance_status === "observed"
+    ? 0.15
+    : memory.provenance_status === "generated"
+    ? 0.05
+    : 0;
+  const policy = memory.can_use_as_instruction
+    ? 0.2
+    : memory.can_use_as_evidence
+    ? 0.08
+    : -0.2;
+  const review = memory.review_status === "confirmed"
+    ? 0.15
+    : memory.review_status === "evidence_only"
+    ? 0.05
+    : memory.review_status === "pending"
+    ? -0.08
+    : -0.25;
   return similarity + provenance + policy + review +
     Number(memory.confidence || 0) * 0.15;
 }
@@ -567,11 +664,15 @@ function responseMemory(memory: AgentMemory) {
 }
 
 function recallResponseSchema(reqSchemaVersion: string) {
-  return reqSchemaVersion === "openbrain.openclaw.recall.v1" ? "openbrain.openclaw.recall_response.v1" : "openbrain.agent_memory.recall_response.v1";
+  return reqSchemaVersion === "openbrain.openclaw.recall.v1"
+    ? "openbrain.openclaw.recall_response.v1"
+    : "openbrain.agent_memory.recall_response.v1";
 }
 
 function writebackResponseSchema(reqSchemaVersion: string) {
-  return reqSchemaVersion === "openbrain.openclaw.writeback.v1" ? "openbrain.openclaw.writeback_response.v1" : "openbrain.agent_memory.writeback_response.v1";
+  return reqSchemaVersion === "openbrain.openclaw.writeback.v1"
+    ? "openbrain.openclaw.writeback_response.v1"
+    : "openbrain.agent_memory.writeback_response.v1";
 }
 
 type PostgrestFailure = {
@@ -603,7 +704,15 @@ function transactionalRpcError(
   const message = error.message ?? "";
   const normalized = message.toLowerCase();
   if (error.code === "PGRST202") {
-    return c.json({ error: TRANSACTIONAL_RPC_MISSING_ERROR }, 503, corsHeaders);
+    return c.json(
+      {
+        error: operation === "writeback"
+          ? WRITEBACK_RPC_MISSING_ERROR
+          : REVIEW_RPC_MISSING_ERROR,
+      },
+      503,
+      corsHeaders,
+    );
   }
   if (
     operation === "writeback" && normalized.includes("idempotency") &&
@@ -650,7 +759,13 @@ function transactionalRpcError(
       corsHeaders,
     );
   }
-  return internalServerError(c, `agent_memory_${operation}_tx`, error);
+  return internalServerError(
+    c,
+    operation === "writeback"
+      ? "agent_memory_writeback_batch_tx"
+      : "agent_memory_review_tx",
+    error,
+  );
 }
 
 function rpcMemoryResult(
@@ -664,6 +779,25 @@ function rpcMemoryResult(
     memory: memory as AgentMemory,
     replayed: candidate.replayed === true,
   };
+}
+
+function rpcBatchMemoryResults(
+  value: unknown,
+): Array<{ memory: AgentMemory; replayed: boolean }> | null {
+  const rawItems = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.memories)
+    ? value.memories
+    : isRecord(value) && Array.isArray(value.items)
+    ? value.items
+    : isRecord(value) && Array.isArray(value.results)
+    ? value.results
+    : null;
+  if (!rawItems) return null;
+  const results = rawItems.map(rpcMemoryResult);
+  return results.every((result) => result !== null)
+    ? results as Array<{ memory: AgentMemory; replayed: boolean }>
+    : null;
 }
 
 async function audit(event_type: string, payload: Record<string, unknown>) {
@@ -696,7 +830,7 @@ app.use("*", async (c, next) => {
       corsHeaders,
     );
   }
-  if (!auth(c)) {
+  if (!(await auth(c))) {
     return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
   }
   await next();
@@ -758,32 +892,37 @@ app.post("/recall", async (c) => {
   }
   const req = parsed.data;
 
-  const embedding = validateEmbedding(await getEmbedding(req.query));
+  const embedding = await getEmbeddingWithRetry(req.query);
   const { data: matches, error: matchError } = await supabase.rpc(
-    "match_thoughts",
+    "agent_memory_match",
     {
-      query_embedding: embedding,
-      match_threshold: 0.25,
-      match_count: Math.max(req.limits.max_items * 4, 20),
+      p_workspace_id: req.workspace_id,
+      p_query_embedding: embedding,
+      p_limit: Math.max(req.limits.max_items * 4, 20),
+      p_threshold: 0.25,
     },
   );
   if (matchError) {
-    return internalServerError(c, "recall_match_thoughts", matchError);
+    if (matchError.code === "PGRST202") {
+      return c.json({ error: MATCH_RPC_MISSING_ERROR }, 503, corsHeaders);
+    }
+    return internalServerError(c, "agent_memory_match", matchError);
   }
 
-  const similarityByThought = new Map<string, number>();
+  const similarityByMemory = new Map<string, number>();
   for (const item of matches || []) {
-    similarityByThought.set(item.id, item.similarity);
+    if (typeof item.memory_id === "string") {
+      similarityByMemory.set(item.memory_id, Number(item.similarity) || 0);
+    }
   }
-  const thoughtIds = Array.from(similarityByThought.keys());
+  const memoryIds = Array.from(similarityByMemory.keys());
 
-  // Live OB1 exposes match_thoughts(query_embedding, match_threshold, match_count).
   let rawMemories: unknown[] = [];
-  if (thoughtIds.length > 0) {
+  if (memoryIds.length > 0) {
     const { data, error: memoryError } = await supabase.from("agent_memories")
       .select("*").eq("workspace_id", req.workspace_id).in(
-        "thought_id",
-        thoughtIds,
+        "id",
+        memoryIds,
       ).order("created_at", { ascending: false }).limit(100);
     if (memoryError) {
       return internalServerError(c, "recall_load_memories", memoryError);
@@ -795,7 +934,7 @@ app.post("/recall", async (c) => {
     .filter((m) => scopeMatches(m, req))
     .filter((m) => isRecent(m, req.limits.recency_days))
     .map((m) => {
-      const similarity = similarityByThought.get(m.thought_id || "") || 0;
+      const similarity = similarityByMemory.get(m.id) || 0;
       return { ...m, similarity, ranking_score: rankMemory(m, similarity) };
     })
     .sort((a, b) => b.ranking_score - a.ranking_score);
@@ -938,15 +1077,13 @@ app.post("/writeback", async (c) => {
     );
   }
 
-  const created: Array<{ memory: AgentMemory; replayed: boolean }> = [];
   const provider = req.models_used[0]?.provider ?? null;
   const model = req.models_used[0]?.model ?? null;
-
-  for (const [index, row] of rows.entries()) {
+  const embeddings = await Promise.all(
+    rows.map((row) => getEmbeddingWithRetry(row.content)),
+  );
+  const items = await Promise.all(rows.map(async (row, index) => {
     const rowContentHash = await sha256Hex(`${row.memory_type}:${row.content}`);
-    const idempotency_key = `${req.idempotency_key}:${index}`;
-    const embedding = validateEmbedding(await getEmbedding(row.content));
-    const summary = row.content.replace(/\s+/g, " ").slice(0, 140);
     const memory = {
       project_id: req.project_id ?? null,
       channel_kind: req.channel.kind ?? null,
@@ -954,7 +1091,7 @@ app.post("/writeback", async (c) => {
       channel_thread_id: req.channel.thread_id ?? null,
       visibility: defaultVisibility(req),
       memory_type: row.memory_type,
-      summary,
+      summary: row.content.replace(/\s+/g, " ").slice(0, 140),
       content: row.content,
       runtime_name: req.runtime.name,
       runtime_version: req.runtime.version ?? null,
@@ -963,7 +1100,6 @@ app.post("/writeback", async (c) => {
       task_id: req.task_id ?? null,
       flow_id: req.flow_id ?? null,
       stale_after: staleAfter(req.retention.stale_after_days),
-      embedding,
       thought_payload: {
         metadata: {
           source: "agent_memory",
@@ -988,14 +1124,22 @@ app.post("/writeback", async (c) => {
         writeback_content_hash: rowContentHash,
       },
     };
-    const { data, error } = await supabase.rpc("agent_memory_writeback_tx", {
+    return {
+      idempotency_key: `${req.idempotency_key}:${index}`,
+      content_hash: rowContentHash,
+      memory,
+      provenance: req.provenance,
+      source_refs: req.source_refs,
+      artifacts: row.artifact ? [row.artifact] : [],
+      embedding: embeddings[index],
+    };
+  }));
+
+  const { data, error } = await supabase.rpc(
+    "agent_memory_writeback_batch_tx",
+    {
       p_workspace_id: req.workspace_id,
-      p_idempotency_key: idempotency_key,
-      p_content_hash: rowContentHash,
-      p_memory: memory,
-      p_provenance: req.provenance,
-      p_source_refs: req.source_refs,
-      p_artifacts: row.artifact ? [row.artifact] : [],
+      p_items: items,
       p_created_by: "agent",
       p_request_context: {
         schema_version: req.schema_version,
@@ -1007,13 +1151,16 @@ app.post("/writeback", async (c) => {
         models_used: req.models_used,
         retention: req.retention,
       },
-    });
-    if (error) return transactionalRpcError(c, "writeback", error);
-    const result = rpcMemoryResult(data);
-    if (!result) {
-      return internalServerError(c, "agent_memory_writeback_tx_result", data);
-    }
-    created.push(result);
+    },
+  );
+  if (error) return transactionalRpcError(c, "writeback", error);
+  const created = rpcBatchMemoryResults(data);
+  if (!created || created.length !== items.length) {
+    return internalServerError(
+      c,
+      "agent_memory_writeback_batch_tx_result",
+      data,
+    );
   }
 
   return c.json(
@@ -1219,6 +1366,27 @@ app.patch("/memories/:id/review", async (c) => {
     );
   }
   const req = parsed.data;
+  const reviewerOnlyActions = new Set([
+    "confirm",
+    "approve",
+    "merge",
+    "supersede",
+  ]);
+  const reviewer = await isReviewer(c);
+  if (reviewerOnlyActions.has(req.action) && !reviewerAccessKey) {
+    return c.json(
+      { error: "reviewer key not configured" },
+      403,
+      corsHeaders,
+    );
+  }
+  if (reviewerOnlyActions.has(req.action) && !reviewer) {
+    return c.json(
+      { error: "Review action requires reviewer key" },
+      403,
+      corsHeaders,
+    );
+  }
   if (req.related_memory_id === id) {
     return c.json(
       { error: "A memory cannot be related to itself" },
@@ -1247,6 +1415,7 @@ app.patch("/memories/:id/review", async (c) => {
     p_content: req.content ?? null,
     p_summary: req.summary ?? null,
     p_visibility: req.visibility ?? null,
+    p_actor_kind: reviewer ? "human" : "agent",
   });
   if (error) return transactionalRpcError(c, "review", error);
   const result = rpcMemoryResult(data);
