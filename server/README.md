@@ -50,6 +50,26 @@ credentials provide independent revocation and request-local identity at the
 MCP boundary; they do not provide database RLS, per-tool scopes, or persistent
 caller identity.
 
+## Canonical Edge build
+
+[`server/index.ts`](./index.ts) and [`server/deno.json`](./deno.json) are the
+only canonical Supabase Edge runtime inputs. The committed server is the source
+of truth for authentication, CORS, and all 16 MCP tools; ignored deploy folders
+are not sources and are never updated by the builder.
+
+Create a deterministic artifact in the repository's ignored build area with:
+
+```sh
+node scripts/build-edge-deploy.mjs --out .edge-build/open-brain-mcp
+```
+
+The command replaces only the explicit output directory with byte-identical
+copies named `index.ts` and `deno.json`. For deletion safety, the output must
+be a child of `.edge-build/`; the build root itself, external paths, protected
+repository/server paths, and symlinked destinations are refused. Building is
+not deployment: the command has no network behavior and does not contact or
+modify Supabase.
+
 ## Tools
 
 - `search(query)` and `fetch(id)` preserve the ChatGPT search/fetch contract.
@@ -89,6 +109,11 @@ caller identity.
   mutation path. If the RPC is absent, deletion fails closed with instructions
   to apply `schemas/hybrid-recall`; the server performs no fallback read,
   PATCH, audit write, or database delete.
+- `audit_entities(max_low_quality=30)` performs read-only, paginated entity and
+  thought-entity scans and returns deterministically ordered duplicate, date,
+  type-mismatch, and low-quality-topic findings. The listing cap is an integer
+  from 0 through 100; unexpected database failures return only a correlated
+  generic client error.
 
 ## Pondération lexicale (baseline-derived sur 21 cas réels, 2026-07-14 ; à revalider hors échantillon)
 

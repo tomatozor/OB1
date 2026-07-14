@@ -1,0 +1,99 @@
+name: Server CI
+
+on:
+  push:
+    paths:
+      - "server/**"
+      - "scripts/build-edge-deploy.mjs"
+      - ".github/workflows/server-ci.yml"
+      - ".gitignore"
+  pull_request:
+    paths:
+      - "server/**"
+      - "scripts/build-edge-deploy.mjs"
+      - ".github/workflows/server-ci.yml"
+      - ".gitignore"
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check formatting
+        run: >-
+          deno fmt --check
+          server/index.ts
+          server/index_test.ts
+          server/tests/stateless-blackbox.ts
+          scripts/build-edge-deploy.mjs
+
+      - name: Type-check server and tests
+        run: >-
+          deno check --config server/deno.json
+          server/index.ts
+          server/index_test.ts
+
+      - name: Run complete server harness
+        run: bash server/tests/run-all.sh
+
+      - name: Verify deterministic canonical Edge builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          out_a=".edge-build/ci-a"
+          out_b=".edge-build/ci-b"
+          node scripts/build-edge-deploy.mjs --out "${out_a}"
+          node scripts/build-edge-deploy.mjs --out "${out_b}"
+          diff --recursive --brief "${out_a}" "${out_b}"
+          cmp server/index.ts "${out_a}/index.ts"
+          cmp server/deno.json "${out_a}/deno.json"
+          test "$(cd "${out_a}" && find . -type f -print | sort)" = $'./deno.json\n./index.ts'
+          (cd "${out_a}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > ".edge-build/edge-a.sha256"
+          (cd "${out_b}" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > ".edge-build/edge-b.sha256"
+          cmp ".edge-build/edge-a.sha256" ".edge-build/edge-b.sha256"
+
+      - name: Refuse missing or unsafe build outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          refusal_dir="${GITHUB_WORKSPACE}/.edge-build/refusal"
+          mkdir -p "${refusal_dir}"
+          if (
+            cd "${refusal_dir}"
+            node "${GITHUB_WORKSPACE}/scripts/build-edge-deploy.mjs" > refusal.stdout 2> refusal.stderr
+          ); then
+            echo "builder unexpectedly accepted missing --out" >&2
+            exit 1
+          fi
+          test "$(find "${refusal_dir}" -mindepth 1 -type f -printf '%f\n' | sort)" = $'refusal.stderr\nrefusal.stdout'
+
+          external_out="${RUNNER_TEMP}/open-brain-edge-external"
+          if node scripts/build-edge-deploy.mjs --out "${external_out}"; then
+            echo "builder unexpectedly accepted an external output" >&2
+            exit 1
+          fi
+          test ! -e "${external_out}"
+
+          if node scripts/build-edge-deploy.mjs --out .edge-build; then
+            echo "builder unexpectedly accepted the build root itself" >&2
+            exit 1
+          fi
+
+          mkdir .edge-build/symlink-target
+          ln -s symlink-target .edge-build/symlink-output
+          if node scripts/build-edge-deploy.mjs --out .edge-build/symlink-output; then
+            echo "builder unexpectedly accepted a symlinked output" >&2
+            exit 1
+          fi
+          test -L .edge-build/symlink-output
+          test -z "$(find .edge-build/symlink-target -mindepth 1 -print -quit)"

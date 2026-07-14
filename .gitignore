@@ -22,6 +22,7 @@ gmail-sync-log.json
 sync-log.json
 
 # Build artifacts
+.edge-build/
 deno.lock
 docs/walkthroughs/*/public/
 docs/assets/agent-memory/promotional/generated-backgrounds/**/result.json

@@ -2458,6 +2458,246 @@ function buildServer(): McpServer {
     },
   );
 
+  server.registerTool(
+    "audit_entities",
+    {
+      title: "Audit Entity Quality",
+      description:
+        "Scan entity records for deterministic duplicate, date, type-mismatch, and low-quality-topic findings.",
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+      inputSchema: {
+        max_low_quality: z.number().int().min(0).max(100).default(30)
+          .optional().describe(
+            "Maximum low-quality topics to list (0-100, default 30).",
+          ),
+      },
+    },
+    async ({ max_low_quality = 30 }) => {
+      try {
+        type Entity = {
+          id: number;
+          entity_type: string;
+          canonical_name: string;
+          normalized_name: string;
+          aliases: string[] | null;
+          last_seen_at: string;
+        };
+
+        const entities: Entity[] = [];
+        const pageSize = 1_000;
+        for (let from = 0; from < 50_000; from += pageSize) {
+          const { data, error } = await supabase
+            .from("entities")
+            .select(
+              "id,entity_type,canonical_name,normalized_name,aliases,last_seen_at",
+            )
+            .order("id", { ascending: true })
+            .range(from, from + pageSize - 1);
+          if (error) throw error;
+          if (!data || data.length === 0) break;
+          entities.push(...(data as Entity[]));
+          if (data.length < pageSize) break;
+        }
+
+        const links: Array<{ entity_id: number }> = [];
+        for (let from = 0; from < 500_000; from += pageSize) {
+          const { data, error } = await supabase
+            .from("thought_entities")
+            .select("entity_id")
+            .order("entity_id", { ascending: true })
+            .range(from, from + pageSize - 1);
+          if (error) throw error;
+          if (!data || data.length === 0) break;
+          links.push(...(data as Array<{ entity_id: number }>));
+          if (data.length < pageSize) break;
+        }
+
+        const linkCounts = new Map<number, number>();
+        for (const link of links) {
+          linkCounts.set(
+            link.entity_id,
+            (linkCounts.get(link.entity_id) ?? 0) + 1,
+          );
+        }
+
+        const compareText = (left: string, right: string) =>
+          left < right ? -1 : left > right ? 1 : 0;
+        const compareEntities = (left: Entity, right: Entity) =>
+          left.id - right.id ||
+          compareText(left.canonical_name, right.canonical_name);
+
+        const normalizedEntities = new Map<string, Entity[]>();
+        for (const entity of entities) {
+          const normalizedName = entity.normalized_name || "";
+          const group = normalizedEntities.get(normalizedName) ?? [];
+          group.push(entity);
+          normalizedEntities.set(normalizedName, group);
+        }
+        const duplicates = [...normalizedEntities.entries()]
+          .filter(([, group]) => group.length > 1)
+          .map(([normalizedName, group]) =>
+            [
+              normalizedName,
+              [...group].sort(compareEntities),
+            ] as const
+          )
+          .sort(([left], [right]) => compareText(left, right));
+
+        const datePatterns = [
+          /^\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|févr|mars|avri|mai|juin|juil|août|sept|octo|nove|déce)\w*\s+\d{4}$/i,
+          /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2},?\s+\d{4}$/i,
+          /^\d{4}-\d{2}-\d{2}$/,
+          /^\d{1,2}\/\d{1,2}\/\d{2,4}$/,
+        ];
+        const isDate = (value: string) =>
+          datePatterns.some((pattern) => pattern.test(value));
+        const dateEntities = entities
+          .filter((entity) => isDate(entity.canonical_name || ""))
+          .sort(compareEntities);
+
+        const companyNames = new Set([
+          "hilton",
+          "sogequip",
+          "vaka",
+          "fouine-com",
+          "seap",
+          "kura",
+          "devlab",
+          "sogema",
+          "attio",
+        ]);
+        const toolNames = new Set([
+          "claude",
+          "cursor",
+          "supabase",
+          "notion",
+          "linear",
+          "slack",
+          "github",
+        ]);
+        const mismatches: Array<{ id: number; reason: string }> = [];
+        for (const entity of entities) {
+          const canonicalName = entity.canonical_name || "";
+          const canonicalLower = canonicalName.toLowerCase();
+          const normalizedLower = (entity.normalized_name || "").toLowerCase();
+          if (
+            entity.entity_type === "tool" &&
+            (companyNames.has(canonicalLower) ||
+              companyNames.has(normalizedLower))
+          ) {
+            mismatches.push({
+              id: entity.id,
+              reason:
+                `'${canonicalName}' typed as tool — looks like a company/org`,
+            });
+          } else if (
+            entity.entity_type === "place" && isDate(canonicalName)
+          ) {
+            mismatches.push({
+              id: entity.id,
+              reason: `'${canonicalName}' typed as place — looks like a date`,
+            });
+          } else if (
+            entity.entity_type === "person" &&
+            toolNames.has(canonicalLower) && !canonicalLower.includes(" ")
+          ) {
+            mismatches.push({
+              id: entity.id,
+              reason: `'${canonicalName}' typed as person — looks like a tool`,
+            });
+          }
+        }
+        mismatches.sort((left, right) =>
+          left.id - right.id || compareText(left.reason, right.reason)
+        );
+
+        const lowQualityTopics = entities
+          .filter((entity) =>
+            entity.entity_type === "topic" &&
+            (linkCounts.get(entity.id) ?? 0) === 1 &&
+            (entity.canonical_name || "").length > 40
+          )
+          .sort(compareEntities);
+
+        const lines = ["OPEN BRAIN ENTITY AUDIT", ""];
+
+        if (duplicates.length > 0) {
+          lines.push(`Duplicates (${duplicates.length}):`);
+          for (const [, group] of duplicates) {
+            const parts = group.map((entity) =>
+              `id ${entity.id} (${entity.entity_type})`
+            ).join(" + ");
+            const counts = group.map((entity) => linkCounts.get(entity.id) ?? 0)
+              .join(" + ");
+            lines.push(
+              `  - '${group[0].canonical_name}': ${parts} — ${counts} thoughts`,
+            );
+          }
+        } else {
+          lines.push("Duplicates (0): none");
+        }
+        lines.push("");
+
+        if (dateEntities.length > 0) {
+          lines.push(`Date-typed entities (${dateEntities.length}):`);
+          for (const entity of dateEntities) {
+            lines.push(
+              `  - id ${entity.id} '${entity.canonical_name}' (${entity.entity_type}) — ${
+                linkCounts.get(entity.id) ?? 0
+              } thoughts`,
+            );
+          }
+        } else {
+          lines.push("Date-typed entities (0): none");
+        }
+        lines.push("");
+
+        if (mismatches.length > 0) {
+          lines.push(`Type mismatches (${mismatches.length}):`);
+          for (const mismatch of mismatches) {
+            lines.push(`  - id ${mismatch.id}: ${mismatch.reason}`);
+          }
+        } else {
+          lines.push("Type mismatches (0): none");
+        }
+        lines.push("");
+
+        if (lowQualityTopics.length > 0) {
+          lines.push(
+            `Low-quality topics (${lowQualityTopics.length}, showing up to ${max_low_quality}):`,
+          );
+          for (const entity of lowQualityTopics.slice(0, max_low_quality)) {
+            lines.push(
+              `  - id ${entity.id} '${entity.canonical_name}' (topic, 1 thought)`,
+            );
+          }
+          if (lowQualityTopics.length > max_low_quality) {
+            lines.push(
+              `  ... and ${lowQualityTopics.length - max_low_quality} more`,
+            );
+          }
+        } else {
+          lines.push("Low-quality topics (0): none");
+        }
+
+        const totalIssues = duplicates.length + dateEntities.length +
+          mismatches.length + lowQualityTopics.length;
+        lines.push("");
+        lines.push(`Total entities scanned: ${entities.length}`);
+        lines.push(`Total issues found: ${totalIssues}`);
+
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (error) {
+        return internalToolError("audit_entities", error);
+      }
+    },
+  );
+
   return server;
 }
 

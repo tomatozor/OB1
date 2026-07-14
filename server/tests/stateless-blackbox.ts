@@ -64,6 +64,7 @@ const requests: MockRequest[] = [];
 let memorySequence = 10;
 let traceSequence = 20;
 let failNextAudit = false;
+let failNextEntityAudit = false;
 const embeddingAttempts = new Map<string, number>();
 const writebackByKey = new Map<string, Record<string, any>>();
 const agentMemories: Array<Record<string, any>> = [
@@ -696,6 +697,92 @@ globalThis.fetch = (async (
     return json(200, [{ to_thought_id: "recall-superseded" }]);
   }
 
+  if (url.pathname === "/rest/v1/entities" && request.method === "GET") {
+    if (failNextEntityAudit) {
+      failNextEntityAudit = false;
+      return json(500, {
+        code: "XX000",
+        message: "private entity audit storage detail",
+      });
+    }
+    return json(200, [
+      {
+        id: 9,
+        entity_type: "topic",
+        canonical_name:
+          "Another unusually verbose single mention topic for cleanup",
+        normalized_name:
+          "another unusually verbose single mention topic for cleanup",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 8,
+        entity_type: "company",
+        canonical_name: "ACME Incorporated",
+        normalized_name: "acme",
+        aliases: [],
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 7,
+        entity_type: "topic",
+        canonical_name:
+          "A very long single mention topic that should be reviewed",
+        normalized_name:
+          "a very long single mention topic that should be reviewed",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 5,
+        entity_type: "place",
+        canonical_name: "2026-07-14",
+        normalized_name: "2026-07-14",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 4,
+        entity_type: "tool",
+        canonical_name: "Vaka",
+        normalized_name: "vaka",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 3,
+        entity_type: "person",
+        canonical_name: "Claude",
+        normalized_name: "claude",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+      {
+        id: 2,
+        entity_type: "company",
+        canonical_name: "Acme",
+        normalized_name: "acme",
+        aliases: null,
+        last_seen_at: "2026-07-14T00:00:00.000Z",
+      },
+    ]);
+  }
+
+  if (
+    url.pathname === "/rest/v1/thought_entities" && request.method === "GET"
+  ) {
+    return json(200, [
+      { entity_id: 9 },
+      { entity_id: 8 },
+      { entity_id: 7 },
+      { entity_id: 5 },
+      { entity_id: 3 },
+      { entity_id: 2 },
+      { entity_id: 2 },
+    ]);
+  }
+
   if (url.pathname === "/rest/v1/thoughts" && request.method === "GET") {
     const idFilter = url.searchParams.get("id");
     if (idFilter?.startsWith("in.")) {
@@ -890,6 +977,7 @@ const expectedTools = [
   "memory_usage_report",
   "memory_review_queue",
   "memory_review",
+  "audit_entities",
 ].sort();
 
 let passed = 0;
@@ -929,6 +1017,10 @@ async function mcp(
 
 function toolResult(body: Record<string, any>): Record<string, any> {
   return JSON.parse(body.result.content[0].text);
+}
+
+function toolText(body: Record<string, any>): string {
+  return body.result.content[0].text;
 }
 
 console.log("\n[1] Stateless transport and authentication");
@@ -1069,10 +1161,91 @@ assert(
   JSON.stringify(
     tools.body?.result.tools.map((tool: { name: string }) => tool.name).sort(),
   ) === JSON.stringify(expectedTools),
-  "tools/list contains exactly the fifteen v2 tools",
+  "tools/list contains exactly the sixteen v2 tools",
 );
 
 console.log("\n[2] Deterministic and filtered tool contracts");
+const auditRequestStart = requests.length;
+const auditOne = await mcp("tools/call", {
+  name: "audit_entities",
+  arguments: { max_low_quality: 1 },
+});
+const auditTwo = await mcp("tools/call", {
+  name: "audit_entities",
+  arguments: { max_low_quality: 1 },
+});
+const expectedAudit = [
+  "OPEN BRAIN ENTITY AUDIT",
+  "",
+  "Duplicates (1):",
+  "  - 'Acme': id 2 (company) + id 8 (company) — 2 + 1 thoughts",
+  "",
+  "Date-typed entities (1):",
+  "  - id 5 '2026-07-14' (place) — 1 thoughts",
+  "",
+  "Type mismatches (3):",
+  "  - id 3: 'Claude' typed as person — looks like a tool",
+  "  - id 4: 'Vaka' typed as tool — looks like a company/org",
+  "  - id 5: '2026-07-14' typed as place — looks like a date",
+  "",
+  "Low-quality topics (2, showing up to 1):",
+  "  - id 7 'A very long single mention topic that should be reviewed' (topic, 1 thought)",
+  "  ... and 1 more",
+  "",
+  "Total entities scanned: 7",
+  "Total issues found: 7",
+].join("\n");
+assert(
+  auditOne.body?.result?.isError !== true &&
+    toolText(auditOne.body!) === expectedAudit,
+  "audit_entities returns the expected structured deterministic report",
+);
+assert(
+  toolText(auditTwo.body!) === toolText(auditOne.body!),
+  "audit_entities ordering is stable across repeated scans",
+);
+const auditRequests = requests.slice(auditRequestStart).filter((entry) =>
+  entry.url.includes("/rest/v1/entities") ||
+  entry.url.includes("/rest/v1/thought_entities")
+);
+assert(
+  auditRequests.length === 4 &&
+    auditRequests.every((entry) => entry.method === "GET") &&
+    auditRequests.filter((entry) => entry.url.includes("/entities?")).every(
+      (entry) => entry.url.includes("order=id.asc"),
+    ) &&
+    auditRequests.filter((entry) => entry.url.includes("/thought_entities?"))
+      .every((entry) => entry.url.includes("order=entity_id.asc")),
+  "audit_entities performs only ordered paginated entity/link reads",
+);
+
+const invalidAuditRequestStart = requests.length;
+const invalidAudit = await mcp("tools/call", {
+  name: "audit_entities",
+  arguments: { max_low_quality: 101 },
+});
+assert(
+  invalidAudit.body?.result?.isError === true &&
+    invalidAudit.body.result.content[0].text.includes("max_low_quality") &&
+    requests.length === invalidAuditRequestStart,
+  "audit_entities rejects an out-of-bounds cap before any database request",
+);
+
+failNextEntityAudit = true;
+const failedAudit = await mcp("tools/call", {
+  name: "audit_entities",
+  arguments: {},
+});
+const failedAuditText = failedAudit.body?.result?.content?.[0]?.text ?? "";
+assert(
+  failedAudit.body?.result?.isError === true &&
+    /audit_entities error: Internal failure \(reference [0-9a-f]{8}\)/.test(
+      failedAuditText,
+    ) &&
+    !failedAuditText.includes("private entity audit storage detail"),
+  "audit_entities database failures return a generic correlated client error",
+);
+
 const recallParams = { days: 0, limit: 2, min_importance: 0 };
 const recallOne = await mcp("tools/call", {
   name: "recall_context",
