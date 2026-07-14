@@ -46,6 +46,7 @@ for (const projectId of projectIds) {
       await request(`/memories/${memory.memory_id}/review`, {
         method: "PATCH",
         body: {
+          workspace_id: workspaceId,
           action: "reject",
           actor_label: "OB1 Agent Memory test cleanup harness",
           notes: "Rejected smoke/test memory so it cannot influence personal recall.",

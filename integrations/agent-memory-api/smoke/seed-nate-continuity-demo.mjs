@@ -162,6 +162,7 @@ async function main() {
         await request(`/memories/${id}/review`, {
           method: "PATCH",
           body: {
+            workspace_id: workspaceId,
             action: batch.reviewAction,
             actor_label: "OB1 Nate continuity demo seed",
             notes: `Seed ${batch.slug} as ${batch.reviewAction}`,
@@ -232,7 +233,7 @@ function writebackPayload(batch) {
     memory_payload: normalizePayload(batch.payload),
     provenance: batch.provenance,
     retention: batch.retention,
-    visibility: { workspace: "private", project: "project", channel: "dashboard" },
+    visibility: "project",
   };
 }
 

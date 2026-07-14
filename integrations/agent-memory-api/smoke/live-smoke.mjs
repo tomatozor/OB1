@@ -84,6 +84,7 @@ async function main() {
   const reviewed = await request(`/memories/${writtenIds[0]}/review`, {
     method: "PATCH",
     body: {
+      workspace_id: workspaceId,
       action: "evidence_only",
       actor_label: "OB1 Agent Memory API live smoke",
       notes: `API smoke run ${runId}`,
@@ -97,11 +98,11 @@ async function main() {
     review_status_after: reviewed.memory.review_status,
   };
 
-  const inspected = await request(`/memories/${writtenIds[0]}`);
+  const inspected = await request(`/memories/${writtenIds[0]}?workspace_id=${encodeURIComponent(workspaceId)}`);
   assert(inspected.memory?.id === writtenIds[0], "inspect returned the wrong memory");
   summary.checks.inspect_memory = "passed";
 
-  const trace = await request(`/recall-traces/${inclusiveRecall.request_id}`);
+  const trace = await request(`/recall-traces/${inclusiveRecall.request_id}?workspace_id=${encodeURIComponent(workspaceId)}`);
   assert(trace.items?.some((item) => item.memory_id === recalledWrittenId && item.used === true), "recall trace did not mark used memory");
   summary.checks.recall_trace = {
     status: "passed",
@@ -158,7 +159,7 @@ function writebackPayload() {
     },
     provenance: { default_status: "generated", confidence: 0.83, requires_review: true },
     retention: { stale_after_days: 30 },
-    visibility: { workspace: "private", project: "project", channel: "cli" },
+    visibility: "project",
   };
 }
 

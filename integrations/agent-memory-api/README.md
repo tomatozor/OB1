@@ -107,6 +107,38 @@ The API accepts the runtime-neutral core schema versions and the OpenClaw launch
 | `/memories/:id/review` | PATCH | Confirm, edit, reject, restrict, stale, dispute, or supersede |
 | `/recall-traces/:request_id` | GET | Debug what was recalled and how it was used |
 
+`workspace_id` is mandatory on every memory-bearing operation. Pass it in the
+JSON body for `POST /recall`, `POST /writeback`, and
+`PATCH /memories/:id/review`; pass it as a query parameter for
+`GET /memories/:id` and `GET /recall-traces/:request_id`. A by-id lookup that
+does not belong to that workspace returns the same `404` as an unknown id.
+
+### Scope model
+
+Recall always starts with a strict `workspace_id` boundary. Within that
+workspace, visibility is evaluated as follows:
+
+| Memory visibility | Visible when |
+| --- | --- |
+| `workspace` | The recall has the same `workspace_id`; project and channel do not narrow it. |
+| `project` | The recall has the same non-empty `project_id`. |
+| `channel` | The recall has the same non-empty `channel.id`, plus the same stored project when the memory has one. |
+| `personal` | The recall has the same `runtime.name`, plus the same stored project/channel dimensions when present. |
+
+Writeback accepts `visibility` as one of those four enum values. `project`
+requires `project_id`; `channel` requires `channel.id`. When omitted, the
+default is symmetric with normal recall: `channel` when a channel id exists,
+otherwise `project` when a project id exists, otherwise `workspace`. Recall
+without `scope.visibility` considers every visibility allowed by the table;
+setting `scope.visibility` reduces recall to that exact visibility. The legacy
+`scope.project_only` field remains accepted for v1 compatibility but does not
+override these visibility rules.
+
+`restrict_scope` is monotone: `workspace -> project -> channel -> personal`.
+It may keep the current level or move right only when the memory already has
+the required project/channel dimension. A broader target is rejected with
+`400`, so review cannot expand the audience of an existing memory.
+
 Every endpoint except the CORS preflight requires one of these supported header credentials:
 
 ```text
@@ -130,6 +162,13 @@ match_thoughts(query_embedding, match_threshold, match_count)
 
 No optional `filter` argument is assumed. Workspace, project, lifecycle, review, visibility, and use-policy filtering is applied to the matched Agent Memory rows after semantic retrieval.
 
+`limits.recency_days` keeps a memory when its newest freshness timestamp
+(`created_at` or `last_confirmed_at`) is within the requested window.
+`limits.max_tokens` is a hard prefix budget applied after relevance ranking and
+before return: each memory costs approximately
+`ceil((summary characters + content characters) / 4)` tokens. Selection stops
+before the first item that would exceed the budget, preserving ranking order.
+
 ## Expected Outcome
 
 An agent runtime can recall relevant context, write back compact memories, and leave a trace that explains what happened. Unsafe write-backs are blocked before durable storage.
@@ -144,7 +183,10 @@ Run the protocol-only local smoke test before deployment. It exercises the expor
 deno run --allow-env test/smoke-local.mjs
 ```
 
-It verifies missing-header rejection, query-only credential rejection, both supported auth headers, required idempotency, malformed JSON, and the 64 KiB request limit.
+It uses an in-memory Supabase/OpenRouter mock and verifies protocol guards,
+strict cross-workspace/project/channel/runtime isolation, by-id workspace
+binding, monotone `restrict_scope`, recency and token budgets, symmetric
+writeback defaults, and one-to-one artifact persistence.
 
 Use the live smoke harness only after the production/staging installation gate and an intentional deployment or secret rotation:
 

@@ -11,7 +11,7 @@ const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY") ?? "";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_REQUEST_BYTES = 64 * 1024;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+let supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -29,6 +29,8 @@ const channelSchema = z.object({
   id: z.string().trim().max(256).nullable().optional(),
   thread_id: z.string().trim().max(256).nullable().optional(),
 });
+
+const visibilitySchema = z.enum(["personal", "channel", "project", "workspace"]);
 
 const recallSchemaVersion = z.union([
   z.literal("openbrain.agent_memory.recall.v1"),
@@ -56,7 +58,7 @@ const recallSchema = z.object({
   query: z.string().trim().min(1).max(8000),
   entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100)).default({}),
   scope: z.object({
-    visibility: z.enum(["personal", "channel", "project", "workspace", "organization"]).nullable().optional(),
+    visibility: visibilitySchema.nullable().optional(),
     project_only: z.boolean().default(true),
     include_unconfirmed: z.boolean().default(false),
     include_stale: z.boolean().default(false),
@@ -85,7 +87,7 @@ const memoryPayloadSchema = z.object({
   entities: z.record(z.string().max(128), z.array(z.string().max(256)).max(100)).default({}),
 });
 
-const writebackSchema = z.object({
+const writebackSchemaBase = z.object({
   schema_version: writebackSchemaVersion,
   workspace_id: z.string().trim().min(1).max(256),
   project_id: z.string().trim().max(256).nullable().optional(),
@@ -117,11 +119,12 @@ const writebackSchema = z.object({
     ttl_days: z.number().int().positive().nullable().optional(),
     stale_after_days: z.number().int().positive().nullable().optional(),
   }).default({}),
-  visibility: z.object({
-    workspace: z.string().nullable().optional(),
-    project: z.string().nullable().optional(),
-    channel: z.string().nullable().optional(),
-  }).default({}),
+  visibility: visibilitySchema.optional(),
+});
+
+const writebackSchema = writebackSchemaBase.superRefine((value: z.infer<typeof writebackSchemaBase>, ctx: z.RefinementCtx) => {
+  if (value.visibility === "project" && !value.project_id) ctx.addIssue({ code: "custom", message: "project visibility requires project_id", path: ["visibility"] });
+  if (value.visibility === "channel" && !value.channel.id) ctx.addIssue({ code: "custom", message: "channel visibility requires channel.id", path: ["visibility"] });
 });
 
 const usageSchema = z.object({
@@ -133,13 +136,14 @@ const usageSchema = z.object({
 });
 
 const reviewSchemaBase = z.object({
+  workspace_id: z.string().trim().min(1).max(256),
   action: z.enum(["confirm", "edit", "evidence_only", "restrict_scope", "mark_stale", "merge", "reject", "dispute", "supersede"]),
   actor_id: z.string().trim().max(256).nullable().optional(),
   actor_label: z.string().trim().max(256).nullable().optional(),
   notes: z.string().trim().max(4000).nullable().optional(),
   content: z.string().trim().min(1).max(15000).optional(),
   summary: z.string().trim().min(1).max(500).optional(),
-  visibility: z.enum(["personal", "channel", "project", "workspace", "organization"]).optional(),
+  visibility: visibilitySchema.optional(),
   related_memory_id: z.string().uuid().optional(),
 });
 
@@ -182,6 +186,13 @@ type AgentMemory = {
   similarity?: number;
 };
 
+type Visibility = z.infer<typeof visibilitySchema>;
+type MemoryRow = {
+  memory_type: string;
+  content: string;
+  artifact?: z.infer<typeof memoryPayloadSchema>["artifacts"][number];
+};
+
 async function sha256Hex(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", data);
@@ -200,7 +211,7 @@ function extractThoughtId(value: unknown): string | null {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawId) ? rawId : null;
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
+async function fetchEmbedding(text: string): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
     headers: {
@@ -215,6 +226,16 @@ async function getEmbedding(text: string): Promise<number[]> {
   if (!r.ok) throw new Error(`OpenRouter embeddings failed: ${r.status} ${await r.text()}`);
   const d = await r.json();
   return d.data[0].embedding;
+}
+
+let getEmbedding = fetchEmbedding;
+
+export function configureAgentMemoryTestDependencies(dependencies: {
+  supabase?: ReturnType<typeof createClient>;
+  getEmbedding?: (text: string) => Promise<number[]>;
+}) {
+  if (dependencies.supabase) supabase = dependencies.supabase;
+  if (dependencies.getEmbedding) getEmbedding = dependencies.getEmbedding;
 }
 
 function timingSafeEqualStrings(provided: string, expected: string): boolean {
@@ -252,7 +273,7 @@ function staleAfter(days?: number | null): string | null {
 
 function memoryRows(payload: z.infer<typeof writebackSchema>) {
   const p = payload.memory_payload;
-  const rows: { memory_type: string; content: string }[] = [];
+  const rows: MemoryRow[] = [];
   for (const content of p.decisions) rows.push({ memory_type: "decision", content });
   for (const content of p.outputs) rows.push({ memory_type: "output", content });
   for (const content of p.lessons) rows.push({ memory_type: "lesson", content });
@@ -264,19 +285,77 @@ function memoryRows(payload: z.infer<typeof writebackSchema>) {
     rows.push({
       memory_type: "artifact_reference",
       content: `${artifact.kind}: ${artifact.description || artifact.uri}\n${artifact.uri}`,
+      artifact,
     });
   }
   return rows;
 }
 
+function defaultVisibility(payload: z.infer<typeof writebackSchema>): Visibility {
+  if (payload.visibility) return payload.visibility;
+  if (payload.channel.id) return "channel";
+  if (payload.project_id) return "project";
+  return "workspace";
+}
+
+function contextMatches(memory: AgentMemory, req: z.infer<typeof recallSchema>): boolean {
+  if (memory.project_id && memory.project_id !== (req.project_id ?? null)) return false;
+  if (memory.channel_id && memory.channel_id !== (req.channel.id ?? null)) return false;
+  return true;
+}
+
 function scopeMatches(memory: AgentMemory, req: z.infer<typeof recallSchema>): boolean {
   if (memory.workspace_id !== req.workspace_id) return false;
-  if (req.scope.project_only && req.project_id && memory.project_id !== req.project_id) return false;
   if (["superseded", "rejected", "disputed"].includes(memory.lifecycle_status)) return false;
   if (!req.scope.include_stale && memory.lifecycle_status === "stale") return false;
   if (!req.scope.include_unconfirmed && memory.requires_user_confirmation && memory.review_status === "pending") return false;
-  if (memory.visibility === "personal" && req.scope.visibility !== "personal") return false;
+  if (req.scope.visibility && memory.visibility !== req.scope.visibility) return false;
+  if (memory.visibility === "project" && (!req.project_id || memory.project_id !== req.project_id)) return false;
+  if (memory.visibility === "channel" && (!req.channel.id || memory.channel_id !== req.channel.id || !contextMatches(memory, req))) return false;
+  if (memory.visibility === "personal" && (memory.runtime_name !== req.runtime.name || !contextMatches(memory, req))) return false;
+  if (memory.visibility === "organization") return false;
   if (!memory.can_use_as_instruction && !memory.can_use_as_evidence) return false;
+  return true;
+}
+
+function isRecent(memory: AgentMemory, recencyDays?: number | null): boolean {
+  if (!recencyDays) return true;
+  const cutoff = Date.now() - recencyDays * 24 * 60 * 60 * 1000;
+  const freshness = Math.max(
+    Date.parse(memory.created_at),
+    memory.last_confirmed_at ? Date.parse(memory.last_confirmed_at) : Number.NEGATIVE_INFINITY,
+  );
+  return Number.isFinite(freshness) && freshness >= cutoff;
+}
+
+function estimatedTokens(memory: Pick<AgentMemory, "summary" | "content">): number {
+  return Math.ceil((memory.summary.length + memory.content.length) / 4);
+}
+
+function applyTokenBudget<T extends AgentMemory>(ranked: T[], maxTokens: number): T[] {
+  const selected: T[] = [];
+  let used = 0;
+  for (const memory of ranked) {
+    const cost = estimatedTokens(memory);
+    if (used + cost > maxTokens) break;
+    selected.push(memory);
+    used += cost;
+  }
+  return selected;
+}
+
+const visibilityRank: Record<Visibility, number> = {
+  workspace: 0,
+  project: 1,
+  channel: 2,
+  personal: 3,
+};
+
+function canRestrictVisibility(memory: AgentMemory, requested: Visibility): boolean {
+  const current = memory.visibility as Visibility;
+  if (!(current in visibilityRank) || visibilityRank[requested] < visibilityRank[current]) return false;
+  if (requested === "project" && !memory.project_id) return false;
+  if (requested === "channel" && !memory.channel_id) return false;
   return true;
 }
 
@@ -413,13 +492,15 @@ app.post("/recall", async (c) => {
     rawMemories = data || [];
   }
 
-  const ranked = ((rawMemories || []) as AgentMemory[])
+  const rankedByRelevance = ((rawMemories || []) as AgentMemory[])
     .filter((m) => scopeMatches(m, req))
+    .filter((m) => isRecent(m, req.limits.recency_days))
     .map((m) => {
       const similarity = similarityByThought.get(m.thought_id || "") || 0;
       return { ...m, similarity, ranking_score: rankMemory(m, similarity) };
     })
-    .sort((a, b) => b.ranking_score - a.ranking_score)
+    .sort((a, b) => b.ranking_score - a.ranking_score);
+  const ranked = applyTokenBudget(rankedByRelevance, req.limits.max_tokens)
     .slice(0, req.limits.max_items);
 
   const { data: trace, error: traceError } = await supabase.from("agent_memory_recall_traces").insert({
@@ -434,7 +515,13 @@ app.post("/recall", async (c) => {
     query: req.query,
     schema_version: req.schema_version,
     request_payload: req,
-    response_policy: { max_items: req.limits.max_items, include_unconfirmed: req.scope.include_unconfirmed },
+    response_policy: {
+      max_items: req.limits.max_items,
+      max_tokens: req.limits.max_tokens,
+      recency_days: req.limits.recency_days ?? null,
+      token_estimate: "ceil((summary_chars + content_chars) / 4)",
+      include_unconfirmed: req.scope.include_unconfirmed,
+    },
   }).select("*").single();
   if (traceError) return c.json({ error: traceError.message }, 500, corsHeaders);
 
@@ -489,7 +576,8 @@ app.post("/writeback", async (c) => {
   const rows = memoryRows(req);
   if (rows.length === 0) return c.json({ error: "memory_payload produced no memory rows" }, 400, corsHeaders);
 
-  const requestContentHash = await sha256Hex(JSON.stringify(rows));
+  const canonicalRows = rows.map(({ memory_type, content }) => ({ memory_type, content }));
+  const requestContentHash = await sha256Hex(JSON.stringify(canonicalRows));
   if (req.content_hash && req.content_hash.toLowerCase() !== requestContentHash) return c.json({ error: "content_hash does not match the canonical memory rows" }, 409, corsHeaders);
 
   const unsafe = rows.flatMap((row) => unsafeReasons(row.content).map((reason) => ({ reason, memory_type: row.memory_type })));
@@ -562,7 +650,7 @@ app.post("/writeback", async (c) => {
       channel_kind: req.channel.kind ?? null,
       channel_id: req.channel.id ?? null,
       channel_thread_id: req.channel.thread_id ?? null,
-      visibility: req.project_id ? "project" : "personal",
+      visibility: defaultVisibility(req),
       memory_type: row.memory_type,
       summary: row.content.replace(/\s+/g, " ").slice(0, 140),
       content: row.content,
@@ -614,16 +702,14 @@ app.post("/writeback", async (c) => {
       if (sourceError) return c.json({ error: sourceError.message }, 500, corsHeaders);
     }
 
-    if (row.memory_type === "artifact_reference") {
-      for (const artifact of req.memory_payload.artifacts) {
-        const { error: artifactError } = await supabase.from("agent_memory_artifacts").insert({
-          memory_id: memory.id,
-          artifact_kind: artifact.kind,
-          uri: artifact.uri,
-          description: artifact.description ?? null,
-        });
-        if (artifactError) return c.json({ error: artifactError.message }, 500, corsHeaders);
-      }
+    if (row.memory_type === "artifact_reference" && row.artifact) {
+      const { error: artifactError } = await supabase.from("agent_memory_artifacts").insert({
+        memory_id: memory.id,
+        artifact_kind: row.artifact.kind,
+        uri: row.artifact.uri,
+        description: row.artifact.description ?? null,
+      });
+      if (artifactError) return c.json({ error: artifactError.message }, 500, corsHeaders);
     }
 
     await audit("memory_written", {
@@ -714,8 +800,11 @@ app.get("/memories", async (c) => {
 app.get("/memories/:id", async (c) => {
   const id = c.req.param("id");
   if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Invalid memory id" }, 400, corsHeaders);
-  const { data, error } = await supabase.from("agent_memories").select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)").eq("id", id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const workspace_id = c.req.query("workspace_id");
+  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  const { data, error } = await supabase.from("agent_memories").select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)").eq("id", id).eq("workspace_id", workspace_id).maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!data) return c.json({ error: "Memory not found" }, 404, corsHeaders);
   return c.json({ memory: data }, 200, corsHeaders);
 });
 
@@ -728,8 +817,9 @@ app.patch("/memories/:id/review", async (c) => {
   if (!parsed.success) return c.json({ error: "Invalid review payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
 
-  const { data: before, error: beforeError } = await supabase.from("agent_memories").select("*").eq("id", id).single();
-  if (beforeError) return c.json({ error: beforeError.message }, 404, corsHeaders);
+  const { data: before, error: beforeError } = await supabase.from("agent_memories").select("*").eq("id", id).eq("workspace_id", req.workspace_id).maybeSingle();
+  if (beforeError) return c.json({ error: beforeError.message }, 500, corsHeaders);
+  if (!before) return c.json({ error: "Memory not found" }, 404, corsHeaders);
   if (req.related_memory_id === id) return c.json({ error: "A memory cannot be related to itself" }, 400, corsHeaders);
   if (req.related_memory_id) {
     const { data: related, error: relatedError } = await supabase.from("agent_memories").select("id").eq("id", req.related_memory_id).eq("workspace_id", before.workspace_id).maybeSingle();
@@ -765,6 +855,9 @@ app.patch("/memories/:id/review", async (c) => {
     updates.can_use_as_evidence = false;
     updates.requires_user_confirmation = true;
   } else if (req.action === "restrict_scope") {
+    if (!canRestrictVisibility(before as AgentMemory, req.visibility!)) {
+      return c.json({ error: "restrict_scope may only reduce the existing visibility" }, 400, corsHeaders);
+    }
     updates.review_status = "restricted";
     updates.visibility = req.visibility;
   } else if (req.action === "edit") {
@@ -789,7 +882,7 @@ app.patch("/memories/:id/review", async (c) => {
     Object.assign(updates, { review_status: "stale", lifecycle_status: "superseded", can_use_as_instruction: false, can_use_as_evidence: false, requires_user_confirmation: false });
   }
 
-  const { data: after, error: updateError } = await supabase.from("agent_memories").update(updates).eq("id", id).select("*").single();
+  const { data: after, error: updateError } = await supabase.from("agent_memories").update(updates).eq("id", id).eq("workspace_id", req.workspace_id).select("*").single();
   if (updateError) return c.json({ error: updateError.message }, 500, corsHeaders);
 
   const { error: reviewActionError } = await supabase.from("agent_memory_review_actions").insert({
@@ -837,8 +930,11 @@ app.patch("/memories/:id/review", async (c) => {
 app.get("/recall-traces/:request_id", async (c) => {
   const request_id = c.req.param("request_id");
   if (!z.string().uuid().safeParse(request_id).success) return c.json({ error: "Invalid request_id" }, 400, corsHeaders);
-  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const workspace_id = c.req.query("workspace_id");
+  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).eq("workspace_id", workspace_id).maybeSingle();
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (!trace) return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
   const { data: items, error: itemError } = await supabase.from("agent_memory_recall_items").select("*, agent_memories(*)").eq("trace_id", trace.id).order("rank");
   if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
   return c.json({ trace, items }, 200, corsHeaders);

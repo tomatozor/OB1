@@ -27,8 +27,8 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
   channel_kind TEXT,
   channel_id TEXT,
   channel_thread_id TEXT,
-  visibility TEXT NOT NULL DEFAULT 'project' CHECK (
-    visibility IN ('personal', 'channel', 'project', 'workspace', 'organization')
+  visibility TEXT NOT NULL DEFAULT 'workspace' CHECK (
+    visibility IN ('personal', 'channel', 'project', 'workspace')
   ),
   memory_type TEXT NOT NULL CHECK (
     memory_type IN (
@@ -92,6 +92,20 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
     OR provenance_status IN ('user_confirmed', 'imported')
   )
 );
+
+-- Keep repeat applications aligned with the runtime-neutral four-level scope
+-- model, including databases created by an earlier version of this schema.
+ALTER TABLE public.agent_memories
+  ALTER COLUMN visibility SET DEFAULT 'workspace';
+UPDATE public.agent_memories
+  SET visibility = 'workspace'
+  WHERE visibility = 'organization';
+ALTER TABLE public.agent_memories
+  DROP CONSTRAINT IF EXISTS agent_memories_visibility_check;
+ALTER TABLE public.agent_memories
+  ADD CONSTRAINT agent_memories_visibility_check CHECK (
+    visibility IN ('personal', 'channel', 'project', 'workspace')
+  );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memories_idempotency_key
   ON public.agent_memories (workspace_id, idempotency_key);

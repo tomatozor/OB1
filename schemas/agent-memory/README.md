@@ -90,6 +90,11 @@ After applying this schema, OB1 can store agent memories as governed records ins
 
 `idempotency_key` and `content_hash` are mandatory for every Agent Memory row, and idempotency is unique within a workspace. Indexes cover workspace/creation time, `thought_id`, review state, lifecycle state, runtime/task, and content hashes. Enum-like values for provenance, lifecycle, visibility, memory type, review state, relations, review actions, audit events, and actor kinds are protected by `CHECK` constraints.
 
+The persistence visibility enum is deliberately limited to `workspace`,
+`project`, `channel`, and `personal`; `workspace_id` is always required. The
+API enforces the exact contextual matching and runtime ownership semantics
+documented in [`integrations/agent-memory-api`](../../integrations/agent-memory-api/README.md#scope-model).
+
 The service role is granted `SELECT`, `INSERT`, and `UPDATE`, but not `DELETE`, on all eight sidecar tables. The API exposes no physical-delete route. Rejection, staleness, merging, dispute, and supersession are represented through `lifecycle_status`, reviewer records, relations, and `agent_memory_audit_events`. A database trigger writes an audit event in the same transaction as every transition to `stale`, `superseded`, `disputed`, or `rejected`, so the lifecycle change rolls back if its audit cannot be persisted.
 
 Use [Safe Agent Memory and Provenance](../../docs/safe-agent-memory-provenance.md) as the operating guide for provenance, review status, use policy, and scope decisions.
