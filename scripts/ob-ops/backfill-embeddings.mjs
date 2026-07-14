@@ -5,13 +5,19 @@ import fs from "node:fs";
 const HELP = `Usage: node scripts/ob-ops/backfill-embeddings.mjs [options]
 
 Lists thoughts whose embedding is NULL. Dry-run is the default and never sends
-content to an embedding provider.
+content to an embedding provider. Output contains identifiers, counts, and
+lengths only; it never prints thought content.
 
 Options:
   --apply                 Generate and persist embeddings
+  --batch <number>        PostgREST page size (default: 100)
   --min-length <number>   Minimum content length (default: 5)
   --env-file <path>       Load simple KEY=VALUE environment entries
-  --help                  Show this help`;
+  --help                  Show this help
+
+Exit codes:
+  0  Completed successfully
+  1  Configuration, network/API, or apply failure`;
 
 function fail(message) { console.error(`Error: ${message}`); process.exitCode = 1; }
 function loadEnvFile(path) {
@@ -21,15 +27,17 @@ function loadEnvFile(path) {
   }
 }
 function args() {
-  const out = { apply: false, minLength: 5 };
+  const out = { apply: false, batch: 100, minLength: 5 };
   for (let i = 2; i < process.argv.length; i++) {
     const arg = process.argv[i];
     if (arg === "--help") { console.log(HELP); process.exit(0); }
     if (arg === "--apply") out.apply = true;
+    else if (arg === "--batch") out.batch = Number(process.argv[++i]);
     else if (arg === "--min-length") out.minLength = Number(process.argv[++i]);
     else if (arg === "--env-file") out.envFile = process.argv[++i];
     else throw new Error(`Unknown or incomplete option: ${arg}`);
   }
+  if (!Number.isInteger(out.batch) || out.batch < 1 || out.batch > 1000) throw new Error("--batch must be an integer from 1 to 1000");
   if (!Number.isInteger(out.minLength) || out.minLength < 0) throw new Error("--min-length must be a non-negative integer");
   return out;
 }
@@ -51,15 +59,16 @@ async function main() {
   const { url, key } = config(); const headers = { apikey: key, Authorization: `Bearer ${key}` };
   const rows = []; let offset = 0;
   while (true) {
-    const query = new URLSearchParams({ select: "id,content,metadata", embedding: "is.null", order: "id.asc", limit: "100", offset: String(offset) });
+    const query = new URLSearchParams({ select: "id,content,metadata", embedding: "is.null", order: "id.asc", limit: String(options.batch), offset: String(offset) });
     const page = await (await request(`${url}/rest/v1/thoughts?${query}`, { headers })).json();
-    rows.push(...page); if (page.length < 100) break; offset += 100;
+    rows.push(...page); if (page.length < options.batch) break; offset += options.batch;
   }
   const short = rows.filter((row) => (row.content ?? "").length < options.minLength);
   const eligible = rows.filter((row) => (row.content ?? "").length >= options.minLength);
   const bySource = Object.fromEntries(Object.entries(eligible.reduce((a, row) => { const source = row.metadata?.source ?? "unknown"; a[source] = (a[source] ?? 0) + 1; return a; }, {})).sort());
-  console.log(JSON.stringify({ mode: options.apply ? "apply" : "dry-run", by_source: bySource, sample_ids: rows.slice(0, 10).map((r) => r.id), skipped_short_ids: short.slice(0, 10).map((r) => r.id) }, null, 2));
-  let embedded = 0; let failed = 0;
+  const sampleLengths = rows.slice(0, 10).map((row) => ({ id: row.id, length: (row.content ?? "").length }));
+  console.log(JSON.stringify({ mode: options.apply ? "apply" : "dry-run", by_source: bySource, sample_ids: rows.slice(0, 10).map((r) => r.id), sample_lengths: sampleLengths, skipped_short_ids: short.slice(0, 10).map((r) => r.id) }, null, 2));
+  let updated = 0; let failed = 0;
   if (options.apply) {
     const embeddingUrl = `${(process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "")}/embeddings`;
     const apiKey = process.env.OPENROUTER_API_KEY || process.env.LLM_API_KEY;
@@ -78,10 +87,11 @@ async function main() {
           } catch (error) { if (attempt === 2) throw error; await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt))); }
         }
         await request(`${url}/rest/v1/thoughts?${new URLSearchParams({ id: `eq.${row.id}`, embedding: "is.null" })}`, { method: "PATCH", headers: { ...headers, "Content-Type": "application/json", Prefer: "return=minimal" }, body: JSON.stringify({ embedding: vector }) });
-        embedded++;
+        updated++;
       } catch (error) { failed++; console.error(`Failed id ${row.id}: ${error.message}`); }
     }
   }
-  console.log(JSON.stringify({ scanned: rows.length, embedded, skipped_short: short.length, failed }));
+  console.log(JSON.stringify({ scanned: rows.length, updated, skipped_short: short.length, failed, iterations: Math.ceil(rows.length / options.batch) }));
+  if (options.apply && failed > 0) process.exitCode = 1;
 }
 main().catch((error) => fail(error.message));

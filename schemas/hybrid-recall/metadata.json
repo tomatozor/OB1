@@ -3,8 +3,8 @@
   "description": "Adds reciprocal-rank-fused semantic and full-text recall, atomic capture, source backfill, logical deletion, append-only audit, and exact thought statistics.",
   "category": "schemas",
   "author": {
-    "name": "Nate B. Jones / OB1",
-    "github": "NateBJones-Projects"
+    "name": "Thomas Verdenne",
+    "github": "tomatozor"
   },
   "version": "1.0.0",
   "requires": {

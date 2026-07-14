@@ -25,23 +25,30 @@ reasoning, credentials, private customer data, or large code blocks. Generated
 or inferred write-back remains evidence and requires human confirmation before
 it becomes instruction-grade.
 
-Configure the Open Brain MCP connector as a remote HTTP connector. Replace the
-placeholders locally; never commit the access key:
+Configure the Open Brain MCP connector as a remote HTTP server in
+`~/.codex/config.toml`. Replace the placeholders locally; never commit the
+access key:
 
-```json
-{
-  "mcpServers": {
-    "open-brain": {
-      "type": "http",
-      "url": "https://YOUR_PROJECT_REF.supabase.co/functions/v1/open-brain-mcp",
-      "headers": {
-        "x-brain-key": "YOUR_OPEN_BRAIN_ACCESS_KEY"
-      }
-    }
-  }
-}
+```toml
+[mcp_servers.open-brain]
+url = "https://YOUR_PROJECT_REF.supabase.co/functions/v1/open-brain-mcp"
+
+[mcp_servers.open-brain.http_headers]
+x-brain-key = "YOUR_OPEN_BRAIN_ACCESS_KEY"
 ```
 
-The exact connector configuration location depends on the Codex CLI version.
-Verify that `recall_context` and `capture_thought` are visible before relying
-on this protocol.
+Check the MCP section of the Codex CLI documentation for your installed
+version — key names for remote HTTP servers have evolved across releases.
+
+Tool availability is not guaranteed to match this protocol's ideal set.
+Apply this transitional policy, in order:
+
+1. If `recall_context` is visible, call it first with the shared defaults.
+2. Otherwise, if `search_thoughts` is visible, call it with a query built
+   from the task at hand.
+3. Otherwise, continue the task and state explicitly that Open Brain recall
+   was unavailable.
+
+Recall is mandatory before substantive work; never write back sensitive data
+automatically. Once the v2 server is deployed, step 1 applies without any
+edit to this file.

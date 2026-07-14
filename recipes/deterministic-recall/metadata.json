@@ -3,8 +3,8 @@
   "description": "Apply the same explicit Open Brain recall and session write-back protocol across Claude Code, Codex CLI, ChatGPT, and other MCP clients.",
   "category": "recipes",
   "author": {
-    "name": "OB1 Team",
-    "github": "NateBJones-Projects"
+    "name": "Thomas Verdenne",
+    "github": "tomatozor"
   },
   "version": "1.0.0",
   "requires": {

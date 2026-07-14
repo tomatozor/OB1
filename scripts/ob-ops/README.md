@@ -11,15 +11,24 @@ simple local environment file with `--env-file path`; each non-comment line is
 
 ```bash
 node scripts/ob-ops/backfill-embeddings.mjs --env-file .env.ob
-node scripts/ob-ops/backfill-embeddings.mjs --apply --min-length 5 --env-file .env.ob
+node scripts/ob-ops/backfill-embeddings.mjs --apply --batch 100 --min-length 5 --env-file .env.ob
 node scripts/ob-ops/backfill-source-type.mjs --env-file .env.ob
 node scripts/ob-ops/backfill-source-type.mjs --apply --batch 100 --env-file .env.ob
 node scripts/ob-ops/verify-stats.mjs --env-file .env.ob
 node scripts/ob-ops/health-signal.mjs --env-file .env.ob
 ```
 
-`backfill-source-type` uses `backfill_source_type(p_batch, p_dry_run)` when it
-is available, otherwise it performs id-qualified PATCH requests. `verify-stats`
+`backfill-embeddings` accepts `--batch` (default 100) for its PostgREST page
+size. Its apply summary is fail-closed: any per-thought embedding failure makes
+the process return a non-zero exit code. Its output contains only identifiers,
+counts, and lengths, never thought content.
+
+`backfill-source-type --apply` repeatedly uses
+`backfill_source_type(p_batch, p_dry_run)` until the RPC reports no qualified
+rows remaining (maximum 1,000 iterations). If the RPC is unavailable before it
+makes a change, it performs the same bounded loop with id-qualified PATCH
+requests. An RPC or PATCH iteration failure returns a non-zero exit code.
+Dry-run remains one read-only pass. `verify-stats`
 uses `brain_stats_aggregate` and attempts `thought_stats_exact`; unavailable
 RPCs are reported clearly rather than treated as a crash. `health-signal` uses
 only REST-observable signals: latest `thoughts.created_at` per source, queue
@@ -27,5 +36,7 @@ status counts, and missing embeddings. It cannot inspect the unexposed
 `cron.job_run_details` view.
 
 Exit codes: all scripts return non-zero for configuration or network/API errors;
+both backfills also return non-zero for failed apply work (including their
+iteration safety limit);
 `verify-stats` also returns 1 for a comparable discrepancy above 0.5%, and
 `health-signal` returns 1 for yellow or red health.

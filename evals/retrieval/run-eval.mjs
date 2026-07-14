@@ -17,23 +17,25 @@ Options:
   --modes <list>        Comma-separated: ${DEFAULT_MODES.join(",")} (default: all)
   --k <number>          Ranking depth (default: 10)
   --threshold <number>  Semantic similarity floor (default: 0.3)
+  --allow-partial       Exclude failed queries from quality metrics; permits partial failures
   --env-file <path>     Optional KEY=VALUE file; never committed
   --out <path>          Write complete JSON report
   --help                Show this message`;
 }
 
 function parseArgs(argv) {
-  const options = { modes: DEFAULT_MODES, k: 10, threshold: 0.3 };
+  const options = { modes: DEFAULT_MODES, k: 10, threshold: 0.3, thresholdProvided: false, allowPartial: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help") return { help: true };
     if (!arg.startsWith("--")) throw new Error(`Unknown argument: ${arg}`);
+    if (arg === "--allow-partial") { options.allowPartial = true; continue; }
     const value = argv[++i];
     if (!value) throw new Error(`Missing value for ${arg}`);
     if (arg === "--golden") options.golden = value;
     else if (arg === "--modes") options.modes = value.split(",").map((x) => x.trim()).filter(Boolean);
     else if (arg === "--k") options.k = Number(value);
-    else if (arg === "--threshold") options.threshold = Number(value);
+    else if (arg === "--threshold") { options.threshold = Number(value); options.thresholdProvided = true; }
     else if (arg === "--env-file") options.envFile = value;
     else if (arg === "--out") options.out = value;
     else throw new Error(`Unknown option: ${arg}`);
@@ -74,7 +76,7 @@ function loadGolden(file) {
 }
 
 class HttpError extends Error {
-  constructor(label, status, body) { super(`${label} failed: HTTP ${status}${body ? ` — ${body.slice(0, 240)}` : ""}`); this.status = status; }
+  constructor(label, status, body) { super(`${label} failed: HTTP ${status}${body ? ` — ${body.slice(0, 240)}` : ""}`); this.status = status; this.body = body; }
 }
 
 function config() {
@@ -102,7 +104,7 @@ async function embed(query, c) {
 }
 
 async function semantic(query, c, embeddingCache, k, threshold) {
-  const vector = await embeddingFor(query, c, embeddingCache);
+  const vector = await embeddingFor(query, embeddingCache);
   return postJson(`${c.url}/rest/v1/rpc/match_thoughts`, rpcHeaders(c), { query_embedding: vector, match_threshold: threshold, match_count: k }, "match_thoughts");
 }
 
@@ -110,13 +112,28 @@ async function textSearch(query, c, k) {
   return postJson(`${c.url}/rest/v1/rpc/search_thoughts_text`, rpcHeaders(c), { p_query: query, p_limit: k, p_filter: {}, p_offset: 0 }, "search_thoughts_text");
 }
 
-async function hybrid(query, c, embeddingCache, k) {
-  const vector = await embeddingFor(query, c, embeddingCache);
-  return postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), { p_query: query, p_query_embedding: vector, p_limit: k, p_offset: 0, p_filter: {}, p_include_restricted: false, p_rrf_k: 60 }, "hybrid_search_thoughts");
+function hybridPayload(query, vector, k, threshold) {
+  return { p_query: query, p_query_embedding: vector, p_limit: k, p_offset: 0, p_filter: {}, p_include_restricted: false, p_rrf_k: 60, ...(threshold === undefined ? {} : { p_semantic_threshold: threshold }) };
 }
 
-function embeddingFor(query, c, cache) {
-  if (!cache.has(query)) cache.set(query, embed(query, c));
+function isSignatureError(error) {
+  return error instanceof HttpError && (error.status === 400 || error.status === 404) && /function|parameter|argument|p_semantic_threshold|schema cache/i.test(error.body || error.message);
+}
+
+async function hybrid(query, c, embeddingCache, k, semanticThreshold) {
+  const vector = await embeddingFor(query, embeddingCache);
+  try {
+    return await postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k, semanticThreshold), "hybrid_search_thoughts");
+  } catch (error) {
+    if (semanticThreshold !== undefined && isSignatureError(error)) {
+      return postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k), "hybrid_search_thoughts");
+    }
+    throw error;
+  }
+}
+
+function embeddingFor(query, cache) {
+  if (!cache.has(query)) throw new Error(`Query embedding was not precomputed for: ${query}`);
   return cache.get(query);
 }
 
@@ -141,7 +158,7 @@ async function execute(mode, entry, c, cache, options) {
   let rows;
   if (mode === "semantic") rows = await semantic(entry.query, c, cache, options.k, options.threshold);
   else if (mode === "text") rows = await textSearch(entry.query, c, options.k);
-  else if (mode === "hybrid") rows = await hybrid(entry.query, c, cache, options.k);
+  else if (mode === "hybrid") rows = await hybrid(entry.query, c, cache, options.k, options.thresholdProvided ? options.threshold : undefined);
   else {
     const [semanticRows, textRows] = await Promise.all([
       semantic(entry.query, c, cache, 60, options.threshold),
@@ -158,10 +175,11 @@ function percentile(values, p) {
   return sorted[Math.ceil((p / 100) * sorted.length) - 1];
 }
 
-function metrics(results, k) {
+function metrics(results, k, allowPartial) {
   const succeeded = results.filter((r) => !r.error);
+  const scored = allowPartial ? succeeded : results;
   const found = (r, depth) => r.returned_ids.slice(0, depth).some((id) => r.relevant_ids.includes(id));
-  const reciprocalRanks = succeeded.map((r) => {
+  const reciprocalRanks = scored.map((r) => {
     const index = r.returned_ids.findIndex((id) => r.relevant_ids.includes(id));
     return index < 0 ? 0 : 1 / (index + 1);
   });
@@ -170,9 +188,10 @@ function metrics(results, k) {
     total: results.length,
     succeeded: succeeded.length,
     failed: results.length - succeeded.length,
-    hit_at_1: average(succeeded.map((r) => found(r, 1) ? 1 : 0)),
-    hit_at_5: average(succeeded.map((r) => found(r, Math.min(5, k)) ? 1 : 0)),
-    hit_at_k: average(succeeded.map((r) => found(r, k) ? 1 : 0)),
+    quality_denominator: scored.length,
+    hit_at_1: average(scored.map((r) => found(r, 1) ? 1 : 0)),
+    hit_at_5: average(scored.map((r) => found(r, Math.min(5, k)) ? 1 : 0)),
+    hit_at_k: average(scored.map((r) => found(r, k) ? 1 : 0)),
     mrr: average(reciprocalRanks),
     latency_ms: { p50: percentile(succeeded.map((r) => r.latency_ms), 50), p95: percentile(succeeded.map((r) => r.latency_ms), 95) },
   };
@@ -181,12 +200,13 @@ function metrics(results, k) {
 function formatNumber(value) { return value.toFixed(3); }
 function printTable(report) {
   console.log(`\nRetrieval evaluation: ${report.case_count} cases, k=${report.options.k}, threshold=${report.options.threshold}`);
-  console.log("Latency is end-to-end client wall time for each retrieval mode; it includes its network calls (and a cached query embedding where needed).");
-  console.log("mode           hit@1  hit@5  hit@k  MRR    P50 ms  P95 ms  failed  note");
+  console.log(`Quality denominator: ${report.options.allow_partial ? "successful queries only (--allow-partial)" : "all queries; failures count as misses (fail-closed default)"}.`);
+  console.log("Warmup: query embeddings were precomputed before timed retrieval; latency measures retrieval calls only.");
+  console.log("mode           hit@1  hit@5  hit@k  MRR    P50 ms  P95 ms  failed  denom");
   for (const [mode, result] of Object.entries(report.modes)) {
     if (result.status === "skipped") { console.log(`${mode.padEnd(14)} skipped (${result.note})`); continue; }
     const m = result.metrics;
-    console.log(`${mode.padEnd(14)} ${formatNumber(m.hit_at_1).padStart(5)}  ${formatNumber(m.hit_at_5).padStart(5)}  ${formatNumber(m.hit_at_k).padStart(5)}  ${formatNumber(m.mrr).padStart(5)}  ${m.latency_ms.p50.toFixed(1).padStart(6)}  ${m.latency_ms.p95.toFixed(1).padStart(6)}  ${String(m.failed).padStart(6)}`);
+    console.log(`${mode.padEnd(14)} ${formatNumber(m.hit_at_1).padStart(5)}  ${formatNumber(m.hit_at_5).padStart(5)}  ${formatNumber(m.hit_at_k).padStart(5)}  ${formatNumber(m.mrr).padStart(5)}  ${m.latency_ms.p50.toFixed(1).padStart(6)}  ${m.latency_ms.p95.toFixed(1).padStart(6)}  ${String(m.failed).padStart(6)}  ${String(m.quality_denominator).padStart(5)}`);
   }
 }
 
@@ -202,8 +222,16 @@ async function main() {
   let c;
   try { c = config(); } catch (error) { console.error(`Configuration error: ${error.message}`); process.exitCode = 2; return; }
 
-  const report = { generated_at: new Date().toISOString(), golden: path.resolve(options.golden), case_count: golden.length, options: { modes: options.modes, k: options.k, threshold: options.threshold }, notes: ["No database writes are performed.", "Latency is end-to-end client wall time and includes network time. Query embeddings are cached in memory by query and reused across modes."], modes: {} };
+  const report = { generated_at: new Date().toISOString(), golden: path.resolve(options.golden), case_count: golden.length, options: { modes: options.modes, k: options.k, threshold: options.threshold, threshold_provided: options.thresholdProvided, allow_partial: options.allowPartial }, notes: ["No database writes are performed.", "Query embeddings are precomputed in an unmeasured warmup phase. Mode latency measures retrieval calls and their network time only.", options.allowPartial ? "Partial mode: failed queries are excluded from quality denominators." : "Fail-closed mode: failed queries count as quality misses and cause a non-zero exit."], modes: {} };
   const cache = new Map();
+  const uniqueQueries = [...new Set(golden.map((entry) => entry.query))];
+  console.log(`Warmup: precomputing embeddings for ${uniqueQueries.length} unique queries (not timed).`);
+  const warmups = uniqueQueries.map((query) => {
+    const pending = embed(query, c);
+    cache.set(query, pending);
+    return pending;
+  });
+  await Promise.allSettled(warmups);
   for (const mode of options.modes) {
     const results = [];
     let skipped;
@@ -220,7 +248,7 @@ async function main() {
         results.push({ id: entry.id, relevant_ids: entry.relevant_ids, returned_ids: [], error: error.message });
       }
     }
-    report.modes[mode] = skipped ? { status: "skipped", note: skipped } : { status: "executed", metrics: metrics(results, options.k), results };
+    report.modes[mode] = skipped ? { status: "skipped", note: skipped } : { status: "executed", metrics: metrics(results, options.k, options.allowPartial), results };
   }
   printTable(report);
   if (options.out) {
@@ -228,6 +256,10 @@ async function main() {
     fs.writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
     console.log(`Full report: ${options.out}`);
   }
+  const executed = Object.values(report.modes).filter((result) => result.status === "executed");
+  const hasFailure = executed.some((result) => result.metrics.failed > 0);
+  const allFailedMode = executed.some((result) => result.metrics.total > 0 && result.metrics.succeeded === 0);
+  if ((!options.allowPartial && hasFailure) || (options.allowPartial && allFailedMode)) process.exitCode = 1;
 }
 
 main().catch((error) => { console.error(`Unexpected error: ${error.stack || error.message}`); process.exitCode = 1; });
