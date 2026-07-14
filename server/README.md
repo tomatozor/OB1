@@ -163,7 +163,7 @@ flag, or usage claim.
   `created_at`) when `search_thoughts_text` or enhanced thought columns are not
   installed; semantic retrieval remains available and enrichment is
   opportunistic.
-- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.5, semantic_weight=1.0, text_weight=2.0, recency_half_life_days?)`
+- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.3 (aligné sur les évals golden du 2026-07-14), semantic_weight=1.0, text_weight=2.0, recency_half_life_days?)`
   provides filtered retrieval. Hybrid mode calls `hybrid_search_thoughts` first,
   then uses weighted semantic/text RRF (`k=60`) only when that RPC is absent. The caller's
   `threshold` is sent to the hybrid RPC as `p_semantic_threshold` and applies

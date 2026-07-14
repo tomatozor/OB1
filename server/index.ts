@@ -17,6 +17,10 @@ const ALLOW_QUERY_KEY = Deno.env.get("MCP_ALLOW_QUERY_KEY") === "true";
 const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
   "https://openrouter.ai/api/v1";
 const RRF_K = 60;
+// Seuil sémantique par défaut : 0.3, aligné sur les évaluations golden du
+// 2026-07-14 (hit@10 0,905 in-sample / 0,864 hors échantillon mesurés à 0,3 ;
+// l'ancien défaut 0,5 tronquait le contexte des requêtes conversationnelles).
+const DEFAULT_SEMANTIC_THRESHOLD = 0.3;
 const DEFAULT_SEMANTIC_WEIGHT = 1.0;
 const DEFAULT_TEXT_WEIGHT = 2.0;
 const AGENT_MEMORY_RUNTIME = "open-brain-mcp-v2";
@@ -1912,7 +1916,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
           mode: "hybrid",
           limit: 10,
           offset: 0,
-          threshold: 0.5,
+          threshold: DEFAULT_SEMANTIC_THRESHOLD,
           semanticWeight: DEFAULT_SEMANTIC_WEIGHT,
           textWeight: DEFAULT_TEXT_WEIGHT,
           filters: { include_restricted: false },
@@ -2021,7 +2025,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
         start_date: z.string().min(1).optional(),
         end_date: z.string().min(1).optional(),
         include_restricted: z.boolean().default(false).optional(),
-        threshold: z.number().min(0).max(1).default(0.5).optional(),
+        threshold: z.number().min(0).max(1).default(DEFAULT_SEMANTIC_THRESHOLD).optional(),
         semantic_weight: z.number().default(DEFAULT_SEMANTIC_WEIGHT).optional(),
         text_weight: z.number().default(DEFAULT_TEXT_WEIGHT).optional(),
         recency_half_life_days: z.number().optional(),
@@ -2038,7 +2042,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
       start_date,
       end_date,
       include_restricted = false,
-      threshold = 0.5,
+      threshold = DEFAULT_SEMANTIC_THRESHOLD,
       semantic_weight = DEFAULT_SEMANTIC_WEIGHT,
       text_weight = DEFAULT_TEXT_WEIGHT,
       recency_half_life_days,
