@@ -6,6 +6,10 @@
  * MCP transport and tool handlers without requiring permission to bind a port.
  */
 const ACCESS_KEY = "test-mcp-key";
+const CLIENT_B_KEY = "fixture-client-b-key";
+const LEGACY_ACCESS_KEY = "fixture-legacy-access-key";
+const ALLOWED_ORIGIN = "https://client-a.example";
+const DENIED_ORIGIN = "https://denied.example";
 const ID = "11111111-1111-4111-8111-111111111111";
 const ATOMIC_CAPTURE_ID = "22222222-2222-4222-8222-222222222222";
 const LEGACY_CAPTURE_ID = "33333333-3333-4333-8333-333333333333";
@@ -23,11 +27,32 @@ const VALID_EMBEDDING = Array.from(
   (_, index) => index < 3 ? [0.1, 0.2, 0.3][index] : 0,
 );
 
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  );
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const ACCESS_KEY_SHA256 = await sha256Hex(ACCESS_KEY);
+const CLIENT_B_KEY_SHA256 = await sha256Hex(CLIENT_B_KEY);
+
 Deno.env.set("SUPABASE_URL", "http://postgrest.invalid");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
 Deno.env.set("OPENROUTER_API_KEY", "test-openrouter-key");
 Deno.env.set("OPENROUTER_BASE_URL", "http://openrouter.invalid");
-Deno.env.set("MCP_ACCESS_KEY", ACCESS_KEY);
+Deno.env.set("MCP_ACCESS_KEY", LEGACY_ACCESS_KEY);
+Deno.env.set(
+  "MCP_CLIENT_KEYS",
+  JSON.stringify([
+    { client_id: "client-a", key_sha256: ACCESS_KEY_SHA256 },
+    { client_id: "client-b", key_sha256: CLIENT_B_KEY_SHA256 },
+  ]),
+);
+Deno.env.set(
+  "MCP_ALLOWED_ORIGINS",
+  `${ALLOWED_ORIGIN},https://client-b.example`,
+);
 
 type MockRequest = {
   method: string;
@@ -899,7 +924,7 @@ async function mcp(
   } catch {
     body = null;
   }
-  return { response, body };
+  return { response, body, raw };
 }
 
 function toolResult(body: Record<string, any>): Record<string, any> {
@@ -907,11 +932,35 @@ function toolResult(body: Record<string, any>): Record<string, any> {
 }
 
 console.log("\n[1] Stateless transport and authentication");
-const cors = await app.request("http://mcp.invalid", { method: "OPTIONS" });
+const allowedOptions = await app.request("http://mcp.invalid", {
+  method: "OPTIONS",
+  headers: { origin: ALLOWED_ORIGIN },
+});
 assert(
-  cors.status === 200 &&
-    cors.headers.get("access-control-allow-origin") === "*",
-  "CORS preflight -> 200 with origin header",
+  allowedOptions.status === 200 &&
+    allowedOptions.headers.get("access-control-allow-origin") ===
+      ALLOWED_ORIGIN &&
+    allowedOptions.headers.get("vary") === "Origin",
+  "allowed CORS preflight -> 200 with exact echoed origin",
+);
+const deniedOptions = await app.request("http://mcp.invalid", {
+  method: "OPTIONS",
+  headers: { origin: DENIED_ORIGIN },
+});
+assert(
+  deniedOptions.status === 200 &&
+    !deniedOptions.headers.has("access-control-allow-origin") &&
+    deniedOptions.headers.get("vary") === "Origin",
+  "denied CORS preflight -> 200 without allow-origin",
+);
+const missingOriginOptions = await app.request("http://mcp.invalid", {
+  method: "OPTIONS",
+});
+assert(
+  missingOriginOptions.status === 200 &&
+    !missingOriginOptions.headers.has("access-control-allow-origin") &&
+    missingOriginOptions.headers.get("vary") === "Origin",
+  "no-origin CORS preflight -> 200 without allow-origin",
 );
 assert(
   (await mcp("initialize", {}, { "content-type": "application/json" }))
@@ -940,9 +989,16 @@ assert(
 assert(
   (await mcp("initialize", {}, {
     "content-type": "application/json",
-    authorization: `Bearer ${ACCESS_KEY}`,
+    authorization: `Bearer ${CLIENT_B_KEY}`,
   })).response.status === 200,
-  "Authorization Bearer -> 200",
+  "client B Authorization Bearer -> 200",
+);
+assert(
+  (await mcp("initialize", {}, {
+    "content-type": "application/json",
+    "x-brain-key": LEGACY_ACCESS_KEY,
+  })).response.status === 401,
+  "registry takes precedence and does not fall back to legacy key",
 );
 for (
   const [label, key] of [
@@ -965,6 +1021,48 @@ for (
     `Authorization Bearer ${label} key -> 401`,
   );
 }
+const unknownKey = "fixture-unknown-client-key";
+const unknown = await mcp("initialize", {}, {
+  "content-type": "application/json",
+  "x-brain-key": unknownKey,
+});
+assert(unknown.response.status === 401, "unknown registry key -> 401");
+assert(
+  !unknown.raw.includes(unknownKey) &&
+    !unknown.raw.includes(ACCESS_KEY) &&
+    !unknown.raw.includes(ACCESS_KEY_SHA256) &&
+    !unknown.raw.includes(CLIENT_B_KEY_SHA256) &&
+    !unknown.raw.includes(LEGACY_ACCESS_KEY),
+  "authentication error leaks no key or digest material",
+);
+
+const allowedCors = await mcp("initialize", {}, {
+  ...BASE_HEADERS,
+  origin: ALLOWED_ORIGIN,
+});
+assert(
+  allowedCors.response.status === 200 &&
+    allowedCors.response.headers.get("access-control-allow-origin") ===
+      ALLOWED_ORIGIN &&
+    allowedCors.response.headers.get("vary") === "Origin",
+  "allowed non-OPTIONS origin is echoed",
+);
+const deniedCors = await mcp("initialize", {}, {
+  ...BASE_HEADERS,
+  origin: DENIED_ORIGIN,
+});
+assert(
+  deniedCors.response.status === 200 &&
+    !deniedCors.response.headers.has("access-control-allow-origin") &&
+    deniedCors.response.headers.get("vary") === "Origin",
+  "denied non-OPTIONS origin receives no allow-origin",
+);
+assert(
+  initialized.response.status === 200 &&
+    !initialized.response.headers.has("access-control-allow-origin") &&
+    initialized.response.headers.get("vary") === "Origin",
+  "no-origin non-OPTIONS request receives no allow-origin",
+);
 const tools = await mcp("tools/list");
 assert(tools.response.status === 200, "tools/list -> 200");
 assert(

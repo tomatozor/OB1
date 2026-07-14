@@ -4,6 +4,52 @@ This stateless MCP endpoint authenticates requests only with `x-brain-key` or
 `Authorization: Bearer <key>`. URL query parameters are never accepted for
 authentication.
 
+## Authentication and CORS
+
+`MCP_CLIENT_KEYS` enables revocable per-client credentials. It must be a JSON
+array of one or more objects containing exactly `client_id` and `key_sha256`:
+
+```json
+[
+  { "client_id": "desktop-agent", "key_sha256": "<64-hex-sha256-digest>" },
+  { "client_id": "automation-agent", "key_sha256": "<64-hex-sha256-digest>" }
+]
+```
+
+Store only the SHA-256 digest of each generated credential in this variable.
+Client IDs must be non-empty and whitespace-normalized; digests must contain
+exactly 64 hexadecimal characters. Empty arrays, extra or missing fields,
+duplicate client IDs, duplicate digests, invalid JSON, and malformed entries
+stop server initialization with a generic configuration error. Secrets and
+digests are never returned to clients or written to authentication logs.
+
+When `MCP_CLIENT_KEYS` is absent, `MCP_ACCESS_KEY` retains its existing
+single-key behavior. When both variables are present, the multi-client registry
+always takes precedence: a registry miss never falls back to
+`MCP_ACCESS_KEY`. If a request presents both supported headers, both credentials
+must resolve to the same registered client. The resolved `client_id` exists
+only in request-local HTTP plumbing; it is not added to tool inputs, persisted,
+or treated as a scope.
+
+`MCP_ALLOWED_ORIGINS` optionally defines a comma-separated, exact-origin
+allowlist, for example:
+
+```text
+https://agent.example,https://automation.example:8443
+```
+
+When it is absent, the endpoint preserves the legacy
+`Access-Control-Allow-Origin: *` response. When it is present, an allowed
+request `Origin` is echoed exactly and responses include `Vary: Origin`.
+Denied or missing origins receive no `Access-Control-Allow-Origin` header.
+`OPTIONS` uses the same origin policy and remains an unauthenticated preflight;
+all non-`OPTIONS` requests still require a valid MCP credential.
+
+The Supabase client continues to use `SUPABASE_SERVICE_ROLE_KEY`. Per-client
+credentials provide independent revocation and request-local identity at the
+MCP boundary; they do not provide database RLS, per-tool scopes, or persistent
+caller identity.
+
 ## Tools
 
 - `search(query)` and `fetch(id)` preserve the ChatGPT search/fetch contract.

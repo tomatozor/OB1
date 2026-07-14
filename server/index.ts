@@ -9,7 +9,9 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
+const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY");
+const MCP_CLIENT_KEYS = Deno.env.get("MCP_CLIENT_KEYS");
+const MCP_ALLOWED_ORIGINS = Deno.env.get("MCP_ALLOWED_ORIGINS");
 
 const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
   "https://openrouter.ai/api/v1";
@@ -2459,88 +2461,265 @@ function buildServer(): McpServer {
   return server;
 }
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+const baseCorsHeaders = {
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
 
-export async function timingSafeEqualStrings(
-  a: string,
-  b: string,
-): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const [aDigest, bDigest] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(a)),
-    crypto.subtle.digest("SHA-256", encoder.encode(b)),
-  ]);
-  const aBytes = new Uint8Array(aDigest);
-  const bBytes = new Uint8Array(bDigest);
-  let difference = 0;
+type ClientCredential = {
+  clientId: string;
+  keyDigest: Uint8Array;
+};
+
+export type AuthConfig =
+  | { mode: "multi-client"; clients: ClientCredential[] }
+  | { mode: "legacy"; accessKey: string | undefined };
+
+type AuthResult = {
+  authenticated: boolean;
+  clientId?: string;
+};
+
+type AppEnv = {
+  Variables: {
+    clientId?: string;
+  };
+};
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(32);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export function parseAuthConfig(
+  rawClientKeys: string | undefined,
+  legacyAccessKey: string | undefined,
+): AuthConfig {
+  if (rawClientKeys === undefined) {
+    return { mode: "legacy", accessKey: legacyAccessKey };
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(rawClientKeys);
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error();
+
+    const clientIds = new Set<string>();
+    const digests = new Set<string>();
+    const clients: ClientCredential[] = [];
+    for (const entry of parsed) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error();
+      }
+      const fields = Object.keys(entry).sort();
+      if (
+        fields.length !== 2 || fields[0] !== "client_id" ||
+        fields[1] !== "key_sha256"
+      ) {
+        throw new Error();
+      }
+      const { client_id, key_sha256 } = entry as Record<string, unknown>;
+      if (
+        typeof client_id !== "string" || client_id.length === 0 ||
+        client_id.trim() !== client_id || typeof key_sha256 !== "string" ||
+        !/^[0-9a-fA-F]{64}$/.test(key_sha256)
+      ) {
+        throw new Error();
+      }
+      const normalizedDigest = key_sha256.toLowerCase();
+      if (clientIds.has(client_id) || digests.has(normalizedDigest)) {
+        throw new Error();
+      }
+      clientIds.add(client_id);
+      digests.add(normalizedDigest);
+      clients.push({
+        clientId: client_id,
+        keyDigest: hexToBytes(normalizedDigest),
+      });
+    }
+    return { mode: "multi-client", clients };
+  } catch {
+    throw new Error("Invalid MCP_CLIENT_KEYS configuration");
+  }
+}
+
+export function parseAllowedOrigins(
+  rawAllowedOrigins: string | undefined,
+): ReadonlySet<string> | null {
+  if (rawAllowedOrigins === undefined) return null;
+  return new Set(
+    rawAllowedOrigins.split(",").map((origin) => origin.trim()).filter(Boolean),
+  );
+}
+
+export function corsHeadersForOrigin(
+  origin: string | undefined,
+  allowedOrigins: ReadonlySet<string> | null,
+): Record<string, string> {
+  const headers: Record<string, string> = { ...baseCorsHeaders };
+  if (allowedOrigins === null) {
+    headers["Access-Control-Allow-Origin"] = "*";
+  } else {
+    headers.Vary = "Origin";
+    if (origin !== undefined && allowedOrigins.has(origin)) {
+      headers["Access-Control-Allow-Origin"] = origin;
+    }
+  }
+  return headers;
+}
+
+async function sha256Bytes(value: string): Promise<Uint8Array> {
+  return new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  );
+}
+
+function timingSafeEqualDigests(a: Uint8Array, b: Uint8Array): boolean {
+  let difference = a.length ^ b.length;
   for (let index = 0; index < 32; index++) {
-    difference |= aBytes[index] ^ bBytes[index];
+    difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
   }
   return difference === 0;
 }
 
-export const app = new Hono();
+export async function timingSafeEqualStrings(
+  a: string,
+  b: string,
+): Promise<boolean> {
+  const [aDigest, bDigest] = await Promise.all([
+    sha256Bytes(a),
+    sha256Bytes(b),
+  ]);
+  return timingSafeEqualDigests(aDigest, bDigest);
+}
 
-app.options("*", (context) => context.text("ok", 200, corsHeaders));
-
-app.all("*", async (context) => {
-  const headerKey = context.req.header("x-brain-key") ?? "";
-  const authorization = context.req.header("authorization") ?? "";
+export async function authenticateRequest(
+  headers: Headers,
+  config: AuthConfig,
+): Promise<AuthResult> {
+  const headerKey = headers.get("x-brain-key") ?? "";
+  const authorization = headers.get("authorization") ?? "";
   const bearerKey = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
-  const hasConfiguredKey = typeof MCP_ACCESS_KEY === "string" &&
-    MCP_ACCESS_KEY.length > 0;
-  const [headerMatches, bearerMatches] = hasConfiguredKey
-    ? await Promise.all([
-      timingSafeEqualStrings(headerKey, MCP_ACCESS_KEY),
-      timingSafeEqualStrings(bearerKey, MCP_ACCESS_KEY),
-    ])
-    : [false, false];
-  if (!hasConfiguredKey || (!headerMatches && !bearerMatches)) {
-    return context.json(
-      { error: "Invalid or missing access key" },
-      401,
-      corsHeaders,
-    );
+
+  if (config.mode === "legacy") {
+    const hasConfiguredKey = typeof config.accessKey === "string" &&
+      config.accessKey.length > 0;
+    const [headerMatches, bearerMatches] = hasConfiguredKey
+      ? await Promise.all([
+        timingSafeEqualStrings(headerKey, config.accessKey!),
+        timingSafeEqualStrings(bearerKey, config.accessKey!),
+      ])
+      : [false, false];
+    return {
+      authenticated: hasConfiguredKey && (headerMatches || bearerMatches),
+    };
   }
 
-  if (!context.req.header("accept")?.includes("text/event-stream")) {
-    const headers = new Headers(context.req.raw.headers);
-    headers.set("Accept", "application/json, text/event-stream");
-    const patched = new Request(context.req.raw.url, {
-      method: context.req.raw.method,
-      headers,
-      body: context.req.raw.body,
-      // @ts-ignore -- duplex is required for streaming request bodies in Deno.
-      duplex: "half",
-    });
-    Object.defineProperty(context.req, "raw", {
-      value: patched,
-      writable: true,
-    });
-  }
+  const presentedKeys = [headerKey, bearerKey].filter((key) => key.length > 0);
+  if (presentedKeys.length === 0) return { authenticated: false };
 
-  const server = buildServer();
-  const transport = new StreamableHTTPTransport();
-  await server.connect(transport);
-  const response = await transport.handleRequest(context);
-  if (!response) {
-    return context.json(
-      { error: "No response from MCP transport" },
-      500,
-      corsHeaders,
+  const presentedDigests = await Promise.all(presentedKeys.map(sha256Bytes));
+  let resolvedClientId: string | undefined;
+  let allCredentialsMatch = true;
+  for (const presentedDigest of presentedDigests) {
+    let matchedClientId: string | undefined;
+    for (const client of config.clients) {
+      if (timingSafeEqualDigests(presentedDigest, client.keyDigest)) {
+        matchedClientId = client.clientId;
+      }
+    }
+    if (matchedClientId === undefined) {
+      allCredentialsMatch = false;
+    } else if (
+      resolvedClientId !== undefined && resolvedClientId !== matchedClientId
+    ) {
+      allCredentialsMatch = false;
+    } else {
+      resolvedClientId = matchedClientId;
+    }
+  }
+  return allCredentialsMatch && resolvedClientId !== undefined
+    ? { authenticated: true, clientId: resolvedClientId }
+    : { authenticated: false };
+}
+
+const authConfig = parseAuthConfig(MCP_CLIENT_KEYS, MCP_ACCESS_KEY);
+const allowedOrigins = parseAllowedOrigins(MCP_ALLOWED_ORIGINS);
+
+export function createApp(
+  requestAuthConfig: AuthConfig = authConfig,
+  requestAllowedOrigins: ReadonlySet<string> | null = allowedOrigins,
+): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+
+  app.options("*", (context) =>
+    context.text(
+      "ok",
+      200,
+      corsHeadersForOrigin(context.req.header("origin"), requestAllowedOrigins),
+    ));
+
+  app.all("*", async (context) => {
+    const corsHeaders = corsHeadersForOrigin(
+      context.req.header("origin"),
+      requestAllowedOrigins,
     );
-  }
-  response.headers.delete("mcp-session-id");
-  for (const [key, value] of Object.entries(corsHeaders)) {
-    response.headers.set(key, value);
-  }
-  return response;
-});
+    const authentication = await authenticateRequest(
+      context.req.raw.headers,
+      requestAuthConfig,
+    );
+    if (!authentication.authenticated) {
+      return context.json(
+        { error: "Invalid or missing access key" },
+        401,
+        corsHeaders,
+      );
+    }
+    if (authentication.clientId !== undefined) {
+      context.set("clientId", authentication.clientId);
+    }
+
+    if (!context.req.header("accept")?.includes("text/event-stream")) {
+      const headers = new Headers(context.req.raw.headers);
+      headers.set("Accept", "application/json, text/event-stream");
+      const patched = new Request(context.req.raw.url, {
+        method: context.req.raw.method,
+        headers,
+        body: context.req.raw.body,
+        // @ts-ignore -- duplex is required for streaming request bodies in Deno.
+        duplex: "half",
+      });
+      Object.defineProperty(context.req, "raw", {
+        value: patched,
+        writable: true,
+      });
+    }
+
+    const server = buildServer();
+    const transport = new StreamableHTTPTransport();
+    await server.connect(transport);
+    const response = await transport.handleRequest(context);
+    if (!response) {
+      return context.json(
+        { error: "No response from MCP transport" },
+        500,
+        corsHeaders,
+      );
+    }
+    response.headers.delete("mcp-session-id");
+    for (const [key, value] of Object.entries(corsHeaders)) {
+      response.headers.set(key, value);
+    }
+    return response;
+  });
+
+  return app;
+}
+
+export const app = createApp();
 
 // PORT est ignoré par l'Edge Runtime Supabase mais permet aux tests locaux
 // de démarrer le serveur sur un port éphémère.

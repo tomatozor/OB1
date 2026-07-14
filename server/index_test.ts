@@ -2,14 +2,20 @@ Deno.env.set("SUPABASE_URL", "http://127.0.0.1:54321");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
 Deno.env.set("OPENROUTER_API_KEY", "test-openrouter-key");
 Deno.env.set("MCP_ACCESS_KEY", "test-mcp-key");
+Deno.env.delete("MCP_CLIENT_KEYS");
+Deno.env.delete("MCP_ALLOWED_ORIGINS");
 
 const {
+  authenticateRequest,
+  corsHeadersForOrigin,
   fuseRrf,
   isMissingDatabaseObjectError,
   isMissingEnhancedThoughtsError,
   isMissingHybridRpcError,
   isHybridThresholdSignatureError,
   isHybridWeightSignatureError,
+  parseAllowedOrigins,
+  parseAuthConfig,
   retrieveHybrid,
   timingSafeEqualStrings,
   validateEmbedding,
@@ -27,6 +33,13 @@ function thought(id: string) {
     metadata: {},
     created_at: "2026-07-14T00:00:00.000Z",
   };
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  );
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 Deno.test("RRF uses lexical-priority 2:1 defaults and supports inverted weights", () => {
@@ -215,6 +228,185 @@ Deno.test("auth comparison hashes values and handles different lengths", async (
   assert(
     !(await timingSafeEqualStrings("test-mcp-keyx", "test-mcp-key")),
     "longer key matched",
+  );
+});
+
+Deno.test("multi-client auth resolves two clients and prefers the registry", async () => {
+  const clientAKey = "fixture-client-a-key";
+  const clientBKey = "fixture-client-b-key";
+  const config = parseAuthConfig(
+    JSON.stringify([
+      { client_id: "client-a", key_sha256: await sha256Hex(clientAKey) },
+      { client_id: "client-b", key_sha256: await sha256Hex(clientBKey) },
+    ]),
+    "fixture-legacy-key",
+  );
+  assert(config.mode === "multi-client", "registry did not take precedence");
+
+  const clientA = await authenticateRequest(
+    new Headers({ "x-brain-key": clientAKey }),
+    config,
+  );
+  const clientB = await authenticateRequest(
+    new Headers({ authorization: `Bearer ${clientBKey}` }),
+    config,
+  );
+  const legacy = await authenticateRequest(
+    new Headers({ "x-brain-key": "fixture-legacy-key" }),
+    config,
+  );
+  assert(
+    clientA.authenticated && clientA.clientId === "client-a",
+    "client A was not resolved",
+  );
+  assert(
+    clientB.authenticated && clientB.clientId === "client-b",
+    "client B was not resolved",
+  );
+  assert(!legacy.authenticated, "registry failure fell back to the legacy key");
+
+  const sameClientTwice = await authenticateRequest(
+    new Headers({
+      "x-brain-key": clientAKey,
+      authorization: `Bearer ${clientAKey}`,
+    }),
+    config,
+  );
+  const conflictingClients = await authenticateRequest(
+    new Headers({
+      "x-brain-key": clientAKey,
+      authorization: `Bearer ${clientBKey}`,
+    }),
+    config,
+  );
+  const oneKnownOneUnknown = await authenticateRequest(
+    new Headers({
+      "x-brain-key": clientAKey,
+      authorization: "Bearer fixture-unknown-key",
+    }),
+    config,
+  );
+  assert(
+    sameClientTwice.authenticated && sameClientTwice.clientId === "client-a",
+    "matching dual credentials did not resolve to their client",
+  );
+  assert(
+    !conflictingClients.authenticated,
+    "credentials for different clients were accepted together",
+  );
+  assert(
+    !oneKnownOneUnknown.authenticated,
+    "a known credential masked an unknown second credential",
+  );
+});
+
+Deno.test("multi-client registry rejects malformed, empty, and duplicate entries", async () => {
+  const digestA = await sha256Hex("fixture-registry-key-a");
+  const digestB = await sha256Hex("fixture-registry-key-b");
+  const invalidRegistries = [
+    "",
+    "{}",
+    "[]",
+    JSON.stringify([{ client_id: "", key_sha256: digestA }]),
+    JSON.stringify([{ client_id: "client-a", key_sha256: "not-a-digest" }]),
+    JSON.stringify([{
+      client_id: "client-a",
+      key_sha256: digestA,
+      scope: "invented",
+    }]),
+    JSON.stringify([
+      { client_id: "client-a", key_sha256: digestA },
+      { client_id: "client-a", key_sha256: digestB },
+    ]),
+    JSON.stringify([
+      { client_id: "client-a", key_sha256: digestA },
+      { client_id: "client-b", key_sha256: digestA.toUpperCase() },
+    ]),
+  ];
+  for (const raw of invalidRegistries) {
+    let message = "";
+    try {
+      parseAuthConfig(raw, "fixture-legacy-key");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    assert(
+      message === "Invalid MCP_CLIENT_KEYS configuration",
+      "invalid registry did not fail closed with a generic error",
+    );
+    assert(
+      !message.includes(digestA) && !message.includes("fixture-legacy-key"),
+      "configuration error leaked credential material",
+    );
+  }
+});
+
+Deno.test("legacy-only authentication remains unchanged", async () => {
+  const legacyKey = "fixture-legacy-only-key";
+  const config = parseAuthConfig(undefined, legacyKey);
+  assert(config.mode === "legacy", "legacy mode was not selected");
+  assert(
+    (await authenticateRequest(
+      new Headers({ "x-brain-key": legacyKey }),
+      config,
+    )).authenticated,
+    "legacy x-brain-key was rejected",
+  );
+  assert(
+    (await authenticateRequest(
+      new Headers({ authorization: `Bearer ${legacyKey}` }),
+      config,
+    )).authenticated,
+    "legacy bearer key was rejected",
+  );
+  assert(
+    !(await authenticateRequest(
+      new Headers({ "x-brain-key": `${legacyKey}-unknown` }),
+      config,
+    )).authenticated,
+    "unknown legacy key was accepted",
+  );
+  assert(
+    !(await authenticateRequest(new Headers(), parseAuthConfig(undefined, "")))
+      .authenticated,
+    "empty legacy configuration did not fail closed",
+  );
+});
+
+Deno.test("configured CORS is exact and absent configuration keeps wildcard", () => {
+  const wildcard = corsHeadersForOrigin(
+    undefined,
+    parseAllowedOrigins(undefined),
+  );
+  assert(
+    wildcard["Access-Control-Allow-Origin"] === "*" && !wildcard.Vary,
+    "absent CORS configuration did not preserve wildcard behavior",
+  );
+
+  const allowedOrigins = parseAllowedOrigins(
+    "https://client-a.example, https://client-b.example",
+  );
+  const allowed = corsHeadersForOrigin(
+    "https://client-a.example",
+    allowedOrigins,
+  );
+  const denied = corsHeadersForOrigin(
+    "https://CLIENT-a.example",
+    allowedOrigins,
+  );
+  const missing = corsHeadersForOrigin(undefined, allowedOrigins);
+  assert(
+    allowed["Access-Control-Allow-Origin"] === "https://client-a.example" &&
+      allowed.Vary === "Origin",
+    "allowed exact origin was not echoed",
+  );
+  assert(
+    !denied["Access-Control-Allow-Origin"] && denied.Vary === "Origin",
+    "denied origin received an allow-origin header",
+  );
+  assert(
+    !missing["Access-Control-Allow-Origin"] && missing.Vary === "Origin",
+    "missing origin received an allow-origin header",
   );
 });
 
