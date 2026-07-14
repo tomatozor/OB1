@@ -107,6 +107,54 @@ The default invocation sends no write-back. A reviewed automatic invocation
 creates one evidence-only, pending-review `work_log` with an idempotency key
 derived from the session id.
 
+## Enforcement & measurement
+
+### Rule 9 — fail open, measure the outcome
+
+The Claude Code `SessionStart` hook is runtime enforcement: Claude Code runs
+it automatically at session start. It attempts the deterministic
+`recall_context` request once plus up to two timeout retries, logs a compact
+timestamped success or failure record in `~/.local/state/openbrain/recall.log`,
+and always exits `0` so an unavailable recall service never blocks a session.
+Codex CLI has no equivalent automatic hook; its `AGENTS.md` block requires a
+first-turn self-check and the explicit phrase `recall non effectué` if recall
+was missed.
+
+Server evidence measures the outcome across both clients. With a local,
+uncommitted service-role env file:
+
+```dotenv
+OPEN_BRAIN_URL=https://YOUR_PROJECT_REF.supabase.co
+OPEN_BRAIN_SERVICE_KEY=replace-locally
+# Optional: limits Agent Memory rows and recall traces to one workspace.
+OPEN_BRAIN_WORKSPACE=default
+```
+
+run:
+
+```bash
+node examples/recall-coverage.mjs --env-file .env.openbrain --days 7 --min-coverage 0.8
+```
+
+The script reads only PostgREST rows and prints aggregate counts plus JSON; it
+never prints memory, query, or recap content. It counts captured sessions as
+`thoughts.type=session_recap` plus `agent_memories.memory_type=work_log`, and
+reads persisted recalls from `agent_memory_recall_traces`. Coverage is:
+
+```text
+UTC capture dates with at least one persisted recall trace
+----------------------------------------------------------
+all UTC capture dates
+```
+
+The command exits non-zero when the ratio is below `--min-coverage` (default
+`0.8`), and lists the capture dates without a recall trace. The deployed v2
+server persists Agent Memory `memory_recall` traces; `recall_context` currently
+emits application observability but does not insert this table. Therefore the
+coverage gate is a conservative, measurable floor rather than proof of every
+unpersisted `recall_context` call. Pair it with Claude's local `recall.log`
+when auditing hook enforcement.
+
 ## Install by Client
 
 ### Claude Code

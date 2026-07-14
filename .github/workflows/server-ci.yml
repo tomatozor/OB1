@@ -46,6 +46,9 @@ jobs:
       - name: Run complete server harness
         run: bash server/tests/run-all.sh
 
+      - name: Validate deployment entrypoint
+        run: bash -n server/scripts/deploy.sh
+
       - name: Verify deterministic canonical Edge builds
         shell: bash
         run: |
@@ -54,6 +57,7 @@ jobs:
           out_b=".edge-build/ci-b"
           node scripts/build-edge-deploy.mjs --out "${out_a}"
           node scripts/build-edge-deploy.mjs --out "${out_b}"
+          deno check --no-lock --config "${out_a}/deno.json" "${out_a}/index.ts"
           diff --recursive --brief "${out_a}" "${out_b}"
           cmp server/index.ts "${out_a}/index.ts"
           cmp server/deno.json "${out_a}/deno.json"

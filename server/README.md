@@ -1,8 +1,19 @@
 # Open Brain MCP server v2
 
 This stateless MCP endpoint authenticates requests only with `x-brain-key` or
-`Authorization: Bearer <key>`. URL query parameters are never accepted for
-authentication.
+`Authorization: Bearer <key>` by default. A URL `?key=` credential is accepted
+only when the operator explicitly sets `MCP_ALLOW_QUERY_KEY=true`; this
+compatibility mode is disabled by default because URLs commonly leak to logs and
+history.
+
+Operator references:
+
+- [`SECURITY.md`](./SECURITY.md): versioned A6.3 security audit, threat model,
+  residual risks, and prioritized hardening work.
+- [`KEY-ROTATION.md`](./KEY-ROTATION.md): zero-downtime multi-client rotation,
+  legacy/query-key and reviewer-key procedures, and post-rotation probes.
+- [`scripts/deploy.sh`](./scripts/deploy.sh): fail-closed one-command canonical
+  build, verification, and deployment.
 
 ## Authentication and CORS
 
@@ -69,6 +80,19 @@ be a child of `.edge-build/`; the build root itself, external paths, protected
 repository/server paths, and symlinked destinations are refused. Building is
 not deployment: the command has no network behavior and does not contact or
 modify Supabase.
+
+Deploy the canonical server in one command (build, generated-artifact check,
+complete test suite, then Supabase deployment):
+
+```sh
+cd server
+bash scripts/deploy.sh --project-ref YOUR_PROJECT_REF
+```
+
+Add `--with-agent-memory` to deploy `integrations/agent-memory-api` in the same
+operation. Add `--dry-run` to perform every local gate and stop before any
+Supabase command. The project ref can be omitted when the repository is already
+linked with the Supabase CLI.
 
 ## MCP annotations and recall observability
 

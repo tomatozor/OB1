@@ -1,7 +1,10 @@
 ## Open Brain deterministic recall
 
 At the first turn of every session, always call the Open Brain MCP v2 tool
-`recall_context` before doing substantive work. Use these exact defaults unless
+`recall_context` before doing substantive work. Before sending the first
+substantive response, self-check that this happened. If it did not, state
+explicitly in that response: **"recall non effectué"**, then apply the
+transitional availability policy below. Use these exact defaults unless
 the user explicitly asks for a narrower scope:
 
 ```json
@@ -58,3 +61,19 @@ Apply this transitional policy, in order:
 Recall is mandatory before substantive work; never write back sensitive data
 automatically. Once the v2 server is deployed, step 1 applies without any
 edit to this file.
+
+### Coverage audit
+
+When PostgREST service credentials are available, measure the runtime outcome
+rather than relying on this instruction alone:
+
+```bash
+node examples/recall-coverage.mjs --env-file .env.openbrain --days 7 --min-coverage 0.8
+```
+
+The report counts legacy `thoughts` with `type=session_recap`, Agent Memory
+`work_log` captures, and persisted `agent_memory_recall_traces`. Its coverage
+is the share of UTC dates with a capture that also have at least one persisted
+recall trace. `recall_context` currently has application-level observability,
+but does not itself write `agent_memory_recall_traces`; do not claim that this
+script proves those unpersisted calls.
