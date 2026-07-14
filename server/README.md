@@ -36,6 +36,50 @@ authentication.
   `deleted_by`, and writes a best-effort audit event when `thought_audit`
   exists. It never performs a database delete.
 
+## Agent Memory
+
+The MCP v2 server exposes the runtime-neutral Agent Memory sidecars from
+[`schemas/agent-memory`](../schemas/agent-memory/). These tools require that
+schema to be installed. A missing sidecar table (PostgREST 404 / `PGRST205`)
+returns `Agent Memory schema not installed — see schemas/agent-memory`; the
+server never substitutes core `thoughts` behavior or silently skips the write.
+
+- `memory_recall(workspace_id, query?, project_id?, channel_id?, task_type?, entities?, limits?{max_results, recency_days, max_tokens}, restrict_scope?)`
+  recalls only memories visible inside the requested workspace and context,
+  then writes `agent_memory_recall_traces`, `agent_memory_recall_items`, and
+  audit events. A non-empty `query` uses the live three-argument
+  `match_thoughts` RPC and ranks semantic candidates first. Without `query`,
+  ordering is deterministic: `confidence DESC`, newest of
+  `last_confirmed_at/created_at DESC`, then `id ASC`. `restrict_scope` is an
+  exact visibility filter and therefore only narrows the otherwise eligible
+  set. Token budgeting is the same hard-prefix estimate as the Agent Memory
+  API: `ceil((summary characters + content characters) / 4)`.
+- `memory_writeback(workspace_id, idempotency_key, memory{type, summary, content, visibility?, project_id?, channel_id?}, provenance{status, source_refs?}, created_by?)`
+  accepts only `observed`, `inferred`, or `generated` provenance. Every row is
+  created with `can_use_as_instruction=false`, `can_use_as_evidence=true`,
+  `requires_user_confirmation=true`, and `review_status=pending`. Idempotency
+  is scoped by `(workspace_id, idempotency_key)`; identical canonical content
+  returns the existing row, while changed content is rejected.
+- `memory_usage_report(request_id, used_memory_ids, ignored?{memory_id, reason}[])`
+  validates the complete report against the trace before updating any recall
+  item. A memory outside the trace is rejected.
+- `memory_review_queue(workspace_id, limit=20, offset=0)` returns pending rows
+  oldest first with `has_more` pagination.
+- `memory_review(memory_id, workspace_id, action, actor_id, notes?, related_memory_id?, content?, summary?, visibility?)`
+  performs logical review transitions only. Actions are `approve` (an alias
+  persisted as REST `confirm`), `confirm`, `edit`, `evidence_only`,
+  `restrict_scope`, `mark_stale`, `merge`, `reject`, `dispute`, and
+  `supersede`. Lifecycle actions require notes; merge/supersede require a
+  related memory in the same workspace; edit requires content or summary; and
+  `restrict_scope` follows the monotone
+  `workspace -> project -> channel -> personal` order. No action deletes a
+  database row.
+
+Because this MCP surface has no caller-supplied runtime field, personal scope
+is bound to the stable runtime identity `open-brain-mcp-v2`. Project and channel
+dimensions retain the exact contextual matching rules documented by the Agent
+Memory REST API.
+
 Restricted thoughts are excluded from reads unless the tool explicitly accepts
 and receives `include_restricted=true`. Logically deleted thoughts are excluded
 from search, fetch, list, recall, and related-thought results whether

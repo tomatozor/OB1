@@ -11,6 +11,10 @@ const ATOMIC_CAPTURE_ID = "22222222-2222-4222-8222-222222222222";
 const LEGACY_CAPTURE_ID = "33333333-3333-4333-8333-333333333333";
 const ATOMIC_DELETE_ID = "44444444-4444-4444-8444-444444444444";
 const FALLBACK_DELETE_ID = "55555555-5555-4555-8555-555555555555";
+const MEMORY_A_ID = "66666666-6666-4666-8666-666666666666";
+const MEMORY_B_ID = "77777777-7777-4777-8777-777777777777";
+const MEMORY_PENDING_ID = "88888888-8888-4888-8888-888888888888";
+const MEMORY_OUTSIDE_TRACE_ID = "99999999-9999-4999-8999-999999999999";
 
 Deno.env.set("SUPABASE_URL", "http://postgrest.invalid");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
@@ -20,6 +24,111 @@ Deno.env.set("MCP_ACCESS_KEY", ACCESS_KEY);
 
 type MockRequest = { method: string; url: string; body: string };
 const requests: MockRequest[] = [];
+let memorySequence = 10;
+let traceSequence = 20;
+const agentMemories: Array<Record<string, any>> = [
+  {
+    id: MEMORY_A_ID,
+    thought_id: "semantic-visible",
+    workspace_id: "workspace-a",
+    project_id: null,
+    channel_id: null,
+    visibility: "workspace",
+    memory_type: "decision",
+    summary: "Workspace A decision",
+    content: "Workspace A private decision",
+    lifecycle_status: "active",
+    provenance_status: "observed",
+    confidence: 0.9,
+    created_by: "agent",
+    runtime_name: "open-brain-mcp-v2",
+    can_use_as_instruction: false,
+    can_use_as_evidence: true,
+    requires_user_confirmation: false,
+    review_status: "evidence_only",
+    last_confirmed_at: null,
+    stale_after: null,
+    idempotency_key: "seed-a",
+    content_hash: "seed-a-hash",
+    metadata: {},
+    created_at: "2026-07-12T00:00:00.000Z",
+  },
+  {
+    id: MEMORY_B_ID,
+    thought_id: "semantic-visible",
+    workspace_id: "workspace-b",
+    project_id: null,
+    channel_id: null,
+    visibility: "workspace",
+    memory_type: "decision",
+    summary: "Workspace B decision",
+    content: "Workspace B must never cross the boundary",
+    lifecycle_status: "active",
+    provenance_status: "observed",
+    confidence: 1,
+    created_by: "agent",
+    runtime_name: "open-brain-mcp-v2",
+    can_use_as_instruction: false,
+    can_use_as_evidence: true,
+    requires_user_confirmation: false,
+    review_status: "evidence_only",
+    last_confirmed_at: null,
+    stale_after: null,
+    idempotency_key: "seed-b",
+    content_hash: "seed-b-hash",
+    metadata: {},
+    created_at: "2026-07-13T00:00:00.000Z",
+  },
+  {
+    id: MEMORY_PENDING_ID,
+    thought_id: "semantic-visible",
+    workspace_id: "workspace-a",
+    project_id: null,
+    channel_id: null,
+    visibility: "workspace",
+    memory_type: "lesson",
+    summary: "Pending memory",
+    content: "Pending memories are review-only until accepted",
+    lifecycle_status: "active",
+    provenance_status: "generated",
+    confidence: 0.7,
+    created_by: "agent",
+    runtime_name: "open-brain-mcp-v2",
+    can_use_as_instruction: false,
+    can_use_as_evidence: true,
+    requires_user_confirmation: true,
+    review_status: "pending",
+    last_confirmed_at: null,
+    stale_after: null,
+    idempotency_key: "seed-pending",
+    content_hash: "seed-pending-hash",
+    metadata: {},
+    created_at: "2026-07-11T00:00:00.000Z",
+  },
+];
+const recallTraces: Array<Record<string, any>> = [];
+const recallItems: Array<Record<string, any>> = [];
+const memoryAuditEvents: Array<Record<string, any>> = [];
+
+function eqFilter(url: URL, key: string): string | undefined {
+  const value = url.searchParams.get(key);
+  return value?.startsWith("eq.") ? value.slice(3) : undefined;
+}
+
+function postgrestRows(
+  request: Request,
+  rows: Array<Record<string, any>>,
+  status = 200,
+): Response {
+  if (request.headers.get("accept")?.includes("application/vnd.pgrst.object")) {
+    if (rows.length === 1) return json(status, rows[0]);
+    return json(406, {
+      code: "PGRST116",
+      message: "JSON object requested, multiple (or no) rows returned",
+    });
+  }
+  return json(status, rows);
+}
 
 function json(status: number, value: unknown): Response {
   return new Response(JSON.stringify(value), {
@@ -145,6 +254,175 @@ globalThis.fetch = (async (
   }
   if (rpc === "brain_stats_aggregate") {
     return json(200, { total: 7, types: { idea: 7 } });
+  }
+
+  if (
+    url.pathname.startsWith("/rest/v1/agent_memor") &&
+    request.url.includes("schema-absent")
+  ) {
+    const table = url.pathname.split("/").at(-1);
+    return json(404, {
+      code: "PGRST205",
+      message: `Could not find the table public.${table} in the schema cache`,
+    });
+  }
+
+  if (url.pathname === "/rest/v1/agent_memories") {
+    if (request.method === "GET") {
+      let rows = [...agentMemories];
+      for (
+        const key of [
+          "workspace_id",
+          "idempotency_key",
+          "id",
+          "review_status",
+          "thought_id",
+        ]
+      ) {
+        const expected = eqFilter(url, key);
+        if (expected !== undefined) {
+          rows = rows.filter((row) => String(row[key] ?? "") === expected);
+        }
+      }
+      const thoughtIds = url.searchParams.get("thought_id");
+      if (thoughtIds?.startsWith("in.(")) {
+        const allowed = new Set(
+          thoughtIds.slice(4, -1).split(",").map(decodeURIComponent),
+        );
+        rows = rows.filter((row) => allowed.has(row.thought_id));
+      }
+      const order = url.searchParams.get("order") ?? "";
+      if (order.includes("created_at.asc")) {
+        rows.sort((a, b) =>
+          a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)
+        );
+      } else {
+        rows.sort((a, b) =>
+          Number(b.confidence) - Number(a.confidence) ||
+          b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id)
+        );
+      }
+      const range = request.headers.get("range")?.split("-").map(Number);
+      if (range?.length === 2 && range.every(Number.isFinite)) {
+        rows = rows.slice(range[0], range[1] + 1);
+      }
+      const limit = Number(url.searchParams.get("limit"));
+      if (Number.isFinite(limit) && limit > 0) rows = rows.slice(0, limit);
+      return postgrestRows(request, rows);
+    }
+    if (request.method === "POST") {
+      const payload = JSON.parse(rawBody);
+      const input = Array.isArray(payload) ? payload[0] : payload;
+      if (
+        agentMemories.some((row) =>
+          row.workspace_id === input.workspace_id &&
+          row.idempotency_key === input.idempotency_key
+        )
+      ) {
+        return json(409, {
+          code: "23505",
+          message: "duplicate key value violates unique constraint",
+        });
+      }
+      memorySequence++;
+      const row = {
+        lifecycle_status: "active",
+        created_at: `2026-07-14T00:00:${
+          String(memorySequence).padStart(2, "0")
+        }.000Z`,
+        ...input,
+        id: `aaaaaaaa-aaaa-4aaa-8aaa-${
+          String(memorySequence).padStart(12, "0")
+        }`,
+      };
+      agentMemories.push(row);
+      return postgrestRows(request, [row], 201);
+    }
+    if (request.method === "PATCH") {
+      const payload = JSON.parse(rawBody);
+      const id = eqFilter(url, "id");
+      const workspace = eqFilter(url, "workspace_id");
+      const rows = agentMemories.filter((row) =>
+        (!id || row.id === id) && (!workspace || row.workspace_id === workspace)
+      );
+      rows.forEach((row) => Object.assign(row, payload));
+      return postgrestRows(request, rows);
+    }
+  }
+
+  if (url.pathname === "/rest/v1/agent_memory_recall_traces") {
+    if (request.method === "POST") {
+      traceSequence++;
+      const payload = JSON.parse(rawBody);
+      const row = {
+        ...payload,
+        id: `bbbbbbbb-bbbb-4bbb-8bbb-${
+          String(traceSequence).padStart(12, "0")
+        }`,
+        request_id: `cccccccc-cccc-4ccc-8ccc-${
+          String(traceSequence).padStart(12, "0")
+        }`,
+        created_at: "2026-07-14T00:00:00.000Z",
+      };
+      recallTraces.push(row);
+      return postgrestRows(request, [row], 201);
+    }
+    if (request.method === "GET") {
+      let rows = [...recallTraces];
+      const requestId = eqFilter(url, "request_id");
+      if (requestId) rows = rows.filter((row) => row.request_id === requestId);
+      return postgrestRows(request, rows);
+    }
+  }
+
+  if (url.pathname === "/rest/v1/agent_memory_recall_items") {
+    if (request.method === "POST") {
+      const payload = JSON.parse(rawBody);
+      for (const item of Array.isArray(payload) ? payload : [payload]) {
+        recallItems.push({
+          ...item,
+          id: `dddddddd-dddd-4ddd-8ddd-${
+            String(recallItems.length + 1).padStart(12, "0")
+          }`,
+        });
+      }
+      return json(201, []);
+    }
+    if (request.method === "GET") {
+      let rows = [...recallItems];
+      const traceId = eqFilter(url, "trace_id");
+      if (traceId) rows = rows.filter((row) => row.trace_id === traceId);
+      return postgrestRows(request, rows);
+    }
+    if (request.method === "PATCH") {
+      const payload = JSON.parse(rawBody);
+      const traceId = eqFilter(url, "trace_id");
+      const memoryId = eqFilter(url, "memory_id");
+      const rows = recallItems.filter((row) =>
+        (!traceId || row.trace_id === traceId) &&
+        (!memoryId || row.memory_id === memoryId)
+      );
+      rows.forEach((row) => Object.assign(row, payload));
+      return postgrestRows(request, rows);
+    }
+  }
+
+  if (url.pathname === "/rest/v1/agent_memory_audit_events") {
+    if (request.method === "POST") {
+      const payload = JSON.parse(rawBody);
+      memoryAuditEvents.push(...(Array.isArray(payload) ? payload : [payload]));
+      return json(201, []);
+    }
+  }
+
+  if (
+    [
+      "/rest/v1/agent_memory_source_refs",
+      "/rest/v1/agent_memory_review_actions",
+      "/rest/v1/agent_memory_relations",
+    ].includes(url.pathname) && request.method === "POST"
+  ) {
+    return json(201, []);
   }
 
   if (url.pathname === "/rest/v1/thought_edges" && request.method === "GET") {
@@ -310,6 +588,11 @@ const expectedTools = [
   "capture_thought",
   "update_thought",
   "delete_thought",
+  "memory_recall",
+  "memory_writeback",
+  "memory_usage_report",
+  "memory_review_queue",
+  "memory_review",
 ].sort();
 
 let passed = 0;
@@ -395,7 +678,7 @@ assert(
   JSON.stringify(
     tools.body?.result.tools.map((tool: { name: string }) => tool.name).sort(),
   ) === JSON.stringify(expectedTools),
-  "tools/list contains exactly the ten v2 tools",
+  "tools/list contains exactly the fifteen v2 tools",
 );
 
 console.log("\n[2] Deterministic and filtered tool contracts");
@@ -571,7 +854,147 @@ assert(
   "delete_thought confirm gate runs before the RPC",
 );
 
-console.log("\n[3] Atomic mutation RPCs and signaled compatibility fallbacks");
+console.log("\n[3] Agent Memory governance and sidecar contracts");
+const memoryRecall = await mcp("tools/call", {
+  name: "memory_recall",
+  arguments: { workspace_id: "workspace-a" },
+});
+const memoryRecallResult = toolResult(memoryRecall.body!);
+assert(
+  memoryRecall.body?.result?.isError !== true &&
+    memoryRecallResult.memories.map((row: { id: string }) => row.id).join(
+        ",",
+      ) ===
+      MEMORY_A_ID,
+  "memory_recall enforces workspace isolation and excludes pending review",
+);
+assert(
+  typeof memoryRecallResult.request_id === "string" &&
+    recallTraces.some((trace) =>
+      trace.request_id === memoryRecallResult.request_id
+    ),
+  "memory_recall persists and returns a recall request_id",
+);
+assert(
+  recallItems.some((item) =>
+    item.memory_id === MEMORY_A_ID &&
+    recallTraces.some((trace) => trace.id === item.trace_id)
+  ),
+  "memory_recall persists returned recall items",
+);
+
+const writebackArguments = {
+  workspace_id: "workspace-a",
+  idempotency_key: "writeback-idempotency-test",
+  memory: {
+    type: "lesson",
+    summary: "Idempotent lesson",
+    content: "A compact reusable operational lesson.",
+  },
+  provenance: { status: "generated" },
+};
+const writebackOne = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: writebackArguments,
+});
+const writebackTwo = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: writebackArguments,
+});
+const writebackOneResult = toolResult(writebackOne.body!);
+const writebackTwoResult = toolResult(writebackTwo.body!);
+assert(
+  writebackOneResult.memory.id === writebackTwoResult.memory.id &&
+    writebackOneResult.idempotent_replay === false &&
+    writebackTwoResult.idempotent_replay === true,
+  "memory_writeback replays identical workspace-scoped idempotency keys",
+);
+const writtenMemory = agentMemories.find((row) =>
+  row.id === writebackOneResult.memory.id
+);
+assert(
+  writtenMemory?.can_use_as_instruction === false &&
+    writtenMemory?.can_use_as_evidence === true &&
+    writtenMemory?.requires_user_confirmation === true &&
+    writtenMemory?.review_status === "pending",
+  "memory_writeback always starts evidence-only and pending review",
+);
+const writebackConflict = await mcp("tools/call", {
+  name: "memory_writeback",
+  arguments: {
+    ...writebackArguments,
+    memory: {
+      ...writebackArguments.memory,
+      content: "Changed content under a reused idempotency key.",
+    },
+  },
+});
+assert(
+  writebackConflict.body?.result?.isError === true &&
+    writebackConflict.body.result.content[0].text.includes(
+      "already used with different content",
+    ),
+  "memory_writeback rejects changed content under a reused key",
+);
+
+const usageOutsideTrace = await mcp("tools/call", {
+  name: "memory_usage_report",
+  arguments: {
+    request_id: memoryRecallResult.request_id,
+    used_memory_ids: [MEMORY_OUTSIDE_TRACE_ID],
+  },
+});
+assert(
+  usageOutsideTrace.body?.result?.isError === true &&
+    usageOutsideTrace.body.result.content[0].text.includes(
+      "was not returned by this recall",
+    ),
+  "memory_usage_report rejects memory IDs outside the trace before updates",
+);
+
+const reviewWithoutActor = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "workspace-a",
+    action: "approve",
+  },
+});
+assert(
+  reviewWithoutActor.body?.result?.isError === true,
+  "memory_review requires actor_id at the MCP schema boundary",
+);
+
+const approvedMemory = await mcp("tools/call", {
+  name: "memory_review",
+  arguments: {
+    memory_id: MEMORY_PENDING_ID,
+    workspace_id: "workspace-a",
+    action: "approve",
+    actor_id: "reviewer-1",
+  },
+});
+assert(
+  approvedMemory.body?.result?.isError !== true &&
+    toolResult(approvedMemory.body!).memory.can_use_as_instruction === true &&
+    agentMemories.find((row) => row.id === MEMORY_PENDING_ID)?.review_status ===
+      "confirmed",
+  "memory_review maps approve to confirm and promotes instruction use",
+);
+
+const schemaAbsent = await mcp("tools/call", {
+  name: "memory_review_queue",
+  arguments: { workspace_id: "schema-absent" },
+});
+assert(
+  schemaAbsent.body?.result?.isError === true &&
+    schemaAbsent.body.result.content[0].text.includes(
+      "Agent Memory schema not installed — see schemas/agent-memory",
+    ),
+  "missing Agent Memory tables return the explicit installation error",
+);
+
+console.log("\n[4] Atomic mutation RPCs and signaled compatibility fallbacks");
 const beforeAtomicCapture = requests.length;
 const atomicCapture = await mcp("tools/call", {
   name: "capture_thought",
