@@ -42,7 +42,6 @@ FROM YOUR OPEN BRAIN SETUP
 
 GENERATED DURING SETUP
   Agent Memory API URL:       ____________
-  Agent Memory API URL + key: ____________
 
 --------------------------------------
 ```
@@ -55,6 +54,9 @@ Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql)
 
 **Done when:** the `agent_memories` and `agent_memory_recall_traces` tables exist.
 
+> [!CAUTION]
+> Production installation is gated. Apply and verify the schema twice in a local or staging database before enabling write-back against production. The schema creates eight new sidecar tables; it does not alter `thoughts`.
+
 ![Step 2](https://img.shields.io/badge/Step_2-Deploy_the_Edge_Function-1E88E5?style=for-the-badge)
 
 Copy this folder into your Supabase project:
@@ -66,12 +68,18 @@ cp integrations/agent-memory-api/deno.json supabase/functions/agent-memory-api/d
 supabase functions deploy agent-memory-api --no-verify-jwt
 ```
 
+The `--no-verify-jwt` flag delegates authentication to this function's mandatory `MCP_ACCESS_KEY` check. That check accepts only `x-brain-key` or `Authorization: Bearer`; it does not accept URL query credentials. Do not deploy until the schema gate above has passed.
+
+If the Supabase project already declares `verify_jwt = false` for this function in `supabase/config.toml`, the equivalent deployment command is `supabase functions deploy agent-memory-api`.
+
 **Done when:** `supabase functions list` shows `agent-memory-api` as active.
 
 ![Step 3](https://img.shields.io/badge/Step_3-Test_Health-1E88E5?style=for-the-badge)
 
 ```bash
-curl "https://YOUR_PROJECT_REF.supabase.co/functions/v1/agent-memory-api/health?key=YOUR_MCP_ACCESS_KEY"
+curl \
+  -H "x-brain-key: YOUR_MCP_ACCESS_KEY" \
+  "https://YOUR_PROJECT_REF.supabase.co/functions/v1/agent-memory-api/health"
 ```
 
 **Done when:** the response includes `"ok": true`.
@@ -99,6 +107,29 @@ The API accepts the runtime-neutral core schema versions and the OpenClaw launch
 | `/memories/:id/review` | PATCH | Confirm, edit, reject, restrict, stale, dispute, or supersede |
 | `/recall-traces/:request_id` | GET | Debug what was recalled and how it was used |
 
+Every endpoint except the CORS preflight requires one of these supported header credentials:
+
+```text
+x-brain-key: YOUR_MCP_ACCESS_KEY
+Authorization: Bearer YOUR_MCP_ACCESS_KEY
+```
+
+Credentials in `?key=...` are rejected so they cannot leak into URL, proxy, CDN, or function logs. Header credentials are compared in constant time. JSON request bodies are capped at 64 KiB.
+
+`POST /writeback` requires `idempotency_key`. The server computes a SHA-256 `content_hash` for every generated memory row and a canonical request hash for the complete row set. The canonical bytes are the UTF-8 compact JSON encoding of the ordered `[{"memory_type":"...","content":"..."}]` rows produced by the request. Reusing the same key in the same workspace returns the existing rows only when both hashes match; changed content returns `409`. A caller may send that canonical request hash in `content_hash` for end-to-end verification.
+
+Agent write-back accepts only `observed`, `inferred`, or `generated` provenance and always starts as evidence: `can_use_as_instruction=false`, `can_use_as_evidence=true`, `requires_user_confirmation=true`, and `review_status=pending`. Human confirmation through the review endpoint is the only API path that promotes a row to instruction-grade. Trusted bulk imports need a separately approved import path; this endpoint does not silently promote them.
+
+Lifecycle-changing review actions (`mark_stale`, `merge`, `reject`, `dispute`, and `supersede`) require a reviewer identity and notes. `merge` and `supersede` also require a related memory in the same workspace. These actions update `lifecycle_status`; there is no physical-delete endpoint. Every review action and recall/writeback event is persisted in the audit trail.
+
+The recall adapter deliberately calls the live three-argument RPC signature:
+
+```text
+match_thoughts(query_embedding, match_threshold, match_count)
+```
+
+No optional `filter` argument is assumed. Workspace, project, lifecycle, review, visibility, and use-policy filtering is applied to the matched Agent Memory rows after semantic retrieval.
+
 ## Expected Outcome
 
 An agent runtime can recall relevant context, write back compact memories, and leave a trace that explains what happened. Unsafe write-backs are blocked before durable storage.
@@ -107,7 +138,15 @@ The trust model is documented in [Safe Agent Memory and Provenance](../../docs/s
 
 ## Smoke Harness
 
-Use the live smoke harness after deploying the Edge Function or rotating secrets:
+Run the protocol-only local smoke test before deployment. It exercises the exported Deno handler with non-secret local placeholders and never calls Supabase or OpenRouter:
+
+```bash
+deno run --allow-env test/smoke-local.mjs
+```
+
+It verifies missing-header rejection, query-only credential rejection, both supported auth headers, required idempotency, malformed JSON, and the 64 KiB request limit.
+
+Use the live smoke harness only after the production/staging installation gate and an intentional deployment or secret rotation:
 
 ```bash
 OB1_AGENT_MEMORY_ENDPOINT="https://YOUR_PROJECT_REF.supabase.co/functions/v1/agent-memory-api" \
@@ -134,7 +173,7 @@ The default mode is dry-run. Add `--apply` to mark matching active test memories
 ## Troubleshooting
 
 **Issue: `Invalid or missing access key`**
-Solution: Confirm the request includes `?key=...` or `x-brain-key`.
+Solution: Send `x-brain-key` or `Authorization: Bearer`. Query-string credentials are intentionally rejected.
 
 **Issue: recall returns no memories**
 Solution: Confirm write-back has created `agent_memories`, and that those memories are confirmed or `include_unconfirmed` is true.

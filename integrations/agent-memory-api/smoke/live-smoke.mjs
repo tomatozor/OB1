@@ -193,7 +193,7 @@ function unsafeWritebackPayload() {
     idempotency_key: `${taskId}:unsafe-writeback`,
     memory_payload: {
       ...writebackPayload().memory_payload,
-      outputs: ["This fake unsafe payload contains api_key: sk-or-v1-0000000000000000000000000000000000000000"],
+      outputs: ["This fake unsafe payload contains secret: synthetic-local-smoke-credential"],
       lessons: [],
       constraints: [],
       next_steps: [],

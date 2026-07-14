@@ -82,8 +82,8 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
   ),
   last_confirmed_at TIMESTAMPTZ,
   stale_after TIMESTAMPTZ,
-  idempotency_key TEXT,
-  content_hash TEXT,
+  idempotency_key TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -94,14 +94,23 @@ CREATE TABLE IF NOT EXISTS public.agent_memories (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memories_idempotency_key
-  ON public.agent_memories (idempotency_key)
-  WHERE idempotency_key IS NOT NULL;
+  ON public.agent_memories (workspace_id, idempotency_key);
 
 CREATE INDEX IF NOT EXISTS idx_agent_memories_scope
   ON public.agent_memories (workspace_id, project_id, visibility);
 
+CREATE INDEX IF NOT EXISTS idx_agent_memories_workspace_created
+  ON public.agent_memories (workspace_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memories_thought
+  ON public.agent_memories (thought_id)
+  WHERE thought_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_agent_memories_review
   ON public.agent_memories (review_status, lifecycle_status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memories_lifecycle
+  ON public.agent_memories (lifecycle_status, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_agent_memories_runtime_task
   ON public.agent_memories (runtime_name, task_id, flow_id);
@@ -249,6 +258,43 @@ CREATE TABLE IF NOT EXISTS public.agent_memory_audit_events (
 CREATE INDEX IF NOT EXISTS idx_agent_memory_audit_scope
   ON public.agent_memory_audit_events (workspace_id, project_id, created_at DESC);
 
+CREATE OR REPLACE FUNCTION public.agent_memory_audit_lifecycle_change()
+RETURNS TRIGGER AS $$
+DECLARE
+  lifecycle_event TEXT;
+BEGIN
+  IF NEW.lifecycle_status IS DISTINCT FROM OLD.lifecycle_status
+    AND NEW.lifecycle_status IN ('stale', 'superseded', 'disputed', 'rejected') THEN
+    lifecycle_event := CASE NEW.lifecycle_status
+      WHEN 'superseded' THEN 'memory_superseded'
+      WHEN 'disputed' THEN 'memory_disputed'
+      WHEN 'rejected' THEN 'memory_rejected'
+      ELSE 'memory_edited'
+    END;
+    INSERT INTO public.agent_memory_audit_events (
+      event_type,
+      workspace_id,
+      project_id,
+      memory_id,
+      actor_kind,
+      payload
+    ) VALUES (
+      lifecycle_event,
+      NEW.workspace_id,
+      NEW.project_id,
+      NEW.id,
+      'system',
+      jsonb_build_object(
+        'source', 'lifecycle_trigger',
+        'previous_lifecycle_status', OLD.lifecycle_status,
+        'lifecycle_status', NEW.lifecycle_status
+      )
+    );
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION public.agent_memories_set_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -257,10 +303,35 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_agent_memories_updated_at ON public.agent_memories;
-CREATE TRIGGER trg_agent_memories_updated_at
-  BEFORE UPDATE ON public.agent_memories
-  FOR EACH ROW EXECUTE FUNCTION public.agent_memories_set_updated_at();
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'trg_agent_memories_updated_at'
+      AND tgrelid = 'public.agent_memories'::regclass
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER trg_agent_memories_updated_at
+      BEFORE UPDATE ON public.agent_memories
+      FOR EACH ROW EXECUTE FUNCTION public.agent_memories_set_updated_at();
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'trg_agent_memory_audit_lifecycle_change'
+      AND tgrelid = 'public.agent_memories'::regclass
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER trg_agent_memory_audit_lifecycle_change
+      AFTER UPDATE OF lifecycle_status ON public.agent_memories
+      FOR EACH ROW EXECUTE FUNCTION public.agent_memory_audit_lifecycle_change();
+  END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION public.agent_memory_hash_text(p_content TEXT)
 RETURNS TEXT
@@ -281,46 +352,48 @@ ALTER TABLE public.agent_memory_recall_traces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_memory_recall_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_memory_audit_events ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS agent_memories_service_role_all ON public.agent_memories;
-CREATE POLICY agent_memories_service_role_all ON public.agent_memories
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
+DO $$
+DECLARE
+  table_name TEXT;
+  policy_name TEXT;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'agent_memories',
+    'agent_memory_source_refs',
+    'agent_memory_artifacts',
+    'agent_memory_relations',
+    'agent_memory_review_actions',
+    'agent_memory_recall_traces',
+    'agent_memory_recall_items',
+    'agent_memory_audit_events'
+  ] LOOP
+    policy_name := table_name || '_service_role_all';
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_policies AS existing_policy
+      WHERE existing_policy.schemaname = 'public'
+        AND existing_policy.tablename = table_name
+        AND existing_policy.policyname = policy_name
+    ) THEN
+      EXECUTE format(
+        'CREATE POLICY %I ON public.%I FOR ALL TO service_role USING (true) WITH CHECK (true)',
+        policy_name,
+        table_name
+      );
+    END IF;
+  END LOOP;
+END $$;
 
-DROP POLICY IF EXISTS agent_memory_source_refs_service_role_all ON public.agent_memory_source_refs;
-CREATE POLICY agent_memory_source_refs_service_role_all ON public.agent_memory_source_refs
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_artifacts_service_role_all ON public.agent_memory_artifacts;
-CREATE POLICY agent_memory_artifacts_service_role_all ON public.agent_memory_artifacts
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_relations_service_role_all ON public.agent_memory_relations;
-CREATE POLICY agent_memory_relations_service_role_all ON public.agent_memory_relations
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_review_actions_service_role_all ON public.agent_memory_review_actions;
-CREATE POLICY agent_memory_review_actions_service_role_all ON public.agent_memory_review_actions
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_recall_traces_service_role_all ON public.agent_memory_recall_traces;
-CREATE POLICY agent_memory_recall_traces_service_role_all ON public.agent_memory_recall_traces
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_recall_items_service_role_all ON public.agent_memory_recall_items;
-CREATE POLICY agent_memory_recall_items_service_role_all ON public.agent_memory_recall_items
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-DROP POLICY IF EXISTS agent_memory_audit_events_service_role_all ON public.agent_memory_audit_events;
-CREATE POLICY agent_memory_audit_events_service_role_all ON public.agent_memory_audit_events
-  FOR ALL TO service_role USING (true) WITH CHECK (true);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memories TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_source_refs TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_artifacts TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_relations TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_review_actions TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_recall_traces TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_recall_items TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_memory_audit_events TO service_role;
+-- The public API exposes lifecycle updates, never physical row deletion.
+-- Accordingly, the service role receives no DELETE grant on these tables.
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memories TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_source_refs TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_artifacts TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_relations TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_review_actions TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_recall_traces TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_recall_items TO service_role;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_memory_audit_events TO service_role;
 GRANT EXECUTE ON FUNCTION public.agent_memory_hash_text(TEXT) TO service_role;
 
 NOTIFY pgrst, 'reload schema';
