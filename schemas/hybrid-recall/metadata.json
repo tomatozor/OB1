@@ -1,0 +1,20 @@
+{
+  "name": "Hybrid Recall and Safe Thought Operations",
+  "description": "Adds reciprocal-rank-fused semantic and full-text recall, atomic capture, source backfill, logical deletion, append-only audit, and exact thought statistics.",
+  "category": "schemas",
+  "author": {
+    "name": "Nate B. Jones / OB1",
+    "github": "NateBJones-Projects"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Supabase"],
+    "tools": ["PostgreSQL 16", "pgvector"]
+  },
+  "tags": ["hybrid-search", "rrf", "pgvector", "audit", "deduplication", "soft-delete"],
+  "difficulty": "advanced",
+  "estimated_time": "20 minutes",
+  "created": "2026-07-14",
+  "updated": "2026-07-14"
+}
