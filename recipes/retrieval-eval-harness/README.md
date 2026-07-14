@@ -12,6 +12,27 @@ golden JSONL ──> unmeasured embedding warmup ──> semantic / text / hybri
 
 Do **not** commit a real golden set. Queries, expected thought IDs, and notes can expose personal or confidential information. Store real sets outside this public repository, for example `~/.local/share/ob1/recipes/retrieval-eval-harness/golden.jsonl` or a private `.planning/` path. The committed [`examples/synthetic-golden.jsonl`](examples/synthetic-golden.jsonl) contains only ten fictional cases and fabricated UUIDs.
 
+## Prerequisites
+
+- Node.js 22+ with global `fetch` support.
+- An Open Brain URL and service-role key that can call the documented retrieval
+  RPCs, plus an OpenRouter-compatible embedding API key.
+- A human-curated golden JSONL stored outside this repository; use the
+  synthetic example only to exercise the harness.
+
+## Step-by-step
+
+1. Create an untracked environment file with the URL and API keys shown below.
+2. Build or review a local golden JSONL whose expected IDs were selected by a
+   human.
+3. Run the evaluation and compare modes using the same golden set and database
+   snapshot.
+
+## Expected outcome
+
+The runner prints comparable retrieval metrics and exits non-zero for invalid
+configuration or failed queries by default. It never writes to Open Brain.
+
 ## Run an evaluation
 
 Create a local, untracked env file:
@@ -60,10 +81,11 @@ For each candidate query, use the read-only helper:
 node recipes/retrieval-eval-harness/make-golden.mjs \
   --query "What did we decide about the onboarding pilot?" \
   --candidates 15 \
+  --semantic-weight 1.0 --text-weight 2.0 \
   --env-file ~/.local/share/ob1/recipes/retrieval-eval-harness/.env
 ```
 
-It prints the RRF-fused semantic and text candidates (ID, date, type, source, and the first 140 characters). Review those candidates and write the JSONL line yourself:
+It prints the weighted-RRF-fused semantic and text candidates (ID, date, type, source, and the first 140 characters). Its defaults match `run-eval.mjs`: semantic weight `1.0` and text weight `2.0`; both options must be finite and greater than zero. Review those candidates and write the JSONL line yourself:
 
 ```json
 {"id":"onboarding-decision","query":"What did we decide about the onboarding pilot?","relevant_ids":["00000000-0000-4000-8000-000000000000"],"note":"Human-validated; stored locally."}

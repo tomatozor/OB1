@@ -9,6 +9,29 @@ All backfills are dry-run by default. They never print thought content. Pass a
 simple local environment file with `--env-file path`; each non-comment line is
 `KEY=VALUE` and an already-exported environment value wins.
 
+## Prerequisites
+
+- Node.js 22+ and network access to the intended Open Brain PostgREST API.
+- A local, uncommitted environment file containing `OPEN_BRAIN_URL` and
+  `OPEN_BRAIN_SERVICE_KEY`; embedding apply runs also require an embedding key.
+- Explicit operator approval before adding `--apply`, because it changes
+  records even though every script starts in dry-run mode.
+
+## Step-by-step
+
+1. Create the local environment file and run the relevant script without
+   `--apply` to inspect identifiers, counts, and eligibility.
+2. Review the dry-run output and resolve API or configuration errors before
+   changing records.
+3. Rerun only the intended backfill with `--apply`, then use `verify-stats` or
+   `health-signal` to confirm the operational result.
+
+## Expected outcome
+
+Dry runs make no changes and apply runs report bounded, fail-closed results
+without printing thought content. Non-zero exit codes identify configuration,
+network, API, or apply-work failures for operator follow-up.
+
 ```bash
 node recipes/brain-ops-toolkit/backfill-embeddings.mjs --env-file .env.ob
 node recipes/brain-ops-toolkit/backfill-embeddings.mjs --apply --batch 100 --min-length 5 --env-file .env.ob

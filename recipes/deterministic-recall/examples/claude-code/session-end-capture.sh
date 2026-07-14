@@ -67,7 +67,8 @@ else
     const content = fs.readFileSync(0, "utf8").trim();
     const summary = content.replace(/\s+/g, " ").slice(0, 500);
     const idempotency_key = `session-end:${crypto.createHash("sha256").update(process.env.SESSION_ID_VALUE).digest("hex")}`;
-    const payload = {jsonrpc:"2.0", id:"capture-end", method:"tools/call", params:{name:"memory_writeback", arguments:{workspace_id:process.env.WORKSPACE_ID, idempotency_key, memory:{type:"session_summary", summary, content, visibility:"workspace"}, provenance:{status:"generated"}, created_by:"agent"}}};
+    // Keep this aligned with the memory_writeback memoryTypeSchema enum in server/index.ts.
+    const payload = {jsonrpc:"2.0", id:"capture-end", method:"tools/call", params:{name:"memory_writeback", arguments:{workspace_id:process.env.WORKSPACE_ID, idempotency_key, memory:{type:"work_log", summary, content, visibility:"workspace"}, provenance:{status:"generated"}, created_by:"agent"}}};
     process.stdout.write(JSON.stringify(payload));
   ' <<<"$summary"
 fi | curl --fail-with-body --silent --show-error --max-time 10 --config "$curl_config" -X POST "$OPEN_BRAIN_MCP_URL" --data-binary @-

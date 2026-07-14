@@ -79,10 +79,33 @@ SHA-256 derivation of the session id. The server records generated content as
 evidence-only with `review_status=pending`; the hook does not claim that it was
 confirmed.
 
+### Memory type contract
+
+`memory_writeback.memory.type` must be one of the MCP enum's eight valid
+values: `decision`, `output`, `lesson`, `constraint`, `open_question`,
+`failure`, `artifact_reference`, or `work_log`. The SessionEnd hook writes a
+generated session recap as `work_log`; `session_summary` is not a valid MCP
+type.
+
 `OB_CAPTURE_LEGACY=1` together with `OB_CAPTURE_CONFIRM=auto` switches to
 `capture_thought`. This is a non-governed compatibility path: it does not
 create a pending-review Agent Memory record and must be used only when that
 risk is explicitly accepted. It is never enabled by default.
+
+## Step-by-step SessionEnd verification
+
+1. Run the hook without `OB_CAPTURE_CONFIRM=auto` and provide a non-sensitive
+   summary through `SESSION_SUMMARY`, its first argument, or standard input.
+2. Review the printed proposal and ensure it does not contain credentials,
+   private data, raw transcript content, or hidden reasoning.
+3. Only after that review, rerun the specific invocation with
+   `OB_CAPTURE_CONFIRM=auto` and a stable session id.
+
+## Expected outcome
+
+The default invocation sends no write-back. A reviewed automatic invocation
+creates one evidence-only, pending-review `work_log` with an idempotency key
+derived from the session id.
 
 ## Install by Client
 
