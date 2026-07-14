@@ -7,6 +7,10 @@
 
 BEGIN;
 
+-- Portabilité Supabase : l'extension pgvector vit dans le schéma `extensions`
+-- sur les projets hébergés ; sans ce search_path, `vector(1536)` échoue.
+SET search_path TO public, extensions;
+
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -401,7 +405,7 @@ CREATE OR REPLACE FUNCTION public.agent_memory_writeback_tx(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $agent_memory_writeback_tx$
 DECLARE
   v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
@@ -644,7 +648,7 @@ RETURNS TABLE(memory_id UUID, similarity DOUBLE PRECISION)
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $agent_memory_match$
 DECLARE
   v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
@@ -686,7 +690,7 @@ CREATE OR REPLACE FUNCTION public.agent_memory_writeback_batch_tx(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $agent_memory_writeback_batch_tx$
 DECLARE
   v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
@@ -823,7 +827,7 @@ CREATE OR REPLACE FUNCTION public.agent_memory_review_tx(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = public, extensions, pg_temp
 AS $agent_memory_review_tx$
 DECLARE
   v_workspace_id TEXT := nullif(btrim(p_workspace_id), '');
