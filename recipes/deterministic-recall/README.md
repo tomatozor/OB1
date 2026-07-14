@@ -17,8 +17,8 @@ agent configuration provides one. This recipe standardizes the behavior:
 
 1. **Start:** call `recall_context` with the common defaults.
 2. **Work:** use the result as scoped evidence while doing the task.
-3. **End:** call `capture_thought` with a compact session summary when the
-   session was significant.
+3. **End:** propose a compact session summary for human review. A governed
+   write-back happens only after explicit validation.
 
 `recall_context` is deterministic SQL-only retrieval. With the same explicit
 parameters and unchanged data, it returns the same ordered result: importance
@@ -26,8 +26,8 @@ descending, then `created_at` descending, then `id`.
 
 ## Prerequisites
 
-- A working Open Brain MCP v2 deployment with `recall_context` and
-  `capture_thought` ([setup guide](../../docs/01-getting-started.md)).
+- A working Open Brain MCP v2 deployment with `recall_context` and, for
+  governed write-back, `memory_writeback` ([setup guide](../../docs/01-getting-started.md)).
 - A remote MCP HTTP URL and access key. Send the key in `x-brain-key` or
   `Authorization: Bearer ...`; never put it in a URL.
 - Node.js 18+ and `curl` for the included examples and parity check.
@@ -62,6 +62,28 @@ Write back only a compact summary of decisions, outputs, lessons, constraints,
 unresolved questions, or next steps. Do not write raw transcripts, hidden
 reasoning, credentials, private customer data, or large code blocks.
 
+## Write-back governance
+
+The included SessionEnd hook is safe by default: `OB_CAPTURE_CONFIRM=required`
+means it sends nothing and prints the proposed summary for human validation.
+It rejects common credential and authorization patterns before printing or
+sending, caps a proposed summary at 4,000 characters with an explicit
+truncation note, and never puts the access key in `curl` arguments. Network
+requests have a 10-second timeout.
+
+After a human has reviewed the proposal, set `OB_CAPTURE_CONFIRM=auto` for the
+specific hook invocation. The governed path requires `OB_SESSION_ID`,
+`SESSION_ID`, or `CLAUDE_SESSION_ID`, accepts an optional `OB_WORKSPACE_ID`
+(default `default`), and calls `memory_writeback`. Its idempotency key is a
+SHA-256 derivation of the session id. The server records generated content as
+evidence-only with `review_status=pending`; the hook does not claim that it was
+confirmed.
+
+`OB_CAPTURE_LEGACY=1` together with `OB_CAPTURE_CONFIRM=auto` switches to
+`capture_thought`. This is a non-governed compatibility path: it does not
+create a pending-review Agent Memory record and must be used only when that
+risk is explicitly accepted. It is never enabled by default.
+
 ## Install by Client
 
 ### Claude Code
@@ -87,9 +109,12 @@ Claude Code version in use):
 }
 ```
 
-`SessionEnd` reads `SESSION_SUMMARY`, its first argument, or stdin and sends it
-to `capture_thought`. Keep `OPEN_BRAIN_ACCESS_KEY` in the process environment
-or a local secret manager; do not place it in a committed settings file.
+`SessionEnd` reads `SESSION_SUMMARY`, its first argument, or stdin. By default
+it proposes the capped, non-sensitive summary and sends nothing. After human
+validation, `OB_CAPTURE_CONFIRM=auto` sends it through `memory_writeback`;
+`OB_CAPTURE_LEGACY=1` is the explicitly non-governed `capture_thought`
+fallback. Keep `OPEN_BRAIN_ACCESS_KEY` in the process environment or a local
+secret manager; do not place it in a committed settings file or command line.
 
 ### Codex CLI
 
@@ -124,11 +149,13 @@ or workflow preamble:
 ```text
 At session start, call recall_context with days=30, limit=12,
 min_importance=0. Use the returned memories as scoped evidence. At the end of
-a significant session, call capture_thought with a compact summary of
-decisions, outputs, lessons, constraints, unresolved questions, or next steps.
-Do not store raw transcripts, hidden reasoning, secrets, private customer data,
-or large code blocks. If facts conflict, prefer the most recent one unless the
-server reports supersedes filtering; surface action-changing contradictions.
+a significant session, propose a compact summary for human validation; never
+send it automatically. When a validated write-back is requested, prefer
+memory_writeback with generated provenance and an idempotency key so it starts
+evidence-only and pending review. Do not store raw transcripts, hidden
+reasoning, secrets, private customer data, or large code blocks. If facts
+conflict, prefer the most recent one unless the server reports supersedes
+filtering; surface action-changing contradictions.
 ```
 
 For a client that cannot speak MCP, the advanced Agent Memory API is an option:
@@ -153,15 +180,18 @@ node examples/verify-recall-parity.mjs --env-file .env.recall
 ```
 
 The script calls `recall_context` twice with the same parameters and exits `0`
-only when the returned MCP results are identical. `--help` documents the
-alternative `--url` and `--key` flags.
+only when the returned MCP results are identical. `--key` remains available
+only for compatibility and prints a deprecation warning because command-line
+arguments can expose credentials; use `OPEN_BRAIN_ACCESS_KEY` or
+`MCP_ACCESS_KEY` instead. Requests time out after 10 seconds.
 
 ## Expected Outcome
 
 Every client performs the same initial recall (`days=30`, `limit=12`,
 `min_importance=0`) and can explain which recalled items informed the work.
-Significant sessions leave one compact `capture_thought` summary, while
-secrets and raw traces remain out of the brain.
+Significant sessions produce a human-reviewed proposal; validated governed
+write-backs become evidence-only pending records, while secrets and raw traces
+remain out of the brain.
 
 ## Troubleshooting
 
@@ -178,6 +208,7 @@ change between calls, that both calls use the explicit common defaults, and
 that no client-side filtering or formatting is being applied. If the data is
 changing, rerun against a quiet instance and inspect the returned ordering.
 
-**A session summary is not captured.** Supply `SESSION_SUMMARY`, a first
-argument, or stdin to `session-end-capture.sh`, and check that
-`capture_thought` is exposed and the hook process can reach the MCP URL.
+**A session summary is not sent.** This is the default. Review the proposal,
+then invoke the hook with `OB_CAPTURE_CONFIRM=auto`, a session id, and a
+working `memory_writeback` tool. Use the legacy switch only with explicit
+acceptance of its non-governed behavior.

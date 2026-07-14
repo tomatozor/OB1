@@ -7,11 +7,14 @@ set -euo pipefail
 : "${OPEN_BRAIN_ACCESS_KEY:?Set OPEN_BRAIN_ACCESS_KEY in the hook environment}"
 
 payload='{"jsonrpc":"2.0","id":"recall-start","method":"tools/call","params":{"name":"recall_context","arguments":{"days":30,"limit":12,"min_importance":0}}}'
-response="$(curl --fail-with-body --silent --show-error \
+curl_config="$(mktemp)"
+trap 'rm -f "$curl_config"' EXIT
+chmod 600 "$curl_config"
+# Keep the credential out of curl's argv and shell history.
+printf 'header = "content-type: application/json"\nheader = "accept: application/json, text/event-stream"\nheader = "x-brain-key: %s"\n' "$OPEN_BRAIN_ACCESS_KEY" >"$curl_config"
+response="$(curl --fail-with-body --silent --show-error --max-time 10 \
+  --config "$curl_config" \
   -X POST "$OPEN_BRAIN_MCP_URL" \
-  -H 'content-type: application/json' \
-  -H 'accept: application/json, text/event-stream' \
-  -H "x-brain-key: $OPEN_BRAIN_ACCESS_KEY" \
   --data "$payload")"
 
 # MCP Streamable HTTP may return JSON or an SSE data frame. Keep hook output

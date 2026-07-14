@@ -13,6 +13,7 @@ Options:
   --batch <number>        PostgREST page size (default: 100)
   --min-length <number>   Minimum content length (default: 5)
   --env-file <path>       Load simple KEY=VALUE environment entries
+  Network requests time out after 10s (PostgREST) or 15s (embeddings)
   --help                  Show this help
 
 Exit codes:
@@ -47,12 +48,12 @@ function config() {
   if (!url || !key) throw new Error("OPEN_BRAIN_URL and OPEN_BRAIN_SERVICE_KEY must be configured");
   return { url, key };
 }
-async function request(url, options = {}) {
+async function request(url, options = {}, timeoutMs = 10_000) {
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
     return response;
-  } catch (error) { throw new Error(`Network/API request failed: ${error.message}`); }
+  } catch (error) { throw new Error(`Network/API request failed${error.name === "TimeoutError" ? ` after ${timeoutMs}ms` : ""}: ${error.message}`); }
 }
 async function main() {
   const options = args(); if (options.envFile) loadEnvFile(options.envFile);
@@ -80,9 +81,10 @@ async function main() {
         let vector;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
-            const response = await request(embeddingUrl, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: "openai/text-embedding-3-small", input: row.content.slice(0, 8000) }) });
+            const response = await request(embeddingUrl, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: "openai/text-embedding-3-small", input: row.content.slice(0, 8000) }) }, 15_000);
             vector = (await response.json())?.data?.[0]?.embedding;
-            if (!Array.isArray(vector) || !vector.length) throw new Error("embedding response missing vector data");
+            if (!Array.isArray(vector) || vector.length !== 1536) throw new Error(`invalid embedding dimension: expected 1536, received ${Array.isArray(vector) ? vector.length : "non-array"}`);
+            if (!vector.every(Number.isFinite)) throw new Error("invalid embedding: all 1536 components must be finite numbers");
             break;
           } catch (error) { if (attempt === 2) throw error; await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt))); }
         }

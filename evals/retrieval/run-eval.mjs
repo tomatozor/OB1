@@ -19,7 +19,7 @@ Options:
   --threshold <number>  Semantic similarity floor (default: 0.3)
   --allow-partial       Exclude failed queries from quality metrics; permits partial failures
   --env-file <path>     Optional KEY=VALUE file; never committed
-  --out <path>          Write complete JSON report
+  --out <path>          Write complete JSON report (warns outside HOME or .planning)
   --help                Show this message`;
 }
 
@@ -89,27 +89,32 @@ function config() {
   return { url, serviceKey, embeddingKey, embeddingBase: (process.env.OPENROUTER_BASE || "https://openrouter.ai/api/v1").replace(/\/$/, "") };
 }
 
-async function postJson(url, headers, body, label) {
-  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
-  if (!response.ok) throw new HttpError(label, response.status, await response.text().catch(() => ""));
-  return response.json();
+async function postJson(url, headers, body, label, timeoutMs) {
+  try {
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) throw new HttpError(label, response.status, await response.text().catch(() => ""));
+    return response.json();
+  } catch (error) {
+    if (error.name === "TimeoutError") throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    throw error;
+  }
 }
 
 function rpcHeaders(c) { return { apikey: c.serviceKey, Authorization: `Bearer ${c.serviceKey}` }; }
 
 async function embed(query, c) {
-  const data = await postJson(`${c.embeddingBase}/embeddings`, { Authorization: `Bearer ${c.embeddingKey}` }, { model: "openai/text-embedding-3-small", input: query }, "Embedding");
+  const data = await postJson(`${c.embeddingBase}/embeddings`, { Authorization: `Bearer ${c.embeddingKey}` }, { model: "openai/text-embedding-3-small", input: query }, "Embedding", 15_000);
   if (!Array.isArray(data?.data?.[0]?.embedding)) throw new Error("Embedding response did not contain data[0].embedding");
   return data.data[0].embedding;
 }
 
 async function semantic(query, c, embeddingCache, k, threshold) {
   const vector = await embeddingFor(query, embeddingCache);
-  return postJson(`${c.url}/rest/v1/rpc/match_thoughts`, rpcHeaders(c), { query_embedding: vector, match_threshold: threshold, match_count: k }, "match_thoughts");
+  return postJson(`${c.url}/rest/v1/rpc/match_thoughts`, rpcHeaders(c), { query_embedding: vector, match_threshold: threshold, match_count: k }, "match_thoughts", 10_000);
 }
 
 async function textSearch(query, c, k) {
-  return postJson(`${c.url}/rest/v1/rpc/search_thoughts_text`, rpcHeaders(c), { p_query: query, p_limit: k, p_filter: {}, p_offset: 0 }, "search_thoughts_text");
+  return postJson(`${c.url}/rest/v1/rpc/search_thoughts_text`, rpcHeaders(c), { p_query: query, p_limit: k, p_filter: {}, p_offset: 0 }, "search_thoughts_text", 10_000);
 }
 
 function hybridPayload(query, vector, k, threshold) {
@@ -123,10 +128,10 @@ function isSignatureError(error) {
 async function hybrid(query, c, embeddingCache, k, semanticThreshold) {
   const vector = await embeddingFor(query, embeddingCache);
   try {
-    return await postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k, semanticThreshold), "hybrid_search_thoughts");
+    return await postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k, semanticThreshold), "hybrid_search_thoughts", 10_000);
   } catch (error) {
     if (semanticThreshold !== undefined && isSignatureError(error)) {
-      return postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k), "hybrid_search_thoughts");
+      return postJson(`${c.url}/rest/v1/rpc/hybrid_search_thoughts`, rpcHeaders(c), hybridPayload(query, vector, k), "hybrid_search_thoughts", 10_000);
     }
     throw error;
   }
@@ -252,8 +257,11 @@ async function main() {
   }
   printTable(report);
   if (options.out) {
-    fs.mkdirSync(path.dirname(path.resolve(options.out)), { recursive: true });
-    fs.writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
+    const outputPath = path.resolve(options.out);
+    const home = process.env.HOME ? path.resolve(process.env.HOME) : null;
+    if (!outputPath.includes(`${path.sep}.planning${path.sep}`) || !(home && (outputPath === home || outputPath.startsWith(`${home}${path.sep}`)))) console.warn("Warning: le rapport peut contenir des données personnelles — ne pas committer");
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, `${JSON.stringify(report, null, 2)}\n`);
     console.log(`Full report: ${options.out}`);
   }
   const executed = Object.values(report.modes).filter((result) => result.status === "executed");

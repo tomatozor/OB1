@@ -14,7 +14,7 @@ OPEN_BRAIN_ACCESS_KEY (or MCP_ACCESS_KEY).
 Options:
   --env-file PATH  Load KEY=VALUE pairs from PATH before reading the environment
   --url URL        Override the MCP HTTP endpoint
-  --key KEY        Override the MCP access key
+  --key KEY        Deprecated: override the MCP access key (prefer environment variable)
   --help           Show this help
 `);
 }
@@ -51,7 +51,7 @@ function stable(value) {
 }
 
 async function mcpCall(url, key, id) {
-  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-brain-key": key }, body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "recall_context", arguments: DEFAULTS } }) });
+  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-brain-key": key }, body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "recall_context", arguments: DEFAULTS } }), signal: AbortSignal.timeout(10_000) });
   const body = await response.text();
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${body}`);
   const dataLine = body.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim()).pop();
@@ -61,10 +61,11 @@ async function mcpCall(url, key, id) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) return help();
+  if (options.key) console.warn("WARNING: --key is deprecated because command-line arguments can expose credentials; prefer OPEN_BRAIN_ACCESS_KEY or MCP_ACCESS_KEY.");
   if (options.env_file) loadEnvFile(options.env_file);
   const url = options.url || process.env.OPEN_BRAIN_MCP_URL || process.env.MCP_URL;
   const key = options.key || process.env.OPEN_BRAIN_ACCESS_KEY || process.env.MCP_ACCESS_KEY;
-  if (!url || !key) throw new Error("Set OPEN_BRAIN_MCP_URL and OPEN_BRAIN_ACCESS_KEY (or use --url and --key)");
+  if (!url || !key) throw new Error("Set OPEN_BRAIN_MCP_URL and OPEN_BRAIN_ACCESS_KEY (or MCP_URL and MCP_ACCESS_KEY; --key is deprecated)");
   const first = await mcpCall(url, key, "parity-1");
   const second = await mcpCall(url, key, "parity-2");
   if (JSON.stringify(stable(first?.result)) !== JSON.stringify(stable(second?.result))) throw new Error("recall_context results differ");

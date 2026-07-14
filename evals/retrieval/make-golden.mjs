@@ -2,7 +2,7 @@
 /** Read-only candidate helper: it never writes to Open Brain or a golden set. */
 import fs from "node:fs";
 
-function usage() { return `Usage: node make-golden.mjs --query "..." [--candidates 15] [--env-file path]\n\nPrints semantic + text candidates fused with RRF so a human can select relevant_ids manually.`; }
+function usage() { return `Usage: node make-golden.mjs --query "..." [--candidates 15] [--env-file path]\n\nPrints semantic + text candidates fused with RRF so a human can select relevant_ids manually. Network requests time out after 15s (embeddings) or 10s (PostgREST).`; }
 function parseArgs(argv) {
   const options = { candidates: 15 };
   for (let i = 0; i < argv.length; i += 1) {
@@ -29,10 +29,15 @@ function loadEnvFile(file) {
   }
 }
 class HttpError extends Error { constructor(label, status, body) { super(`${label} failed: HTTP ${status}${body ? ` — ${body.slice(0, 240)}` : ""}`); } }
-async function postJson(url, headers, body, label) {
-  const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
-  if (!response.ok) throw new HttpError(label, response.status, await response.text().catch(() => ""));
-  return response.json();
+async function postJson(url, headers, body, label, timeoutMs) {
+  try {
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) throw new HttpError(label, response.status, await response.text().catch(() => ""));
+    return response.json();
+  } catch (error) {
+    if (error.name === "TimeoutError") throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    throw error;
+  }
 }
 function rowDate(row) { return row.created_at || row.updated_at || row.timestamp || "—"; }
 function rowType(row) { return row.type || row.metadata?.type || row.source_type || "—"; }
@@ -54,12 +59,12 @@ async function main() {
   const headers = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` };
   try {
     const embeddingBase = (process.env.OPENROUTER_BASE || "https://openrouter.ai/api/v1").replace(/\/$/, "");
-    const embedding = await postJson(`${embeddingBase}/embeddings`, { Authorization: `Bearer ${embeddingKey}` }, { model: "openai/text-embedding-3-small", input: options.query }, "Embedding");
+    const embedding = await postJson(`${embeddingBase}/embeddings`, { Authorization: `Bearer ${embeddingKey}` }, { model: "openai/text-embedding-3-small", input: options.query }, "Embedding", 15_000);
     const vector = embedding?.data?.[0]?.embedding;
     if (!Array.isArray(vector)) throw new Error("Embedding response did not contain data[0].embedding");
     const [semanticRows, textRows] = await Promise.all([
-      postJson(`${url}/rest/v1/rpc/match_thoughts`, headers, { query_embedding: vector, match_threshold: 0.3, match_count: options.candidates }, "match_thoughts"),
-      postJson(`${url}/rest/v1/rpc/search_thoughts_text`, headers, { p_query: options.query, p_limit: options.candidates, p_filter: {}, p_offset: 0 }, "search_thoughts_text"),
+      postJson(`${url}/rest/v1/rpc/match_thoughts`, headers, { query_embedding: vector, match_threshold: 0.3, match_count: options.candidates }, "match_thoughts", 10_000),
+      postJson(`${url}/rest/v1/rpc/search_thoughts_text`, headers, { p_query: options.query, p_limit: options.candidates, p_filter: {}, p_offset: 0 }, "search_thoughts_text", 10_000),
     ]);
     console.log(`Candidates for: ${options.query}\nRead-only: choose relevant IDs manually; no golden file or database row was written.\n`);
     for (const [index, candidate] of fuse(semanticRows, textRows, options.candidates).entries()) {

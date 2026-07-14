@@ -35,6 +35,8 @@ node evals/retrieval/run-eval.mjs \
 
 `OPENROUTER_API_KEY` may be replaced with `LLM_API_KEY`. The embedding endpoint defaults to `https://openrouter.ai/api/v1/embeddings`, using `openai/text-embedding-3-small`; set `OPENROUTER_BASE` for a compatible local/proxy endpoint. The service key is sent only as HTTP headers to `${OPEN_BRAIN_URL}/rest/v1/rpc/*`.
 
+All network calls have bounded timeouts: 15 seconds for embeddings and 10 seconds for PostgREST RPCs. When `--out` writes outside `$HOME` or outside a path containing `.planning`, the runner warns: `le rapport peut contenir des données personnelles — ne pas committer`. The warning does not block report generation.
+
 `semantic` calls `match_thoughts`; `text` calls `search_thoughts_text`; `hybrid` calls `hybrid_search_thoughts`. The hybrid call uses the deployed `schemas/hybrid-recall` parameter names: `p_query`, `p_query_embedding`, `p_limit`, `p_offset`, `p_filter`, `p_include_restricted`, and `p_rrf_k`. When `--threshold` is explicitly supplied it also tries `p_semantic_threshold`, then retries without that final parameter if the installed RPC does not accept it. If the optional RPC returns HTTP 404, the mode is explicitly skipped rather than counted as a failed quality result. `hybrid-local` makes a semantic and text request with depth 60 and applies reciprocal-rank fusion (RRF, `k=60`) in the client. It is useful to assess hybrid value before deploying the RPC.
 
 Before the timed evaluation, the runner precomputes every unique query embedding in an unmeasured warmup phase. Embedding time therefore cannot be assigned to whichever mode happens to run first; reported latency measures only retrieval RPC calls and their network time. The runner reports this warmup explicitly.

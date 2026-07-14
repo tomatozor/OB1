@@ -18,12 +18,18 @@ state make them instruction-grade. If memories contradict one another, prefer
 the most recent item; if the server exposes supersedes filtering, note that
 filtering in the recall trace.
 
-Before concluding a significant session, call `capture_thought` once with a
-compact, professional summary of decisions, outputs, lessons, constraints,
-unresolved questions, or next steps. Do not capture raw transcripts, hidden
-reasoning, credentials, private customer data, or large code blocks. Generated
-or inferred write-back remains evidence and requires human confirmation before
-it becomes instruction-grade.
+Before concluding a significant session, propose one compact, professional
+summary of decisions, outputs, lessons, constraints, unresolved questions, or
+next steps for human review. Never send a write-back without explicit human
+validation. Do not capture raw transcripts, hidden reasoning, credentials,
+private customer data, or large code blocks.
+
+When a validated write-back is requested and `memory_writeback` is available,
+prefer it to `capture_thought`. Supply a workspace-scoped idempotency key and
+`provenance.status="generated"`; that tool creates evidence-only memory in
+`pending` review and requires confirmation before it can become
+instruction-grade. `capture_thought` is a legacy, non-governed fallback and
+must not be presented as a confirmation workflow.
 
 Configure the Open Brain MCP connector as a remote HTTP server in
 `~/.codex/config.toml`. Replace the placeholders locally; never commit the

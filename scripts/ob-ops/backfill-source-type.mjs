@@ -14,6 +14,7 @@ Options:
   --apply             Persist source_type values
   --batch <number>    RPC and fallback batch size (default: 100)
   --env-file <path>   Load simple KEY=VALUE environment entries
+  Network requests time out after 10 seconds
   --help              Show this help
 
 Exit codes:
@@ -23,7 +24,7 @@ Exit codes:
 function fail(message) { console.error(`Error: ${message}`); process.exitCode = 1; }
 function loadEnvFile(path) { for (const line of fs.readFileSync(path, "utf8").split(/\r?\n/)) { const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/); if (m && !m[1].startsWith("#")) process.env[m[1]] ??= m[2].replace(/^['"]|['"]$/g, ""); } }
 function parse() { const o = { apply: false, batch: 100 }; for (let i = 2; i < process.argv.length; i++) { const a = process.argv[i]; if (a === "--help") { console.log(HELP); process.exit(0); } if (a === "--apply") o.apply = true; else if (a === "--batch") o.batch = Number(process.argv[++i]); else if (a === "--env-file") o.envFile = process.argv[++i]; else throw new Error(`Unknown or incomplete option: ${a}`); } if (!Number.isInteger(o.batch) || o.batch < 1 || o.batch > 1000) throw new Error("--batch must be an integer from 1 to 1000"); return o; }
-async function request(url, options = {}) { try { const r = await fetch(url, options); if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`); return r; } catch (e) { throw new Error(`Network/API request failed: ${e.message}`); } }
+async function request(url, options = {}) { try { const r = await fetch(url, { ...options, signal: AbortSignal.timeout(10_000) }); if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`); return r; } catch (e) { throw new Error(`Network/API request failed${e.name === "TimeoutError" ? " after 10000ms" : ""}: ${e.message}`); } }
 function nonNegativeInteger(value, name) { if (!Number.isInteger(value) || value < 0) throw new Error(`backfill_source_type returned invalid ${name}`); return value; }
 function rpcUnavailable(error) { return /HTTP (404|405):/.test(error.message); }
 async function main() {
