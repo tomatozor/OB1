@@ -2,7 +2,7 @@
 /** Backfill missing thought embeddings. Dry-run unless --apply is supplied. */
 import fs from "node:fs";
 
-const HELP = `Usage: node scripts/ob-ops/backfill-embeddings.mjs [options]
+const HELP = `Usage: node recipes/brain-ops-toolkit/backfill-embeddings.mjs [options]
 
 Lists thoughts whose embedding is NULL. Dry-run is the default and never sends
 content to an embedding provider. Output contains identifiers, counts, and

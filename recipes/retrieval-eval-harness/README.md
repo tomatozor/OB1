@@ -10,7 +10,7 @@ golden JSONL ──> unmeasured embedding warmup ──> semantic / text / hybri
 
 ## Privacy first
 
-Do **not** commit a real golden set. Queries, expected thought IDs, and notes can expose personal or confidential information. Store real sets outside this public repository, for example `~/.local/share/ob1/evals/retrieval/golden.jsonl` or a private `.planning/` path. The committed [`examples/synthetic-golden.jsonl`](examples/synthetic-golden.jsonl) contains only ten fictional cases and fabricated UUIDs.
+Do **not** commit a real golden set. Queries, expected thought IDs, and notes can expose personal or confidential information. Store real sets outside this public repository, for example `~/.local/share/ob1/recipes/retrieval-eval-harness/golden.jsonl` or a private `.planning/` path. The committed [`examples/synthetic-golden.jsonl`](examples/synthetic-golden.jsonl) contains only ten fictional cases and fabricated UUIDs.
 
 ## Run an evaluation
 
@@ -25,11 +25,12 @@ OPENROUTER_API_KEY=your-openrouter-key
 Then run:
 
 ```bash
-node evals/retrieval/run-eval.mjs \
-  --golden ~/.local/share/ob1/evals/retrieval/golden.jsonl \
-  --env-file ~/.local/share/ob1/evals/retrieval/.env \
+node recipes/retrieval-eval-harness/run-eval.mjs \
+  --golden ~/.local/share/ob1/recipes/retrieval-eval-harness/golden.jsonl \
+  --env-file ~/.local/share/ob1/recipes/retrieval-eval-harness/.env \
   --modes semantic,text,hybrid,hybrid-local \
   --k 10 --threshold 0.3 \
+  --semantic-weight 1.0 --text-weight 2.0 \
   --out /tmp/ob1-retrieval-report.json
 ```
 
@@ -37,7 +38,13 @@ node evals/retrieval/run-eval.mjs \
 
 All network calls have bounded timeouts: 15 seconds for embeddings and 10 seconds for PostgREST RPCs. When `--out` writes outside `$HOME` or outside a path containing `.planning`, the runner warns: `le rapport peut contenir des données personnelles — ne pas committer`. The warning does not block report generation.
 
-`semantic` calls `match_thoughts`; `text` calls `search_thoughts_text`; `hybrid` calls `hybrid_search_thoughts`. The hybrid call uses the deployed `schemas/hybrid-recall` parameter names: `p_query`, `p_query_embedding`, `p_limit`, `p_offset`, `p_filter`, `p_include_restricted`, and `p_rrf_k`. When `--threshold` is explicitly supplied it also tries `p_semantic_threshold`, then retries without that final parameter if the installed RPC does not accept it. If the optional RPC returns HTTP 404, the mode is explicitly skipped rather than counted as a failed quality result. `hybrid-local` makes a semantic and text request with depth 60 and applies reciprocal-rank fusion (RRF, `k=60`) in the client. It is useful to assess hybrid value before deploying the RPC.
+`semantic` calls `match_thoughts`; `text` calls `search_thoughts_text`; `hybrid` calls `hybrid_search_thoughts`. The hybrid call sends `p_semantic_weight` and `p_text_weight` in addition to the deployed `schemas/hybrid-recall` parameters. If the installed RPC has the legacy signature, the harness retries without the two weights; when `--threshold` was explicitly supplied, it can then retry once more without `p_semantic_threshold` for the older threshold-less signature. If the optional RPC returns HTTP 404, the mode is explicitly skipped rather than counted as a failed quality result. `hybrid-local` makes a semantic and text request with depth 60 and applies the same weighted RRF (`k=60`) in the client.
+
+## Lexical-priority methodology and out-of-sample warning
+
+The defaults are `--semantic-weight 1.0 --text-weight 2.0`. They are **baseline-derived from 21 real cases measured on 2026-07-14**. Unweighted hybrid retrieval measured `hit@10=0.6667` and `MRR=0.4512`; the 2:1 lexical-priority simulation preserved `hit@10=0.6667` and estimated `MRR≈0.533`. On that same corpus, text-only MRR was `0.505` and semantic-only MRR was `0.218`.
+
+This is in-sample tuning. Revalidate the weighting on a separate, untouched golden set before using it as evidence of general improvement. Record the weights with every comparison; the console table and JSON report both expose the effective values. Both CLI weights must be finite and strictly greater than zero.
 
 Before the timed evaluation, the runner precomputes every unique query embedding in an unmeasured warmup phase. Embedding time therefore cannot be assigned to whichever mode happens to run first; reported latency measures only retrieval RPC calls and their network time. The runner reports this warmup explicitly.
 
@@ -50,10 +57,10 @@ Aim for at least 20 real cases, sampled across the important retrieval intents: 
 For each candidate query, use the read-only helper:
 
 ```bash
-node evals/retrieval/make-golden.mjs \
+node recipes/retrieval-eval-harness/make-golden.mjs \
   --query "What did we decide about the onboarding pilot?" \
   --candidates 15 \
-  --env-file ~/.local/share/ob1/evals/retrieval/.env
+  --env-file ~/.local/share/ob1/recipes/retrieval-eval-harness/.env
 ```
 
 It prints the RRF-fused semantic and text candidates (ID, date, type, source, and the first 140 characters). Review those candidates and write the JSONL line yourself:

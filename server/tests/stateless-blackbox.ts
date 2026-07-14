@@ -250,8 +250,15 @@ globalThis.fetch = (async (
   if (rpc === "hybrid_search_thoughts") {
     const payload = JSON.parse(rawBody);
     if (payload.p_query === "hybrid-rpc") {
-      if (payload.p_semantic_threshold !== 0.83) {
-        return json(400, { code: "P0001", message: "threshold missing" });
+      if (
+        payload.p_semantic_threshold !== 0.83 ||
+        payload.p_semantic_weight !== 0.75 ||
+        payload.p_text_weight !== 3
+      ) {
+        return json(400, {
+          code: "P0001",
+          message: "weighted payload missing",
+        });
       }
       return json(200, [{
         id: HYBRID_RPC_ID,
@@ -263,12 +270,13 @@ globalThis.fetch = (async (
     }
     if (
       payload.p_query === "hybrid-legacy" &&
-      Object.hasOwn(payload, "p_semantic_threshold")
+      (Object.hasOwn(payload, "p_semantic_weight") ||
+        Object.hasOwn(payload, "p_text_weight"))
     ) {
       return json(404, {
         code: "PGRST202",
         message:
-          "Could not find the function public.hybrid_search_thoughts(p_query, p_semantic_threshold) in the schema cache",
+          "Could not find the function public.hybrid_search_thoughts(p_query, p_semantic_threshold, p_semantic_weight, p_text_weight) in the schema cache",
       });
     }
     if (payload.p_query === "hybrid-legacy") {
@@ -1021,8 +1029,9 @@ const hybrid = await mcp("tools/call", {
 });
 assert(
   hybrid.body?.result?.isError !== true &&
-    toolResult(hybrid.body!).source === "hybrid_rrf_fallback",
-  "hybrid search reports RRF fallback when RPC is absent",
+    toolResult(hybrid.body!).source === "hybrid_rrf_fallback" &&
+    toolResult(hybrid.body!).results[0]?.id === "text-visible",
+  "hybrid fallback applies the lexical-priority 2:1 ranking",
 );
 const semanticCall = requests.find((entry) =>
   entry.url.includes("/rest/v1/rpc/match_thoughts")
@@ -1037,6 +1046,8 @@ const hybridRpc = await mcp("tools/call", {
     query: "hybrid-rpc",
     mode: "hybrid",
     threshold: 0.83,
+    semantic_weight: 0.75,
+    text_weight: 3,
   },
 });
 assert(
@@ -1048,9 +1059,11 @@ assert(
   requests.some((entry) =>
     entry.url.includes("/rpc/hybrid_search_thoughts") &&
     JSON.parse(entry.body).p_query === "hybrid-rpc" &&
-    JSON.parse(entry.body).p_semantic_threshold === 0.83
+    JSON.parse(entry.body).p_semantic_threshold === 0.83 &&
+    JSON.parse(entry.body).p_semantic_weight === 0.75 &&
+    JSON.parse(entry.body).p_text_weight === 3
   ),
-  "hybrid RPC receives p_semantic_threshold",
+  "hybrid RPC receives threshold and both configurable weights",
 );
 const legacyHybrid = await mcp("tools/call", {
   name: "search_thoughts",
@@ -1065,14 +1078,47 @@ assert(
     legacyHybridCalls.length === 2 &&
     Object.hasOwn(
       JSON.parse(legacyHybridCalls[0].body),
-      "p_semantic_threshold",
+      "p_semantic_weight",
     ) &&
     !Object.hasOwn(
       JSON.parse(legacyHybridCalls[1].body),
-      "p_semantic_threshold",
-    ),
-  "hybrid RPC retries without threshold only for the legacy signature",
+      "p_semantic_weight",
+    ) &&
+    JSON.parse(legacyHybridCalls[1].body).p_semantic_threshold === 0.64,
+  "hybrid RPC retries the legacy 8-parameter signature without weights",
 );
+
+const invertedHybrid = await mcp("tools/call", {
+  name: "search_thoughts",
+  arguments: {
+    query: "hybrid-inverted",
+    mode: "hybrid",
+    limit: 1,
+    semantic_weight: 2,
+    text_weight: 1,
+  },
+});
+assert(
+  invertedHybrid.body?.result?.isError !== true &&
+    toolResult(invertedHybrid.body!).results[0]?.id === "semantic-visible",
+  "hybrid fallback uses caller-supplied semantic/text weights",
+);
+
+for (
+  const [name, value] of [["semantic_weight", 0], ["text_weight", -1]] as const
+) {
+  const invalidWeight = await mcp("tools/call", {
+    name: "search_thoughts",
+    arguments: { query: "hybrid", mode: "hybrid", [name]: value },
+  });
+  assert(
+    invalidWeight.body?.result?.isError === true &&
+      invalidWeight.body.result.content[0].text.includes(
+        `Invalid ${name}: expected a finite number > 0`,
+      ),
+    `search_thoughts rejects invalid ${name}`,
+  );
+}
 
 const baseSearch = await mcp("tools/call", {
   name: "search",

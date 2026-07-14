@@ -11,13 +11,16 @@ authentication.
   `created_at`) when `search_thoughts_text` or enhanced thought columns are not
   installed; semantic retrieval remains available and enrichment is
   opportunistic.
-- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.5)`
+- `search_thoughts(query, mode="hybrid", limit=10, offset=0, type?, source_type?, min_importance?, start_date?, end_date?, include_restricted=false, threshold=0.5, semantic_weight=1.0, text_weight=2.0)`
   provides filtered retrieval. Hybrid mode calls `hybrid_search_thoughts` first,
-  then uses semantic/text RRF (`k=60`) only when that RPC is absent. The caller's
+  then uses weighted semantic/text RRF (`k=60`) only when that RPC is absent. The caller's
   `threshold` is sent to the hybrid RPC as `p_semantic_threshold` and applies
-  to the semantic fallback leg. A server with the legacy hybrid signature is
-  retried once without that parameter only when PostgREST identifies that
-  exact signature mismatch. Dates must be parseable by `Date.parse`.
+  to the semantic fallback leg. `semantic_weight` and `text_weight` are sent as
+  `p_semantic_weight` and `p_text_weight` and are applied identically by the
+  local fallback; both must be finite and greater than zero. A server with the
+  legacy eight-parameter hybrid signature is retried without the two weights;
+  the older threshold-less signature remains a final compatibility retry.
+  Dates must be parseable by `Date.parse`.
   Pagination includes `has_more` when a page-plus-one read can determine it.
 - `recall_context(scope_topics?, scope_people?, days=30, limit=12, min_importance=0, include_restricted=false)`
   performs deterministic SQL-only recall and excludes thoughts targeted by a
@@ -40,6 +43,17 @@ authentication.
   mutation path. If the RPC is absent, deletion fails closed with instructions
   to apply `schemas/hybrid-recall`; the server performs no fallback read,
   PATCH, audit write, or database delete.
+
+## Pondération lexicale (baseline-derived sur 21 cas réels, 2026-07-14 ; à revalider hors échantillon)
+
+The default hybrid weighting is semantic `1.0`, text `2.0`. On the measured 21-case golden set, unweighted hybrid retrieval produced `hit@10=0.6667` and `MRR=0.4512`; the 2:1 lexical-priority simulation preserved `hit@10=0.6667` and estimated `MRR≈0.533`. The corpus favored full-text search (`MRR=0.505`) over semantic retrieval (`MRR=0.218`).
+
+These defaults are baseline-derived and in-sample. They must be revalidated on an independent out-of-sample set before being treated as generally optimal. Callers can override either positive finite weight; database RPC and local fallback use the same formula:
+
+```text
+score = semantic_weight * Σ 1/(k + semantic_rank)
+      + text_weight     * Σ 1/(k + text_rank)
+```
 
 ## Agent Memory
 

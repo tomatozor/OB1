@@ -3,7 +3,7 @@
 import fs from "node:fs";
 
 const MAX_ITERATIONS = 1000;
-const HELP = `Usage: node scripts/ob-ops/backfill-source-type.mjs [options]
+const HELP = `Usage: node recipes/brain-ops-toolkit/backfill-source-type.mjs [options]
 
 Counts thoughts where source_type is NULL. --apply repeatedly calls
 backfill_source_type(p_batch, p_dry_run) until no qualified rows remain, then

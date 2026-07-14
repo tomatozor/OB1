@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** REST-observable health signal; does not depend on unexposed pg_cron views. */
 import fs from "node:fs";
-const HELP = `Usage: node scripts/ob-ops/health-signal.mjs [options]
+const HELP = `Usage: node recipes/brain-ops-toolkit/health-signal.mjs [options]
 
 Checks source-write freshness, entity_extraction_queue depth, and missing
 embeddings. Output is stable JSON; non-green states exit non-zero.

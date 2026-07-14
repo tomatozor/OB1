@@ -14,6 +14,8 @@ const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
   "https://openrouter.ai/api/v1";
 const RRF_K = 60;
+const DEFAULT_SEMANTIC_WEIGHT = 1.0;
+const DEFAULT_TEXT_WEIGHT = 2.0;
 const AGENT_MEMORY_RUNTIME = "open-brain-mcp-v2";
 const AGENT_MEMORY_SCHEMA_ERROR =
   "Agent Memory schema not installed — see schemas/agent-memory";
@@ -108,6 +110,8 @@ type HybridSearchInput = {
   offset: number;
   filter: JsonObject;
   includeRestricted: boolean;
+  semanticWeight?: number;
+  textWeight?: number;
 };
 
 type HybridSearchDependencies = {
@@ -175,6 +179,17 @@ function parseDateInput(name: string, value?: string): string | undefined {
     );
   }
   return new Date(timestamp).toISOString();
+}
+
+export function validateRrfWeight(name: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw actionable(
+      `Invalid ${name}: expected a finite number > 0, received ${
+        String(value)
+      }`,
+    );
+  }
+  return value;
 }
 
 function rowImportance(row: ThoughtRecord): number {
@@ -464,6 +479,14 @@ export function isHybridThresholdSignatureError(error: unknown): boolean {
       text.includes("schema cache"));
 }
 
+export function isHybridWeightSignatureError(error: unknown): boolean {
+  const text = errorText(error).toLowerCase();
+  return text.includes("hybrid_search_thoughts") &&
+    (text.includes("p_semantic_weight") || text.includes("p_text_weight")) &&
+    (text.includes("does not exist") || text.includes("could not find") ||
+      text.includes("schema cache"));
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -617,12 +640,24 @@ export function fuseRrf(
   semanticRows: ThoughtRecord[],
   textRows: ThoughtRecord[],
   k = RRF_K,
+  semanticWeight = DEFAULT_SEMANTIC_WEIGHT,
+  textWeight = DEFAULT_TEXT_WEIGHT,
 ): ThoughtRecord[] {
+  const validatedSemanticWeight = validateRrfWeight(
+    "semantic_weight",
+    semanticWeight,
+  );
+  const validatedTextWeight = validateRrfWeight("text_weight", textWeight);
   const fused = new Map<string, { row: ThoughtRecord; score: number }>();
-  for (const rows of [semanticRows, textRows]) {
+  for (
+    const [rows, weight] of [
+      [semanticRows, validatedSemanticWeight],
+      [textRows, validatedTextWeight],
+    ] as const
+  ) {
     rows.forEach((row, index) => {
       const current = fused.get(row.id);
-      const contribution = 1 / (k + index + 1);
+      const contribution = weight / (k + index + 1);
       if (current) {
         current.score += contribution;
         current.row = { ...current.row, ...row };
@@ -660,7 +695,13 @@ export async function retrieveHybrid(
     dependencies.text(),
   ]);
   return {
-    rows: fuseRrf(semanticRows, textRows, RRF_K).slice(
+    rows: fuseRrf(
+      semanticRows,
+      textRows,
+      RRF_K,
+      input.semanticWeight ?? DEFAULT_SEMANTIC_WEIGHT,
+      input.textWeight ?? DEFAULT_TEXT_WEIGHT,
+    ).slice(
       input.offset,
       input.offset + input.limit,
     ),
@@ -784,12 +825,31 @@ async function callHybridSearchRpc(
     p_include_restricted: input.includeRestricted,
     p_rrf_k: RRF_K,
   };
-  const result = await supabase.rpc("hybrid_search_thoughts", {
+  const thresholdPayload = {
     ...basePayload,
     p_semantic_threshold: threshold,
+  };
+  const weightedResult = await supabase.rpc("hybrid_search_thoughts", {
+    ...thresholdPayload,
+    p_semantic_weight: input.semanticWeight ?? DEFAULT_SEMANTIC_WEIGHT,
+    p_text_weight: input.textWeight ?? DEFAULT_TEXT_WEIGHT,
   });
-  if (!result.error || !isHybridThresholdSignatureError(result.error)) {
-    return result;
+  if (
+    !weightedResult.error ||
+    !isHybridWeightSignatureError(weightedResult.error)
+  ) {
+    return weightedResult;
+  }
+
+  const thresholdResult = await supabase.rpc(
+    "hybrid_search_thoughts",
+    thresholdPayload,
+  );
+  if (
+    !thresholdResult.error ||
+    !isHybridThresholdSignatureError(thresholdResult.error)
+  ) {
+    return thresholdResult;
   }
   return await supabase.rpc("hybrid_search_thoughts", basePayload);
 }
@@ -859,6 +919,8 @@ async function runSearch(params: {
   limit: number;
   offset: number;
   threshold: number;
+  semanticWeight: number;
+  textWeight: number;
   filters: SearchFilters;
 }): Promise<JsonObject> {
   const pageSize = params.limit + 1;
@@ -895,6 +957,8 @@ async function runSearch(params: {
           offset: params.offset,
           filter: searchFilterPayload(params.filters),
           includeRestricted: params.filters.include_restricted,
+          semanticWeight: params.semanticWeight,
+          textWeight: params.textWeight,
         },
         {
           primary: async (input) =>
@@ -1679,6 +1743,8 @@ function buildServer(): McpServer {
           limit: 10,
           offset: 0,
           threshold: 0.5,
+          semanticWeight: DEFAULT_SEMANTIC_WEIGHT,
+          textWeight: DEFAULT_TEXT_WEIGHT,
           filters: { include_restricted: false },
         });
         const rows = result.results as JsonObject[];
@@ -1776,6 +1842,8 @@ function buildServer(): McpServer {
         end_date: z.string().min(1).optional(),
         include_restricted: z.boolean().default(false).optional(),
         threshold: z.number().min(0).max(1).default(0.5).optional(),
+        semantic_weight: z.number().default(DEFAULT_SEMANTIC_WEIGHT).optional(),
+        text_weight: z.number().default(DEFAULT_TEXT_WEIGHT).optional(),
       },
     },
     async ({
@@ -1790,10 +1858,20 @@ function buildServer(): McpServer {
       end_date,
       include_restricted = false,
       threshold = 0.5,
+      semantic_weight = DEFAULT_SEMANTIC_WEIGHT,
+      text_weight = DEFAULT_TEXT_WEIGHT,
     }) => {
       try {
         const normalizedStartDate = parseDateInput("start_date", start_date);
         const normalizedEndDate = parseDateInput("end_date", end_date);
+        const normalizedSemanticWeight = validateRrfWeight(
+          "semantic_weight",
+          semantic_weight,
+        );
+        const normalizedTextWeight = validateRrfWeight(
+          "text_weight",
+          text_weight,
+        );
         return toolJson(
           await runSearch({
             query,
@@ -1801,6 +1879,8 @@ function buildServer(): McpServer {
             limit,
             offset,
             threshold,
+            semanticWeight: normalizedSemanticWeight,
+            textWeight: normalizedTextWeight,
             filters: {
               type,
               source_type,

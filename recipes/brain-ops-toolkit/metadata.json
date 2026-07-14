@@ -1,0 +1,20 @@
+{
+  "name": "Brain Ops Toolkit",
+  "description": "Operational scripts for a healthy Open Brain: embedding and source_type backfills (dry-run by default, fail-closed exit codes), stats verification against exact SQL counts, and a reliable freshness/queue health signal.",
+  "category": "recipes",
+  "author": {
+    "name": "Thomas Verdenne",
+    "github": "tomatozor"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["OpenRouter or OpenAI embeddings API"],
+    "tools": ["Node.js 18+"]
+  },
+  "tags": ["operations", "backfill", "embeddings", "health-check", "monitoring"],
+  "difficulty": "intermediate",
+  "estimated_time": "20 minutes",
+  "created": "2026-07-14",
+  "updated": "2026-07-14"
+}

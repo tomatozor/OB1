@@ -9,9 +9,11 @@ const {
   isMissingEnhancedThoughtsError,
   isMissingHybridRpcError,
   isHybridThresholdSignatureError,
+  isHybridWeightSignatureError,
   retrieveHybrid,
   timingSafeEqualStrings,
   validateEmbedding,
+  validateRrfWeight,
 } = await import("./index.ts");
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -27,19 +29,49 @@ function thought(id: string) {
   };
 }
 
-Deno.test("RRF merges both rankings with k=60 and deterministic ties", () => {
+Deno.test("RRF uses lexical-priority 2:1 defaults and supports inverted weights", () => {
   const rows = fuseRrf(
     [thought("a"), thought("b")],
     [thought("b"), thought("c")],
   );
   assert(
-    rows.map((row) => row.id).join(",") === "b,a,c",
+    rows.map((row) => row.id).join(",") === "b,c,a",
     "unexpected RRF order",
   );
   assert(
-    Math.abs((rows[0].score ?? 0) - (1 / 61 + 1 / 62)) < 1e-12,
+    Math.abs((rows[0].score ?? 0) - (1 / 62 + 2 / 61)) < 1e-12,
     "unexpected RRF score",
   );
+
+  const semanticFirst = fuseRrf(
+    [thought("semantic"), thought("lexical")],
+    [thought("lexical"), thought("semantic")],
+    60,
+    1,
+    0.1,
+  );
+  assert(
+    semanticFirst[0].id === "semantic",
+    "inverted weights did not promote the semantic-first result",
+  );
+});
+
+Deno.test("RRF weights must be finite and strictly positive", () => {
+  assert(
+    validateRrfWeight("semantic_weight", 1.5) === 1.5,
+    "valid weight changed",
+  );
+  for (const invalid of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    let rejected = false;
+    try {
+      validateRrfWeight("semantic_weight", invalid);
+    } catch (error) {
+      rejected = String(error).includes(
+        "Invalid semantic_weight: expected a finite number > 0",
+      );
+    }
+    assert(rejected, `invalid weight was accepted: ${String(invalid)}`);
+  }
 });
 
 Deno.test("hybrid retrieval calls RPC first then falls back only when absent", async () => {
@@ -214,6 +246,21 @@ Deno.test("base-schema and threshold-signature errors are narrowly classified", 
       message: "Could not find quality_score in the schema cache",
     }),
     "PostgREST missing enhanced column was not detected",
+  );
+  assert(
+    isHybridWeightSignatureError({
+      code: "42883",
+      message:
+        "function hybrid_search_thoughts(p_query, p_semantic_weight, p_text_weight) does not exist",
+    }),
+    "weight signature mismatch was not detected",
+  );
+  assert(
+    !isHybridWeightSignatureError({
+      code: "PGRST202",
+      message: "Could not find hybrid_search_thoughts(p_query)",
+    }),
+    "missing hybrid RPC was misclassified as a weight mismatch",
   );
   assert(
     isHybridThresholdSignatureError({

@@ -9,8 +9,13 @@ BEGIN
   END IF;
   IF to_regprocedure(
     'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision)'
+  ) IS NOT NULL THEN
+    RAISE EXCEPTION 'legacy eight-argument hybrid_search_thoughts still exists';
+  END IF;
+  IF to_regprocedure(
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision)'
   ) IS NULL THEN
-    RAISE EXCEPTION 'current eight-argument hybrid_search_thoughts is missing';
+    RAISE EXCEPTION 'current ten-argument hybrid_search_thoughts is missing';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -21,7 +26,7 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'legacy thought_audit was not upgraded with actor/session_id';
   END IF;
-  RAISE NOTICE 'PASS upgrade replaced the 7-argument RPC and extended legacy thought_audit';
+  RAISE NOTICE 'PASS upgrade replaced legacy 7/8-argument RPCs with the 10-argument RPC and extended legacy thought_audit';
 END
 $upgrade$;
 
@@ -63,7 +68,7 @@ BEGIN
 
   IF NOT has_function_privilege(
     'authenticated',
-    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision)',
+    'public.hybrid_search_thoughts(text,vector,integer,integer,jsonb,boolean,integer,double precision,double precision,double precision)',
     'EXECUTE'
   ) OR NOT has_function_privilege(
     'authenticated',
@@ -127,6 +132,99 @@ BEGIN
   END IF;
 
   RAISE NOTICE 'PASS hybrid fusion excludes restricted/deleted and exposes both rank paths (% rows)', v_count;
+END;
+$$;
+
+INSERT INTO public.thoughts (
+  content, embedding, metadata, created_at, updated_at,
+  type, sensitivity_tier, importance, quality_score, source_type, enriched
+)
+VALUES
+  ('weightedtoken weightedtoken weightedtoken weightedtoken', pg_temp.unit_vector(2), '{"source":"rrf-weight-test"}', now(), now(), 'reference', 'standard', 1, 50, 'rrf-weight-test', true),
+  ('weightedtoken', pg_temp.unit_vector(1), '{"source":"rrf-weight-test"}', now(), now(), 'reference', 'standard', 1, 50, 'rrf-weight-test', true);
+
+DO $$
+DECLARE
+  v_default_first TEXT;
+  v_inverted_first TEXT;
+BEGIN
+  SELECT result.content INTO v_default_first
+  FROM public.hybrid_search_thoughts(
+    'weightedtoken',
+    pg_temp.unit_vector(1),
+    2,
+    0,
+    '{"source_type":"rrf-weight-test"}'::jsonb,
+    false,
+    60
+  ) result
+  LIMIT 1;
+
+  SELECT result.content INTO v_inverted_first
+  FROM public.hybrid_search_thoughts(
+    'weightedtoken',
+    pg_temp.unit_vector(1),
+    2,
+    0,
+    '{"source_type":"rrf-weight-test"}'::jsonb,
+    false,
+    60,
+    NULL,
+    1.0,
+    0.1
+  ) result
+  LIMIT 1;
+
+  IF v_default_first <> 'weightedtoken weightedtoken weightedtoken weightedtoken' THEN
+    RAISE EXCEPTION '2:1 lexical weighting did not promote the text-strong document: %', v_default_first;
+  END IF;
+
+  IF v_inverted_first <> 'weightedtoken' THEN
+    RAISE EXCEPTION '1:0.1 semantic-priority weighting did not promote the semantic-strong document: %', v_inverted_first;
+  END IF;
+
+  RAISE NOTICE 'PASS weighted RRF changes ranking between lexical 2:1 and semantic 1:0.1';
+END;
+$$;
+
+DELETE FROM public.thoughts WHERE source_type = 'rrf-weight-test';
+
+DO $$
+DECLARE
+  v_invalid DOUBLE PRECISION;
+BEGIN
+  FOREACH v_invalid IN ARRAY ARRAY[0.0::DOUBLE PRECISION, -1.0::DOUBLE PRECISION, 'NaN'::DOUBLE PRECISION]
+  LOOP
+    BEGIN
+      PERFORM public.hybrid_search_thoughts(
+        'weightedtoken', pg_temp.unit_vector(1), 2, 0,
+        '{"source_type":"rrf-weight-test"}'::jsonb, false, 60, NULL,
+        v_invalid, 2.0
+      );
+      RAISE EXCEPTION 'expected invalid semantic weight rejection for %', v_invalid;
+    EXCEPTION
+      WHEN SQLSTATE '22023' THEN
+        IF SQLERRM <> 'p_semantic_weight must be finite and > 0' THEN
+          RAISE;
+        END IF;
+    END;
+
+    BEGIN
+      PERFORM public.hybrid_search_thoughts(
+        'weightedtoken', pg_temp.unit_vector(1), 2, 0,
+        '{"source_type":"rrf-weight-test"}'::jsonb, false, 60, NULL,
+        1.0, v_invalid
+      );
+      RAISE EXCEPTION 'expected invalid text weight rejection for %', v_invalid;
+    EXCEPTION
+      WHEN SQLSTATE '22023' THEN
+        IF SQLERRM <> 'p_text_weight must be finite and > 0' THEN
+          RAISE;
+        END IF;
+    END;
+  END LOOP;
+
+  RAISE NOTICE 'PASS weighted RRF rejects zero, negative, and NaN weights on both legs';
 END;
 $$;
 

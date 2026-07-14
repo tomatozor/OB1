@@ -12,7 +12,7 @@ This data-additive, in-place schema upgrade fuses pgvector cosine retrieval and 
 query + embedding
        |
        +--> cosine top-N ---- rank --+
-       |                             +--> RRF --> filtered page
+       |                             +--> weighted RRF --> filtered page
        +--> FTS top-N ------- rank --+
 
 capture --> fingerprint lock --> canonical upsert --> embedding
@@ -25,6 +25,12 @@ The migration never replaces `upsert_thought`, never physically deletes a though
 ## Why This Matters
 
 Embedding similarity catches conceptual matches while full-text search catches exact names and phrases. RRF combines both rank lists without pretending their raw scores are comparable. The companion write helpers keep capture and lifecycle operations transactional and reviewable.
+
+### Lexical-priority weighting: baseline-derived
+
+The default weighted RRF uses `semantic_weight=1.0` and `text_weight=2.0`. This 2:1 lexical priority is **baseline-derived from 21 real cases measured on 2026-07-14**: compared with unweighted RRF, the measured simulation preserved `hit@10` at `0.6667` and increased estimated MRR from `0.4512` to about `0.533`; text-only MRR was `0.505` versus `0.218` for semantic-only retrieval on that corpus.
+
+This is an in-sample tuning result, not a universal retrieval claim. Revalidate it on a separate out-of-sample golden set before treating the defaults as generally optimal. Both weights remain configurable, finite, and strictly positive.
 
 Implementation and review corrections in this schema are authored by [Thomas Verdenne](https://github.com/tomatozor).
 
@@ -86,7 +92,7 @@ from public.hybrid_search_thoughts(
 
 ```sql
 hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int,
-                       double precision)
+                       double precision, double precision, double precision)
   returns table (id uuid, content text, metadata jsonb, created_at timestamptz,
                  type text, importance smallint, rrf_score double precision,
                  semantic_rank int, text_rank int)
@@ -99,7 +105,7 @@ restore_thought(uuid, text, boolean) returns jsonb
 thought_stats_exact() returns jsonb
 ```
 
-In declaration order, the hybrid-search parameters are `p_query`, `p_query_embedding`, `p_limit DEFAULT 10`, `p_offset DEFAULT 0`, `p_filter DEFAULT '{}'`, `p_include_restricted DEFAULT false`, `p_rrf_k DEFAULT 60`, and `p_semantic_threshold DEFAULT NULL`. When the threshold is present, the semantic candidate leg keeps only cosine similarity values greater than or equal to it.
+In declaration order, the hybrid-search parameters are `p_query`, `p_query_embedding`, `p_limit DEFAULT 10`, `p_offset DEFAULT 0`, `p_filter DEFAULT '{}'`, `p_include_restricted DEFAULT false`, `p_rrf_k DEFAULT 60`, `p_semantic_threshold DEFAULT NULL`, `p_semantic_weight DEFAULT 1.0`, and `p_text_weight DEFAULT 2.0`. When the threshold is present, the semantic candidate leg keeps only cosine similarity values greater than or equal to it. Each weight must be finite and greater than zero; invalid values raise SQLSTATE `22023`.
 
 `hybrid_search_thoughts` accepts these optional `p_filter` keys: `type`, `source_type`, `min_importance`, `start_date`, and `end_date`. Dates must be valid `timestamptz` strings. Restricted thoughts are excluded unless explicitly requested; logically deleted thoughts are always excluded.
 
@@ -117,7 +123,7 @@ Audit atomicity is database-local: the thought mutation and its trigger-created 
 
 ## Upgrade Behavior
 
-On an existing installation, the migration adds `actor` and `session_id` only when they are missing from `thought_audit`, preserving existing audit rows and columns. It drops the superseded seven-parameter `hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int)` immediately before creating the eight-parameter replacement with `p_semantic_threshold`; because the whole script is one transaction, callers do not observe a committed state between those operations. The two-parameter logical-delete/restore signatures are likewise replaced atomically by their confirmation-gated three-parameter forms.
+On an existing installation, the migration adds `actor` and `session_id` only when they are missing from `thought_audit`, preserving existing audit rows and columns. It drops the superseded seven- and eight-parameter `hybrid_search_thoughts` overloads immediately before creating the ten-parameter replacement with threshold and weights; because the whole script is one transaction, callers do not observe a committed state between those operations. The two-parameter logical-delete/restore signatures are likewise replaced atomically by their confirmation-gated three-parameter forms.
 
 The normal trigram and timestamp indexes are created inside that transaction (not `CONCURRENTLY`). On a large or write-active table, the transaction can take locks and retain them until commit. Test on a representative staging copy and schedule the production upgrade accordingly.
 
@@ -126,7 +132,7 @@ The normal trigram and timestamp indexes are created inside that transaction (no
 The schema is additive, so leaving the indexes and audit history in place is the safest rollback. To retire only the callable surface, review and run the following lines individually. They are commented to prevent accidental execution.
 
 ```sql
--- DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int, double precision);
+-- DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(text, vector(1536), int, int, jsonb, boolean, int, double precision, double precision, double precision);
 -- DROP FUNCTION IF EXISTS public.capture_thought_atomic(text, jsonb, vector(1536));
 -- DROP FUNCTION IF EXISTS public.backfill_source_type(int, boolean);
 -- DROP FUNCTION IF EXISTS public.log_thought_audit(uuid, text, text, jsonb);
@@ -165,7 +171,7 @@ schemas/hybrid-recall/test/local-test.sh
 docker rm -f ob-thanos-pg
 ```
 
-The harness first creates a legacy seven-parameter `hybrid_search_thoughts` stub and a legacy-compatible `thought_audit` without `actor` or `session_id`. It then installs the schema twice, verifies replacement of the old signature and extension of the old table, loads nine synthetic rows through its assertions, and verifies grants, hybrid recall and thresholding, filters, capture validation and deduplication, backfill, gated logical deletion/restoration, trigger audit counts and compact diffs, and exact statistics.
+The harness first creates a legacy eight-parameter `hybrid_search_thoughts` stub and a legacy-compatible `thought_audit` without `actor` or `session_id`. It then installs the schema twice, verifies atomic replacement by the ten-parameter signature and extension of the old table, and verifies grants, weighted ranking changes, invalid-weight rejection, hybrid recall and thresholding, filters, capture validation and deduplication, backfill, gated logical deletion/restoration, trigger audit counts and compact diffs, and exact statistics.
 
 ## Expected Outcome
 

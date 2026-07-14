@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Compare exact PostgREST counts with installed aggregate RPCs. */
 import fs from "node:fs";
-const HELP = `Usage: node scripts/ob-ops/verify-stats.mjs [options]
+const HELP = `Usage: node recipes/brain-ops-toolkit/verify-stats.mjs [options]
 
 Compares exact PostgREST counts with brain_stats_aggregate and, when installed,
 thought_stats_exact. Exits 1 when a comparable metric differs by more than 0.5%.

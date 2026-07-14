@@ -10,12 +10,12 @@ simple local environment file with `--env-file path`; each non-comment line is
 `KEY=VALUE` and an already-exported environment value wins.
 
 ```bash
-node scripts/ob-ops/backfill-embeddings.mjs --env-file .env.ob
-node scripts/ob-ops/backfill-embeddings.mjs --apply --batch 100 --min-length 5 --env-file .env.ob
-node scripts/ob-ops/backfill-source-type.mjs --env-file .env.ob
-node scripts/ob-ops/backfill-source-type.mjs --apply --batch 100 --env-file .env.ob
-node scripts/ob-ops/verify-stats.mjs --env-file .env.ob
-node scripts/ob-ops/health-signal.mjs --env-file .env.ob
+node recipes/brain-ops-toolkit/backfill-embeddings.mjs --env-file .env.ob
+node recipes/brain-ops-toolkit/backfill-embeddings.mjs --apply --batch 100 --min-length 5 --env-file .env.ob
+node recipes/brain-ops-toolkit/backfill-source-type.mjs --env-file .env.ob
+node recipes/brain-ops-toolkit/backfill-source-type.mjs --apply --batch 100 --env-file .env.ob
+node recipes/brain-ops-toolkit/verify-stats.mjs --env-file .env.ob
+node recipes/brain-ops-toolkit/health-signal.mjs --env-file .env.ob
 ```
 
 `backfill-embeddings` accepts `--batch` (default 100) for its PostgREST page

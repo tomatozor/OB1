@@ -253,13 +253,21 @@ EXECUTE FUNCTION public.audit_thought_mutation();
 -- 3. HYBRID RRF SEARCH
 --
 -- Reciprocal Rank Fusion deliberately combines ranks, not raw cosine and
--- ts_rank values, so neither retrieval system's score scale dominates.
+-- ts_rank values, so neither retrieval system's score scale dominates. The
+-- lexical-priority 2:1 default is baseline-derived from 21 real cases measured
+-- on 2026-07-14 and must be revalidated out of sample.
 -- Candidate pools are bounded at 5,000 rows per retrieval path.
 -- ============================================================
 
 -- Replacing the seven-argument overload avoids leaving a stale legacy RPC.
 DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(
   TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT
+);
+
+-- Replacing the eight-argument overload is part of the same global migration
+-- transaction, so callers never observe a committed signature gap.
+DROP FUNCTION IF EXISTS public.hybrid_search_thoughts(
+  TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION
 );
 
 CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
@@ -270,7 +278,9 @@ CREATE OR REPLACE FUNCTION public.hybrid_search_thoughts(
   p_filter JSONB DEFAULT '{}'::jsonb,
   p_include_restricted BOOLEAN DEFAULT false,
   p_rrf_k INT DEFAULT 60,
-  p_semantic_threshold DOUBLE PRECISION DEFAULT NULL
+  p_semantic_threshold DOUBLE PRECISION DEFAULT NULL,
+  p_semantic_weight DOUBLE PRECISION DEFAULT 1.0,
+  p_text_weight DOUBLE PRECISION DEFAULT 2.0
 )
 RETURNS TABLE (
   id UUID,
@@ -283,17 +293,33 @@ RETURNS TABLE (
   semantic_rank INT,
   text_rank INT
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
 SET search_path = public, extensions, pg_temp
 SET statement_timeout = '25s'
 AS $$
+BEGIN
+  IF p_semantic_weight IS NULL OR
+     NOT (p_semantic_weight > 0.0 AND p_semantic_weight < 'Infinity'::DOUBLE PRECISION) THEN
+    RAISE EXCEPTION 'p_semantic_weight must be finite and > 0'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_text_weight IS NULL OR
+     NOT (p_text_weight > 0.0 AND p_text_weight < 'Infinity'::DOUBLE PRECISION) THEN
+    RAISE EXCEPTION 'p_text_weight must be finite and > 0'
+      USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
   WITH parameters AS (
     SELECT
       greatest(1, least(coalesce(p_limit, 10), 100)) AS result_limit,
       greatest(0, coalesce(p_offset, 0)) AS result_offset,
       greatest(1, coalesce(p_rrf_k, 60)) AS rrf_k,
+      p_semantic_weight AS semantic_weight,
+      p_text_weight AS text_weight,
       least(
         5000,
         greatest(
@@ -380,9 +406,9 @@ AS $$
     ) AS candidate
   ),
   fused AS (
-    SELECT id FROM semantic_candidates
+    SELECT semantic_candidates.id FROM semantic_candidates
     UNION
-    SELECT id FROM text_candidates
+    SELECT text_candidates.id FROM text_candidates
   ),
   scored AS (
     SELECT
@@ -395,11 +421,11 @@ AS $$
       (
         CASE
           WHEN semantic.semantic_rank IS NULL THEN 0.0
-          ELSE 1.0 / (p.rrf_k + semantic.semantic_rank)
+          ELSE p.semantic_weight / (p.rrf_k + semantic.semantic_rank)
         END
         + CASE
           WHEN lexical.text_rank IS NULL THEN 0.0
-          ELSE 1.0 / (p.rrf_k + lexical.text_rank)
+          ELSE p.text_weight / (p.rrf_k + lexical.text_rank)
         END
       )::DOUBLE PRECISION AS rrf_score,
       semantic.semantic_rank,
@@ -424,10 +450,11 @@ AS $$
   ORDER BY scored.rrf_score DESC, scored.created_at DESC, scored.id
   OFFSET (SELECT result_offset FROM parameters)
   LIMIT (SELECT result_limit FROM parameters);
+END;
 $$;
 
-REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION)
+REVOKE ALL ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.hybrid_search_thoughts(TEXT, vector(1536), INT, INT, JSONB, BOOLEAN, INT, DOUBLE PRECISION, DOUBLE PRECISION, DOUBLE PRECISION)
   TO authenticated, service_role;
 
 -- ============================================================

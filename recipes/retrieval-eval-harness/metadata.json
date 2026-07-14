@@ -1,0 +1,20 @@
+{
+  "name": "Retrieval Eval Harness",
+  "description": "Measure Open Brain retrieval quality (hit@k, MRR, latency) across semantic, full-text, and hybrid weighted-RRF modes against your own golden set — fail-closed defaults, warmup-separated latency methodology, privacy-safe report handling.",
+  "category": "recipes",
+  "author": {
+    "name": "Thomas Verdenne",
+    "github": "tomatozor"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["OpenRouter or OpenAI embeddings API"],
+    "tools": ["Node.js 18+"]
+  },
+  "tags": ["evaluation", "retrieval", "hybrid-search", "metrics", "benchmark"],
+  "difficulty": "intermediate",
+  "estimated_time": "30 minutes",
+  "created": "2026-07-14",
+  "updated": "2026-07-14"
+}
