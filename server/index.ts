@@ -12,30 +12,63 @@ const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const RRF_K = 60;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-type ThoughtMatch = {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  similarity: number;
-  created_at: string;
-};
+type JsonObject = Record<string, unknown>;
 
 type ThoughtRecord = {
   id: string;
   content: string;
-  metadata: Record<string, unknown>;
+  metadata: JsonObject | null;
   created_at: string;
   updated_at?: string | null;
+  type?: string | null;
+  source_type?: string | null;
+  importance?: number | null;
+  quality_score?: number | string | null;
+  sensitivity_tier?: string | null;
+  similarity?: number | null;
+  score?: number | null;
+  rrf_score?: number | null;
+  rank?: number | null;
+  total_count?: number | string | null;
 };
 
-const CITATION_BASE_URL =
-  Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") || "https://openbrain.local/thoughts";
+type SearchFilters = {
+  type?: string;
+  source_type?: string;
+  min_importance?: number;
+  start_date?: string;
+  end_date?: string;
+  include_restricted: boolean;
+};
+
+type HybridSearchInput = {
+  query: string;
+  queryEmbedding: number[];
+  limit: number;
+  offset: number;
+  filter: JsonObject;
+  includeRestricted: boolean;
+};
+
+type HybridSearchDependencies = {
+  primary: (
+    input: HybridSearchInput,
+  ) => Promise<{ data: unknown; error: unknown }>;
+  semantic: () => Promise<ThoughtRecord[]>;
+  text: () => Promise<ThoughtRecord[]>;
+};
+
+const CITATION_BASE_URL = Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") ||
+  "https://openbrain.local/thoughts";
 
 function thoughtTitle(content: string, createdAt?: string): string {
   const firstLine = content.replace(/\s+/g, " ").trim().slice(0, 80);
-  const datePrefix = createdAt ? new Date(createdAt).toLocaleDateString() : "Open Brain";
+  const datePrefix = createdAt
+    ? new Date(createdAt).toLocaleDateString()
+    : "Open Brain";
   return firstLine ? `${datePrefix} - ${firstLine}` : `${datePrefix} thought`;
 }
 
@@ -43,8 +76,101 @@ function thoughtUrl(id: string): string {
   return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
 }
 
+function asMetadata(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonObject)
+    : {};
+}
+
+function metadataExcerpt(metadata: unknown): JsonObject {
+  const source = asMetadata(metadata);
+  const excerpt: JsonObject = {};
+  for (const key of ["topics", "people", "action_items"]) {
+    if (Array.isArray(source[key])) excerpt[key] = source[key];
+  }
+  return excerpt;
+}
+
+function isDeleted(row: Pick<ThoughtRecord, "metadata">): boolean {
+  return asMetadata(row.metadata).deleted === true;
+}
+
+function rowType(row: ThoughtRecord): string | null {
+  const metadataType = asMetadata(row.metadata).type;
+  return row.type ?? (typeof metadataType === "string" ? metadataType : null);
+}
+
+function rowSourceType(row: ThoughtRecord): string | null {
+  const metadataSourceType = asMetadata(row.metadata).source_type;
+  return row.source_type ??
+    (typeof metadataSourceType === "string" ? metadataSourceType : null);
+}
+
+function rowImportance(row: ThoughtRecord): number {
+  const metadataImportance = asMetadata(row.metadata).importance;
+  const value = row.importance ?? metadataImportance;
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function matchesSearchFilters(
+  row: ThoughtRecord,
+  filters: SearchFilters,
+): boolean {
+  if (isDeleted(row)) return false;
+  if (
+    !filters.include_restricted &&
+    row.sensitivity_tier === "restricted"
+  ) return false;
+  if (filters.type && rowType(row) !== filters.type) return false;
+  if (filters.source_type && rowSourceType(row) !== filters.source_type) {
+    return false;
+  }
+  if (
+    filters.min_importance !== undefined &&
+    rowImportance(row) < filters.min_importance
+  ) return false;
+  if (filters.start_date && row.created_at < filters.start_date) return false;
+  if (filters.end_date && row.created_at > filters.end_date) return false;
+  return true;
+}
+
+function searchScore(row: ThoughtRecord): number {
+  for (const value of [row.score, row.rrf_score, row.rank, row.similarity]) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function serializeSearchRow(row: ThoughtRecord): JsonObject {
+  const result: JsonObject = {
+    id: row.id,
+    score: searchScore(row),
+    date: row.created_at,
+    type: rowType(row),
+    metadata: metadataExcerpt(row.metadata),
+    content: row.content,
+  };
+  if (typeof row.similarity === "number") {
+    result.similarity = row.similarity;
+  }
+  return result;
+}
+
+function toolJson(value: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+  };
+}
+
+function toolError(message: string) {
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+  };
+}
+
 async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const response = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -55,16 +181,18 @@ async function getEmbedding(text: string): Promise<number[]> {
       input: text,
     }),
   });
-  if (!r.ok) {
-    const msg = await r.text().catch(() => "");
-    throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
+  if (!response.ok) {
+    const message = await response.text().catch(() => "");
+    throw new Error(
+      `OpenRouter embeddings failed: ${response.status} ${message}`,
+    );
   }
-  const d = await r.json();
-  return d.data[0].embedding;
+  const body = await response.json();
+  return body.data[0].embedding;
 }
 
-async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+async function extractMetadata(text: string): Promise<JsonObject> {
+  const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENROUTER_API_KEY}`,
@@ -76,7 +204,8 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       messages: [
         {
           role: "system",
-          content: `Extract metadata from the user's captured thought. Return JSON with:
+          content:
+            `Extract metadata from the user's captured thought. Return JSON with:
 - "people": array of people mentioned (empty if none)
 - "action_items": array of implied to-dos (empty if none)
 - "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
@@ -88,70 +217,337 @@ Only extract what's explicitly there.`,
       ],
     }),
   });
-  const d = await r.json();
+  const body = await response.json();
   try {
-    return JSON.parse(d.choices[0].message.content);
+    return JSON.parse(body.choices[0].message.content);
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
 }
 
-// --- MCP Server Setup ---
+function errorText(error: unknown): string {
+  if (!error) return "";
+  if (typeof error === "string") return error;
+  if (typeof error === "object") {
+    const parts = ["code", "message", "details", "hint"]
+      .map((key) => (error as JsonObject)[key])
+      .filter((value): value is string => typeof value === "string");
+    if (parts.length) return parts.join(" ");
+  }
+  return String(error);
+}
+
+export function isMissingHybridRpcError(error: unknown): boolean {
+  if (
+    error &&
+    typeof error === "object" &&
+    (error as JsonObject).code === "PGRST202"
+  ) return true;
+  const text = errorText(error).toLowerCase();
+  return text.includes("hybrid_search_thoughts") &&
+    (text.includes("does not exist") ||
+      text.includes("could not find the function") ||
+      text.includes("schema cache"));
+}
+
+export function fuseRrf(
+  semanticRows: ThoughtRecord[],
+  textRows: ThoughtRecord[],
+  k = RRF_K,
+): ThoughtRecord[] {
+  const fused = new Map<string, { row: ThoughtRecord; score: number }>();
+  for (const rows of [semanticRows, textRows]) {
+    rows.forEach((row, index) => {
+      const current = fused.get(row.id);
+      const contribution = 1 / (k + index + 1);
+      if (current) {
+        current.score += contribution;
+        current.row = { ...current.row, ...row };
+      } else {
+        fused.set(row.id, { row: { ...row }, score: contribution });
+      }
+    });
+  }
+  return [...fused.values()]
+    .map(({ row, score }) => ({ ...row, score }))
+    .sort((a, b) =>
+      searchScore(b) - searchScore(a) || a.id.localeCompare(b.id)
+    );
+}
+
+export async function retrieveHybrid(
+  input: HybridSearchInput,
+  dependencies: HybridSearchDependencies,
+): Promise<{ rows: ThoughtRecord[]; source: "rpc" | "fallback" }> {
+  const primary = await dependencies.primary(input);
+  if (!primary.error) {
+    return {
+      rows: (primary.data ?? []) as ThoughtRecord[],
+      source: "rpc",
+    };
+  }
+  if (!isMissingHybridRpcError(primary.error)) {
+    throw new Error(
+      `hybrid_search_thoughts failed: ${errorText(primary.error)}`,
+    );
+  }
+
+  const [semanticRows, textRows] = await Promise.all([
+    dependencies.semantic(),
+    dependencies.text(),
+  ]);
+  return {
+    rows: fuseRrf(semanticRows, textRows, RRF_K).slice(
+      input.offset,
+      input.offset + input.limit,
+    ),
+    source: "fallback",
+  };
+}
+
+async function hydrateRows(rows: ThoughtRecord[]): Promise<ThoughtRecord[]> {
+  const ids = [...new Set(rows.map((row) => row.id).filter(Boolean))];
+  if (!ids.length) return [];
+
+  const details: ThoughtRecord[] = [];
+  for (let index = 0; index < ids.length; index += 100) {
+    const batch = ids.slice(index, index + 100);
+    const { data, error } = await supabase
+      .from("thoughts")
+      .select(
+        "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
+      )
+      .in("id", batch);
+    if (error) throw new Error(`thought hydration failed: ${error.message}`);
+    details.push(...((data ?? []) as ThoughtRecord[]));
+  }
+
+  const byId = new Map(details.map((row) => [row.id, row]));
+  return rows
+    .filter((row) => byId.has(row.id))
+    .map((row) => ({
+      ...row,
+      ...byId.get(row.id),
+      similarity: row.similarity,
+    }));
+}
+
+async function semanticCandidates(
+  embedding: number[],
+  threshold: number,
+  needed: number,
+  filters: SearchFilters,
+): Promise<ThoughtRecord[]> {
+  const filteredSearch = Boolean(
+    filters.type ||
+      filters.source_type ||
+      filters.min_importance !== undefined ||
+      filters.start_date ||
+      filters.end_date ||
+      !filters.include_restricted,
+  );
+  const matchCount = Math.min(
+    1000,
+    Math.max(needed + 1, filteredSearch ? (needed + 1) * 4 : needed + 20, 50),
+  );
+  const { data, error } = await supabase.rpc("match_thoughts", {
+    query_embedding: embedding,
+    match_threshold: threshold,
+    match_count: matchCount,
+  });
+  if (error) throw new Error(`match_thoughts failed: ${error.message}`);
+  const hydrated = await hydrateRows((data ?? []) as ThoughtRecord[]);
+  return hydrated.filter((row) => matchesSearchFilters(row, filters));
+}
+
+async function textCandidates(
+  query: string,
+  needed: number,
+  filters: SearchFilters,
+): Promise<ThoughtRecord[]> {
+  const matches: ThoughtRecord[] = [];
+  let rpcOffset = 0;
+  let totalCount = Number.POSITIVE_INFINITY;
+
+  while (
+    matches.length < needed && rpcOffset < totalCount && rpcOffset < 2500
+  ) {
+    const { data, error } = await supabase.rpc("search_thoughts_text", {
+      p_query: query,
+      p_limit: 100,
+      p_filter: {},
+      p_offset: rpcOffset,
+    });
+    if (error) throw new Error(`search_thoughts_text failed: ${error.message}`);
+    const rows = (data ?? []) as ThoughtRecord[];
+    if (!rows.length) break;
+    const parsedTotal = Number(rows[0].total_count);
+    if (Number.isFinite(parsedTotal)) totalCount = parsedTotal;
+    matches.push(...rows.filter((row) => matchesSearchFilters(row, filters)));
+    rpcOffset += rows.length;
+  }
+
+  return matches;
+}
+
+async function excludeDeletedConnections(
+  rows: JsonObject[],
+): Promise<JsonObject[]> {
+  const ids = rows
+    .map((row) => row.id)
+    .filter((id): id is string => typeof id === "string");
+  if (!ids.length) return [];
+  const { data, error } = await supabase
+    .from("thoughts")
+    .select("id, metadata")
+    .in("id", ids);
+  if (error) throw new Error(`connection filtering failed: ${error.message}`);
+  const visible = new Set(
+    ((data ?? []) as Array<{ id: string; metadata: JsonObject | null }>)
+      .filter((row) => !isDeleted(row))
+      .map((row) => row.id),
+  );
+  return rows.filter((row) =>
+    typeof row.id === "string" && visible.has(row.id)
+  );
+}
+
+function searchFilterPayload(filters: SearchFilters): JsonObject {
+  const payload: JsonObject = {};
+  if (filters.type) payload.type = filters.type;
+  if (filters.source_type) payload.source_type = filters.source_type;
+  if (filters.min_importance !== undefined) {
+    payload.min_importance = filters.min_importance;
+  }
+  if (filters.start_date) payload.start_date = filters.start_date;
+  if (filters.end_date) payload.end_date = filters.end_date;
+  return payload;
+}
+
+async function runSearch(params: {
+  query: string;
+  mode: "hybrid" | "semantic" | "text";
+  limit: number;
+  offset: number;
+  threshold: number;
+  filters: SearchFilters;
+}): Promise<JsonObject> {
+  const needed = params.offset + params.limit + 1;
+  let rows: ThoughtRecord[];
+  let source: string = params.mode;
+
+  if (params.mode === "text") {
+    rows = (await textCandidates(params.query, needed, params.filters)).slice(
+      params.offset,
+      params.offset + params.limit,
+    );
+  } else {
+    const embedding = await getEmbedding(params.query);
+    if (params.mode === "semantic") {
+      rows = (
+        await semanticCandidates(
+          embedding,
+          params.threshold,
+          needed,
+          params.filters,
+        )
+      ).slice(params.offset, params.offset + params.limit);
+    } else {
+      const candidateCount = Math.min(
+        1000,
+        Math.max((needed + 1) * 4, 100),
+      );
+      const hybrid = await retrieveHybrid(
+        {
+          query: params.query,
+          queryEmbedding: embedding,
+          limit: params.limit,
+          offset: params.offset,
+          filter: searchFilterPayload(params.filters),
+          includeRestricted: params.filters.include_restricted,
+        },
+        {
+          primary: async (input) =>
+            await supabase.rpc("hybrid_search_thoughts", {
+              p_query: input.query,
+              p_query_embedding: input.queryEmbedding,
+              p_limit: input.limit,
+              p_offset: input.offset,
+              p_filter: input.filter,
+              p_include_restricted: input.includeRestricted,
+              p_rrf_k: RRF_K,
+            }),
+          semantic: async () =>
+            await semanticCandidates(
+              embedding,
+              0.3,
+              candidateCount,
+              params.filters,
+            ),
+          text: async () =>
+            await textCandidates(params.query, candidateCount, params.filters),
+        },
+      );
+      rows = await hydrateRows(hybrid.rows);
+      source = hybrid.source === "rpc" ? "hybrid_rpc" : "hybrid_rrf_fallback";
+    }
+  }
+
+  rows = rows.filter((row) => matchesSearchFilters(row, params.filters));
+  return {
+    mode: params.mode,
+    source,
+    results: rows.map(serializeSearchRow),
+    pagination: {
+      offset: params.offset,
+      limit: params.limit,
+      returned: rows.length,
+    },
+  };
+}
 
 function buildServer(): McpServer {
   const server = new McpServer({
     name: "open-brain",
-    version: "1.0.0",
+    version: "2.0.0",
   });
 
-  // ChatGPT compatibility: restricted connector surfaces, company knowledge, and deep
-  // research look for exact read-only `search` and `fetch` tool shapes.
   server.registerTool(
     "search",
     {
       title: "Search Open Brain",
       description:
-        "Search Open Brain memories by meaning. Use this read-only compatibility tool when ChatGPT needs search/fetch-style access to stored thoughts.",
-      annotations: {
-        readOnlyHint: true,
-      },
+        "Search Open Brain memories. This read-only compatibility tool preserves the ChatGPT search/fetch contract.",
+      annotations: { readOnlyHint: true },
       inputSchema: {
-        query: z.string().describe("The search query to run against Open Brain thoughts"),
+        query: z.string().min(1).describe("The search query to run"),
       },
     },
     async ({ query }) => {
       try {
-        const qEmb = await getEmbedding(query);
-        const { data, error } = await supabase.rpc("match_thoughts", {
-          query_embedding: qEmb,
-          match_threshold: 0.5,
-          match_count: 10,
-          filter: {},
+        const result = await runSearch({
+          query,
+          mode: "hybrid",
+          limit: 10,
+          offset: 0,
+          threshold: 0.5,
+          filters: { include_restricted: false },
         });
-
-        if (error) {
-          return {
-            content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-            isError: true,
-          };
-        }
-
-        const results = ((data || []) as ThoughtMatch[]).map((t) => ({
-          id: t.id,
-          title: thoughtTitle(t.content, t.created_at),
-          url: thoughtUrl(t.id),
-        }));
-
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
-        };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+        const rows = result.results as JsonObject[];
+        return toolJson({
+          results: rows.map((row) => ({
+            id: row.id,
+            title: thoughtTitle(
+              String(row.content ?? ""),
+              String(row.date ?? ""),
+            ),
+            url: thoughtUrl(String(row.id)),
+          })),
+        });
+      } catch (error) {
+        return toolError(`Search error: ${(error as Error).message}`);
       }
-    }
+    },
   );
 
   server.registerTool(
@@ -159,289 +555,368 @@ function buildServer(): McpServer {
     {
       title: "Fetch Open Brain Thought",
       description:
-        "Fetch one Open Brain thought by ID after using search. Use this read-only compatibility tool to retrieve the full text and metadata for citation.",
-      annotations: {
-        readOnlyHint: true,
-      },
+        "Fetch one visible Open Brain thought by ID, including metadata and best-effort connections.",
+      annotations: { readOnlyHint: true },
       inputSchema: {
-        id: z.string().describe("The Open Brain thought ID returned by the search tool"),
+        id: z.string().uuid().describe("Thought UUID returned by search"),
       },
     },
     async ({ id }) => {
       try {
         const { data, error } = await supabase
           .from("thoughts")
-          .select("id, content, metadata, created_at, updated_at")
+          .select(
+            "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
+          )
           .eq("id", id)
+          .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
+          .or("sensitivity_tier.is.null,sensitivity_tier.neq.restricted")
           .single();
+        if (error || !data) {
+          return toolError(`Fetch error: thought ${id} not found`);
+        }
 
-        if (error) {
-          return {
-            content: [{ type: "text" as const, text: `Fetch error: ${error.message}` }],
-            isError: true,
-          };
+        let connections: JsonObject[] = [];
+        const connectionResult = await supabase.rpc("get_thought_connections", {
+          p_thought_id: id,
+          p_limit: 20,
+          p_exclude_restricted: true,
+        });
+        if (!connectionResult.error) {
+          try {
+            connections = await excludeDeletedConnections(
+              (connectionResult.data ?? []) as JsonObject[],
+            );
+          } catch {
+            connections = [];
+          }
         }
 
         const thought = data as ThoughtRecord;
-        const document = {
+        return toolJson({
           id: thought.id,
           title: thoughtTitle(thought.content, thought.created_at),
           text: thought.content,
           url: thoughtUrl(thought.id),
           metadata: {
-            ...thought.metadata,
+            ...asMetadata(thought.metadata),
+            type: rowType(thought),
+            source_type: rowSourceType(thought),
+            importance: rowImportance(thought),
+            quality_score: thought.quality_score,
+            sensitivity_tier: thought.sensitivity_tier,
             created_at: thought.created_at,
             updated_at: thought.updated_at,
           },
-        };
-
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(document) }],
-        };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+          connections,
+        });
+      } catch (error) {
+        return toolError(`Fetch error: ${(error as Error).message}`);
       }
-    }
+    },
   );
 
-  // Tool 1: Semantic Search
   server.registerTool(
     "search_thoughts",
     {
-      title: "Search Thoughts",
+      title: "Search Thoughts v2",
       description:
-        "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
-      annotations: {
-        readOnlyHint: true,
-      },
+        "Filtered, paginated hybrid, semantic, or full-text retrieval. Hybrid mode tries the database RPC first and falls back to deterministic server-side RRF.",
+      annotations: { readOnlyHint: true },
       inputSchema: {
-        query: z.string().describe("What to search for"),
-        limit: z.number().optional().default(10),
-        threshold: z.number().optional().default(0.5),
+        query: z.string().min(1),
+        mode: z.enum(["hybrid", "semantic", "text"]).default("hybrid")
+          .optional(),
+        limit: z.number().int().min(1).max(50).default(10).optional(),
+        offset: z.number().int().min(0).default(0).optional(),
+        type: z.string().min(1).optional(),
+        source_type: z.string().min(1).optional(),
+        min_importance: z.number().int().min(0).max(5).optional(),
+        start_date: z.string().min(1).optional(),
+        end_date: z.string().min(1).optional(),
+        include_restricted: z.boolean().default(false).optional(),
+        threshold: z.number().min(0).max(1).default(0.5).optional(),
       },
     },
-    async ({ query, limit, threshold }) => {
+    async ({
+      query,
+      mode = "hybrid",
+      limit = 10,
+      offset = 0,
+      type,
+      source_type,
+      min_importance,
+      start_date,
+      end_date,
+      include_restricted = false,
+      threshold = 0.5,
+    }) => {
       try {
-        const qEmb = await getEmbedding(query);
-        const { data, error } = await supabase.rpc("match_thoughts", {
-          query_embedding: qEmb,
-          match_threshold: threshold,
-          match_count: limit,
-          filter: {},
-        });
-
-        if (error) {
-          return {
-            content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-            isError: true,
-          };
-        }
-
-        if (!data || data.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
-          };
-        }
-
-        const results = data.map(
-          (
-            t: ThoughtMatch,
-            i: number
-          ) => {
-            const m = t.metadata || {};
-            const parts = [
-              `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
-              `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-              `Type: ${m.type || "unknown"}`,
-            ];
-            if (Array.isArray(m.topics) && m.topics.length)
-              parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
-            if (Array.isArray(m.people) && m.people.length)
-              parts.push(`People: ${(m.people as string[]).join(", ")}`);
-            if (Array.isArray(m.action_items) && m.action_items.length)
-              parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
-            parts.push(`\n${t.content}`);
-            return parts.join("\n");
-          }
-        );
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+        return toolJson(
+          await runSearch({
+            query,
+            mode,
+            limit,
+            offset,
+            threshold,
+            filters: {
+              type,
+              source_type,
+              min_importance,
+              start_date,
+              end_date,
+              include_restricted,
             },
-          ],
-        };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+          }),
+        );
+      } catch (error) {
+        return toolError(`search_thoughts error: ${(error as Error).message}`);
       }
-    }
+    },
   );
 
-  // Tool 2: List Recent
+  server.registerTool(
+    "recall_context",
+    {
+      title: "Recall Context",
+      description:
+        "Deterministically recall recent important context without embeddings or model calls.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        scope_topics: z.array(z.string().min(1)).optional(),
+        scope_people: z.array(z.string().min(1)).optional(),
+        days: z.number().int().min(0).max(3650).default(30).optional(),
+        limit: z.number().int().min(1).max(50).default(12).optional(),
+        min_importance: z.number().int().min(0).max(5).default(0).optional(),
+        include_restricted: z.boolean().default(false).optional(),
+      },
+    },
+    async ({
+      scope_topics,
+      scope_people,
+      days = 30,
+      limit = 12,
+      min_importance = 0,
+      include_restricted = false,
+    }) => {
+      try {
+        let query = supabase
+          .from("thoughts")
+          .select("id, content, type, importance, created_at, metadata")
+          .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
+          .gte("importance", min_importance)
+          .order("importance", { ascending: false, nullsFirst: false })
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: true })
+          .limit(limit);
+        if (!include_restricted) {
+          query = query.or(
+            "sensitivity_tier.is.null,sensitivity_tier.neq.restricted",
+          );
+        }
+        if (days > 0) {
+          query = query.gte(
+            "created_at",
+            new Date(Date.now() - days * 86_400_000).toISOString(),
+          );
+        }
+        if (scope_topics?.length) {
+          query = query.contains("metadata", { topics: scope_topics });
+        }
+        if (scope_people?.length) {
+          query = query.contains("metadata", { people: scope_people });
+        }
+
+        const { data, error } = await query;
+        if (error) throw new Error(error.message);
+        const results = ((data ?? []) as ThoughtRecord[]).map((row) => ({
+          id: row.id,
+          date: row.created_at,
+          type: rowType(row),
+          importance: rowImportance(row),
+          summary: row.content.slice(0, 240),
+        }));
+        return toolJson({ results });
+      } catch (error) {
+        return toolError(`recall_context error: ${(error as Error).message}`);
+      }
+    },
+  );
+
   server.registerTool(
     "list_thoughts",
     {
-      title: "List Recent Thoughts",
-      description:
-        "List recently captured thoughts with optional filters by type, topic, person, or time range.",
-      annotations: {
-        readOnlyHint: true,
-      },
+      title: "List Thoughts",
+      description: "List visible thoughts with filters and offset pagination.",
+      annotations: { readOnlyHint: true },
       inputSchema: {
-        limit: z.number().optional().default(10),
-        type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
-        topic: z.string().optional().describe("Filter by topic tag"),
-        person: z.string().optional().describe("Filter by person mentioned"),
-        days: z.number().optional().describe("Only thoughts from the last N days"),
+        limit: z.number().int().min(1).max(50).default(10).optional(),
+        offset: z.number().int().min(0).default(0).optional(),
+        type: z.string().min(1).optional(),
+        source_type: z.string().min(1).optional(),
+        min_importance: z.number().int().min(0).max(5).optional(),
+        topic: z.string().min(1).optional(),
+        person: z.string().min(1).optional(),
+        days: z.number().int().min(0).max(3650).optional(),
+        include_restricted: z.boolean().default(false).optional(),
       },
     },
-    async ({ limit, type, topic, person, days }) => {
+    async ({
+      limit = 10,
+      offset = 0,
+      type,
+      source_type,
+      min_importance,
+      topic,
+      person,
+      days,
+      include_restricted = false,
+    }) => {
       try {
-        let q = supabase
+        let query = supabase
           .from("thoughts")
-          .select("content, metadata, created_at")
+          .select(
+            "id, content, metadata, created_at, updated_at, type, source_type, importance, quality_score, sensitivity_tier",
+          )
+          .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
           .order("created_at", { ascending: false })
-          .limit(limit);
-
-        if (type) q = q.contains("metadata", { type });
-        if (topic) q = q.contains("metadata", { topics: [topic] });
-        if (person) q = q.contains("metadata", { people: [person] });
-        if (days) {
-          const since = new Date();
-          since.setDate(since.getDate() - days);
-          q = q.gte("created_at", since.toISOString());
+          .order("id", { ascending: true })
+          .range(offset, offset + limit);
+        if (!include_restricted) {
+          query = query.or(
+            "sensitivity_tier.is.null,sensitivity_tier.neq.restricted",
+          );
+        }
+        if (type) query = query.eq("type", type);
+        if (source_type) query = query.eq("source_type", source_type);
+        if (min_importance !== undefined) {
+          query = query.gte("importance", min_importance);
+        }
+        if (topic) query = query.contains("metadata", { topics: [topic] });
+        if (person) query = query.contains("metadata", { people: [person] });
+        if (days && days > 0) {
+          query = query.gte(
+            "created_at",
+            new Date(Date.now() - days * 86_400_000).toISOString(),
+          );
         }
 
-        const { data, error } = await q;
-
-        if (error) {
-          return {
-            content: [{ type: "text" as const, text: `Error: ${error.message}` }],
-            isError: true,
-          };
-        }
-
-        if (!data || !data.length) {
-          return { content: [{ type: "text" as const, text: "No thoughts found." }] };
-        }
-
-        const results = data.map(
-          (
-            t: { content: string; metadata: Record<string, unknown>; created_at: string },
-            i: number
-          ) => {
-            const m = t.metadata || {};
-            const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-            return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
-          }
-        );
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
-            },
-          ],
-        };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+        const { data, error } = await query;
+        if (error) throw new Error(error.message);
+        const rows = (data ?? []) as ThoughtRecord[];
+        const page = rows.slice(0, limit);
+        return toolJson({
+          results: page.map((row) => ({
+            id: row.id,
+            date: row.created_at,
+            type: rowType(row),
+            source_type: rowSourceType(row),
+            importance: rowImportance(row),
+            metadata: metadataExcerpt(row.metadata),
+            content: row.content,
+          })),
+          pagination: {
+            offset,
+            limit,
+            returned: page.length,
+            has_more: rows.length > limit,
+          },
+        });
+      } catch (error) {
+        return toolError(`list_thoughts error: ${(error as Error).message}`);
       }
-    }
+    },
   );
 
-  // Tool 3: Stats
   server.registerTool(
     "thought_stats",
     {
-      title: "Thought Statistics",
-      description: "Get a summary of all captured thoughts: totals, types, top topics, and people.",
-      annotations: {
-        readOnlyHint: true,
+      title: "Thought Statistics v2",
+      description:
+        "Return exact server-side aggregates without downloading thought rows.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        since_days: z.number().int().min(0).max(3650).default(3650).optional(),
+        include_restricted: z.boolean().default(false).optional(),
       },
-      inputSchema: {},
     },
-    async () => {
+    async ({ since_days = 3650, include_restricted = false }) => {
       try {
-        const { count } = await supabase
-          .from("thoughts")
-          .select("*", { count: "exact", head: true });
-
-        const { data } = await supabase
-          .from("thoughts")
-          .select("metadata, created_at")
-          .order("created_at", { ascending: false });
-
-        const types: Record<string, number> = {};
-        const topics: Record<string, number> = {};
-        const people: Record<string, number> = {};
-
-        for (const r of data || []) {
-          const m = (r.metadata || {}) as Record<string, unknown>;
-          if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
-          if (Array.isArray(m.topics))
-            for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
-          if (Array.isArray(m.people))
-            for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
+        const { data, error } = await supabase.rpc("brain_stats_aggregate", {
+          p_since_days: since_days,
+          p_exclude_restricted: !include_restricted,
+        });
+        if (error) {
+          return toolError(
+            `thought_stats error: brain_stats_aggregate failed: ${error.message}`,
+          );
         }
-
-        const sort = (o: Record<string, number>): [string, number][] =>
-          Object.entries(o)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 10);
-
-        const lines: string[] = [
-          `Total thoughts: ${count}`,
-          `Date range: ${
-            data?.length
-              ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
-                " → " +
-                new Date(data[0].created_at).toLocaleDateString()
-              : "N/A"
+        return toolJson({
+          since_days,
+          include_restricted,
+          aggregate: data,
+        });
+      } catch (error) {
+        return toolError(
+          `thought_stats error: brain_stats_aggregate failed: ${
+            (error as Error).message
           }`,
-          "",
-          "Types:",
-          ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
-        ];
-
-        if (Object.keys(topics).length) {
-          lines.push("", "Top topics:");
-          for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
-        }
-
-        if (Object.keys(people).length) {
-          lines.push("", "People mentioned:");
-          for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
-        }
-
-        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+        );
       }
-    }
+    },
   );
 
-  // Tool 4: Capture Thought
+  server.registerTool(
+    "related_thoughts",
+    {
+      title: "Related Thoughts",
+      description: "Find visible connections for a thought.",
+      annotations: { readOnlyHint: true },
+      inputSchema: {
+        thought_id: z.string().uuid(),
+        limit: z.number().int().min(1).max(50).default(10).optional(),
+      },
+    },
+    async ({ thought_id, limit = 10 }) => {
+      try {
+        const source = await supabase
+          .from("thoughts")
+          .select("id")
+          .eq("id", thought_id)
+          .or("metadata->>deleted.is.null,metadata->>deleted.neq.true")
+          .or("sensitivity_tier.is.null,sensitivity_tier.neq.restricted")
+          .maybeSingle();
+        if (source.error || !source.data) {
+          return toolError(
+            `related_thoughts error: thought ${thought_id} not found`,
+          );
+        }
+        const { data, error } = await supabase.rpc("get_thought_connections", {
+          p_thought_id: thought_id,
+          p_limit: Math.min(limit * 2, 50),
+          p_exclude_restricted: true,
+        });
+        if (error) {
+          return toolError(`related_thoughts error: ${error.message}`);
+        }
+        const rows = await excludeDeletedConnections(
+          (data ?? []) as JsonObject[],
+        );
+        return toolJson({
+          thought_id,
+          results: rows.slice(0, limit),
+        });
+      } catch (error) {
+        return toolError(`related_thoughts error: ${(error as Error).message}`);
+      }
+    },
+  );
+
   server.registerTool(
     "capture_thought",
     {
       title: "Capture Thought",
-      description:
-        "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
+      description: "Save a thought, extract metadata, and attach an embedding.",
       annotations: {
         readOnlyHint: false,
         openWorldHint: false,
@@ -449,7 +924,7 @@ function buildServer(): McpServer {
         idempotentHint: false,
       },
       inputSchema: {
-        content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+        content: z.string().min(1).max(50_000),
       },
     },
     async ({ content }) => {
@@ -458,186 +933,324 @@ function buildServer(): McpServer {
           getEmbedding(content),
           extractMetadata(content),
         ]);
-
-        const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
+        const { data, error } = await supabase.rpc("upsert_thought", {
           p_content: content,
           p_payload: { metadata: { ...metadata, source: "mcp" } },
         });
-
-        if (upsertError) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
-            isError: true,
-          };
+        if (error) return toolError(`Failed to capture: ${error.message}`);
+        const thoughtId = (data as JsonObject | null)?.id;
+        if (typeof thoughtId !== "string") {
+          return toolError("Failed to capture: upsert_thought returned no id");
         }
-
-        const thoughtId = upsertResult?.id;
-        const { error: embError } = await supabase
+        const embeddingResult = await supabase
           .from("thoughts")
-          .update({ embedding })
+          .update({ embedding: `[${embedding.join(",")}]` })
           .eq("id", thoughtId);
+        if (embeddingResult.error) {
+          return toolError(
+            `Failed to save embedding: ${embeddingResult.error.message}`,
+          );
+        }
+        return toolJson({ id: thoughtId, captured: true, metadata });
+      } catch (error) {
+        return toolError(`capture_thought error: ${(error as Error).message}`);
+      }
+    },
+  );
 
-        if (embError) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
-            isError: true,
-          };
+  server.registerTool(
+    "update_thought",
+    {
+      title: "Update Thought",
+      description:
+        "Safely update content and/or shallow-merge metadata, with optional optimistic concurrency.",
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+      },
+      inputSchema: {
+        id: z.string().uuid(),
+        content: z.string().min(1).max(50_000).optional(),
+        metadata_patch: z.record(z.string(), z.unknown()).optional(),
+        if_unchanged_since: z.string().datetime({ offset: true }).optional(),
+      },
+    },
+    async ({ id, content, metadata_patch, if_unchanged_since }) => {
+      try {
+        if (
+          metadata_patch &&
+          ["deleted", "deleted_at", "deleted_by"].some((key) =>
+            Object.hasOwn(metadata_patch, key)
+          )
+        ) {
+          return toolError(
+            "update_thought error: deletion metadata is managed by delete_thought",
+          );
         }
 
-        const meta = metadata as Record<string, unknown>;
-        let confirmation = `Captured as ${meta.type || "thought"}`;
-        if (Array.isArray(meta.topics) && meta.topics.length)
-          confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-        if (Array.isArray(meta.people) && meta.people.length)
-          confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
-        if (Array.isArray(meta.action_items) && meta.action_items.length)
-          confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+        const { data: existing, error: fetchError } = await supabase
+          .from("thoughts")
+          .select("id, content, metadata, created_at, updated_at")
+          .eq("id", id)
+          .not("metadata", "cs", '{"deleted":true}')
+          .single();
+        if (fetchError || !existing) {
+          return toolError(`update_thought error: thought ${id} not found`);
+        }
 
-        return {
-          content: [{ type: "text" as const, text: confirmation }],
-        };
-      } catch (err: unknown) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-          isError: true,
-        };
+        if (if_unchanged_since) {
+          const storedTime = new Date(
+            existing.updated_at ?? existing.created_at,
+          ).getTime();
+          if (storedTime > new Date(if_unchanged_since).getTime()) {
+            return toolError(
+              `STALE_READ: thought ${id} changed at ${
+                existing.updated_at ?? existing.created_at
+              }`,
+            );
+          }
+        }
+
+        const updates: JsonObject = {};
+        const contentChanged = content !== undefined &&
+          content !== existing.content;
+        if (contentChanged) {
+          const embedding = await getEmbedding(content);
+          updates.content = content;
+          updates.embedding = `[${embedding.join(",")}]`;
+        }
+        if (metadata_patch && Object.keys(metadata_patch).length) {
+          updates.metadata = {
+            ...asMetadata(existing.metadata),
+            ...metadata_patch,
+          };
+        }
+        if (!Object.keys(updates).length) {
+          return toolJson({
+            id,
+            changed: false,
+            updated_at: existing.updated_at,
+          });
+        }
+
+        let updateQuery = supabase
+          .from("thoughts")
+          .update(updates)
+          .eq("id", id)
+          .not("metadata", "cs", '{"deleted":true}');
+        if (if_unchanged_since) {
+          updateQuery = updateQuery.or(
+            `updated_at.is.null,updated_at.lte.${if_unchanged_since}`,
+          );
+        }
+        const { data, error } = await updateQuery
+          .select("id, content, metadata, created_at, updated_at")
+          .maybeSingle();
+        if (error) return toolError(`update_thought error: ${error.message}`);
+        if (!data) {
+          return toolError(
+            `STALE_READ: thought ${id} changed before the update could be applied`,
+          );
+        }
+        return toolJson({
+          id: data.id,
+          changed: true,
+          content_reembedded: contentChanged,
+          metadata: data.metadata,
+          created_at: data.created_at,
+          updated_at: data.updated_at,
+        });
+      } catch (error) {
+        return toolError(`update_thought error: ${(error as Error).message}`);
       }
-    }
+    },
+  );
+
+  server.registerTool(
+    "delete_thought",
+    {
+      title: "Logically Delete Thought",
+      description:
+        "Logically delete one thought. Requires confirm=true; never hard-deletes rows.",
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+      },
+      inputSchema: {
+        id: z.string().uuid(),
+        confirm: z.boolean().default(false).optional(),
+      },
+    },
+    async ({ id, confirm = false }) => {
+      if (confirm !== true) {
+        return toolError(
+          "delete_thought refused: confirm=true is required; no changes were made",
+        );
+      }
+      try {
+        const { data: existing, error: fetchError } = await supabase
+          .from("thoughts")
+          .select("id, content, metadata, created_at, updated_at")
+          .eq("id", id)
+          .single();
+        if (fetchError || !existing) {
+          return toolError(`delete_thought error: thought ${id} not found`);
+        }
+        const priorMetadata = asMetadata(existing.metadata);
+        if (priorMetadata.deleted === true) {
+          return toolJson({ id, deleted: true, already_deleted: true });
+        }
+
+        const deletedAt = new Date().toISOString();
+        const metadata = {
+          ...priorMetadata,
+          deleted: true,
+          deleted_at: deletedAt,
+          deleted_by: "mcp",
+        };
+        let deleteQuery = supabase
+          .from("thoughts")
+          .update({ metadata })
+          .eq("id", id)
+          .not("metadata", "cs", '{"deleted":true}');
+        deleteQuery = existing.updated_at
+          ? deleteQuery.eq("updated_at", existing.updated_at)
+          : deleteQuery.is("updated_at", null);
+        const { data, error } = await deleteQuery
+          .select("id, updated_at")
+          .maybeSingle();
+        if (error) return toolError(`delete_thought error: ${error.message}`);
+        if (!data) {
+          return toolError(
+            `STALE_READ: thought ${id} changed before logical deletion could be applied`,
+          );
+        }
+
+        try {
+          const auditResult = await supabase.from("thought_audit").insert({
+            thought_id: id,
+            action: "delete",
+            diff: {
+              previous_content: existing.content,
+              previous_metadata: priorMetadata,
+              deleted_at: deletedAt,
+              deleted_by: "mcp",
+            },
+          });
+          if (auditResult.error) {
+            console.warn("delete_thought audit unavailable");
+          }
+        } catch {
+          console.warn("delete_thought audit unavailable");
+        }
+
+        return toolJson({
+          id,
+          deleted: true,
+          deleted_at: deletedAt,
+          deleted_by: "mcp",
+        });
+      } catch (error) {
+        return toolError(`delete_thought error: ${(error as Error).message}`);
+      }
+    },
   );
 
   return server;
 }
 
-// --- Hono App with Auth + CORS ---
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
 
-// JSON-RPC error code for unauthorized requests.
-// Per the JSON-RPC 2.0 spec, the range -32099 to -32000 is reserved for
-// implementation-defined server errors. -32001 is the conventional
-// "Unauthorized" code used by MCP clients/servers in the wild.
-//
-// Why a JSON-RPC envelope (HTTP 200) instead of a bare HTTP 401?
-// Strict MCP hosts (Codex CLI, Claude Code) treat bare HTTP 4xx responses
-// as transport-level failures and tear the connection down rather than
-// surfacing the failure to the application layer. Wrapping the auth
-// rejection in a JSON-RPC error keeps the connection alive and lets
-// clients recover (e.g. prompt the user for a new key, refetch a stale
-// cache) instead of dying.
-const JSON_RPC_UNAUTHORIZED_CODE = -32001;
-const UNAUTHORIZED_MESSAGE = "Unauthorized: missing or invalid authentication.";
-
-/**
- * Read the request body as text without consuming the original request's
- * body stream for downstream handlers. Returns null on bodyless methods
- * or read failure.
- */
-async function readBodyText(req: Request): Promise<string | null> {
-  if (req.method === "GET" || req.method === "HEAD" || req.method === "DELETE") {
-    return null;
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const aBytes = encoder.encode(a);
+  const bBytes = encoder.encode(b);
+  const subtle = (crypto as unknown as {
+    subtle?: {
+      timingSafeEqual?: (
+        left: ArrayBufferView,
+        right: ArrayBufferView,
+      ) => boolean;
+    };
+  }).subtle;
+  if (
+    aBytes.length === bBytes.length &&
+    typeof subtle?.timingSafeEqual === "function"
+  ) {
+    return subtle.timingSafeEqual(aBytes, bBytes);
   }
-  try {
-    return await req.text();
-  } catch {
-    return null;
-  }
-}
 
-/**
- * Best-effort extraction of the JSON-RPC `id` from a raw request body.
- * Returns null when the body is missing, not JSON, or not a JSON-RPC
- * shape with an id. Per the JSON-RPC 2.0 spec, id may be a string,
- * number, or null — we preserve any of those; anything else becomes null.
- */
-function extractJsonRpcId(bodyText: string | null): string | number | null {
-  if (!bodyText) return null;
-  try {
-    const parsed = JSON.parse(bodyText);
-    if (parsed && typeof parsed === "object" && "id" in parsed) {
-      const id = (parsed as { id: unknown }).id;
-      if (typeof id === "string" || typeof id === "number" || id === null) {
-        return id;
-      }
-    }
-  } catch {
-    // fall through — malformed body
+  let difference = aBytes.length ^ bBytes.length;
+  const length = Math.max(aBytes.length, bBytes.length);
+  for (let index = 0; index < length; index++) {
+    difference |= (aBytes[index] ?? 0) ^ (bBytes[index] ?? 0);
   }
-  return null;
-}
-
-/**
- * Build a JSON-RPC 2.0 error envelope response for auth failures.
- * Returns HTTP 200 — the JSON-RPC layer expresses the error so that
- * strict MCP clients keep the connection alive instead of treating
- * the failure as a transport-level fault.
- */
-function unauthorizedResponse(id: string | number | null): Response {
-  const body = {
-    jsonrpc: "2.0",
-    error: {
-      code: JSON_RPC_UNAUTHORIZED_CODE,
-      message: UNAUTHORIZED_MESSAGE,
-    },
-    id,
-  };
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders,
-    },
-  });
+  return difference === 0;
 }
 
 const app = new Hono();
 
-// CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
-app.options("*", (c) => {
-  return c.text("ok", 200, corsHeaders);
-});
+app.options("*", (context) => context.text("ok", 200, corsHeaders));
 
-app.all("*", async (c) => {
-  // Accept access key via header OR URL query parameter
-  const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
-    // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
-    // HTTP 401 so strict MCP hosts treat this as an application-level
-    // error rather than a transport fault and keep the connection alive.
-    // Best-effort echo of the inbound request id keeps the response
-    // correlated; malformed/missing bodies fall back to id: null.
-    const bodyText = await readBodyText(c.req.raw);
-    const id = extractJsonRpcId(bodyText);
-    return unauthorizedResponse(id);
+app.all("*", async (context) => {
+  const headerKey = context.req.header("x-brain-key") ?? "";
+  const authorization = context.req.header("authorization") ?? "";
+  const bearerKey = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
+  const hasConfiguredKey = typeof MCP_ACCESS_KEY === "string" &&
+    MCP_ACCESS_KEY.length > 0;
+  const headerMatches = hasConfiguredKey &&
+    timingSafeEqualStrings(headerKey, MCP_ACCESS_KEY);
+  const bearerMatches = hasConfiguredKey &&
+    timingSafeEqualStrings(bearerKey, MCP_ACCESS_KEY);
+  if (!hasConfiguredKey || (!headerMatches && !bearerMatches)) {
+    return context.json(
+      { error: "Invalid or missing access key" },
+      401,
+      corsHeaders,
+    );
   }
 
-  // Fix: Claude Desktop connectors don't send the Accept header that
-  // StreamableHTTPTransport requires. Build a patched request if missing.
-  // See: https://github.com/NateBJones-Projects/OB1/issues/33
-  if (!c.req.header("accept")?.includes("text/event-stream")) {
-    const headers = new Headers(c.req.raw.headers);
+  if (!context.req.header("accept")?.includes("text/event-stream")) {
+    const headers = new Headers(context.req.raw.headers);
     headers.set("Accept", "application/json, text/event-stream");
-    const patched = new Request(c.req.raw.url, {
-      method: c.req.raw.method,
+    const patched = new Request(context.req.raw.url, {
+      method: context.req.raw.method,
       headers,
-      body: c.req.raw.body,
-      // @ts-ignore -- duplex required for streaming body in Deno
+      body: context.req.raw.body,
+      // @ts-ignore -- duplex is required for streaming request bodies in Deno.
       duplex: "half",
     });
-    Object.defineProperty(c.req, "raw", { value: patched, writable: true });
+    Object.defineProperty(context.req, "raw", {
+      value: patched,
+      writable: true,
+    });
   }
 
   const server = buildServer();
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
-  const response = await transport.handleRequest(c);
-  if (!response) return c.json({ error: "No response from MCP transport" }, 500, corsHeaders);
+  const response = await transport.handleRequest(context);
+  if (!response) {
+    return context.json(
+      { error: "No response from MCP transport" },
+      500,
+      corsHeaders,
+    );
+  }
   response.headers.delete("mcp-session-id");
-  for (const [k, v] of Object.entries(corsHeaders)) response.headers.set(k, v);
+  for (const [key, value] of Object.entries(corsHeaders)) {
+    response.headers.set(key, value);
+  }
   return response;
 });
 
-Deno.serve(app.fetch);
+if (import.meta.main) Deno.serve(app.fetch);
