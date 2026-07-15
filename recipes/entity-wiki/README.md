@@ -43,6 +43,8 @@ Inspired by [Andrej Karpathy's LLM Wiki concept](https://github.com/karpathy/llm
 
 The script groups typed edges by relation, truncates thought content to 300 chars per snippet, caps the prompt at ~25 linked + ~15 semantic items (configurable), and asks the model to cite thought ids inline. Sections with no material are skipped rather than filled with boilerplate.
 
+Two post-passes run deterministically after synthesis (no LLM involved): body `[[Name]]` wikilinks are resolved to real `[[slug|Name]]` page links when the name matches a connected entity, and the `## Relationships` section is rendered directly from the edges data — grouped by relation, ordered by support, with Obsidian-compatible wikilinks. The LLM is instructed not to write that section itself; unknown link targets are left dangling on purpose ("write this later" markers).
+
 ## Prerequisites
 
 > [!WARNING]
@@ -166,6 +168,12 @@ node generate-wiki.mjs --entity "ExoCortex" --dry-run
 
 ```bash
 node generate-wiki.mjs --batch --batch-min-linked 3 --batch-limit 25
+```
+
+**Incremental batch** (file mode only) — skip entities whose page is newer than their latest evidence (`entities.last_seen_at` + newest `thought_entities` link). Fresh pages cost zero LLM calls:
+
+```bash
+node generate-wiki.mjs --batch --incremental --out-dir ./wikis
 ```
 
 **Choose an output mode:**

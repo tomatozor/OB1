@@ -21,11 +21,13 @@ That gives you the Karpathy-style "readable compiled understanding" layer withou
 
 1. Triggers the **entity extraction worker** so new thoughts become entities, links, and evidence rows.
 2. Runs the **typed edge classifier** so the system can capture reasoning relations like `supports`, `contradicts`, and `supersedes`.
-3. Batch-generates **entity wiki pages** from linked thoughts and graph edges.
+3. Batch-generates **entity wiki pages** from linked thoughts and graph edges — **incremental by default**: pages whose evidence has not moved since the last compile are skipped without an LLM call (`--full` forces everything).
 4. Generates **topic wiki pages** from the core `thoughts` table.
 5. Optionally backfills **Gmail thread wiki pages**.
+6. Rebuilds the **global `INDEX.md`** (`build-index.mjs`) — every entity and topic page with a one-line summary, grouped by type, wikilinked. Index-first navigation for agents and Obsidian.
+7. Runs the **lint pass** (`lint-wiki.mjs`) — stale pages, orphan pages, eligible-but-missing pages, unresolved `contradicts` edges, and wikilink hygiene. Report-only; writes `lint-report.md` + `lint-report.json`.
 
-The result is a compiled wiki directory plus a manifest of what ran.
+The result is a compiled wiki directory plus a manifest of what ran, and an append-only `log.md` with one grep-friendly line per compile run.
 
 ## Why This Matches The Promise
 
@@ -224,6 +226,10 @@ By default the wrapper writes to:
 compiled-wiki/
   entities/               # entity-wiki output when using file mode
   topics/                 # wiki-synthesis topic output
+  INDEX.md                # global catalogue (regenerated every compile)
+  lint-report.md          # human-readable lint findings
+  lint-report.json        # machine-readable lint findings
+  log.md                  # append-only compile journal (## [date] compile | ...)
   compile-manifest.json   # run summary and phase statuses
 ```
 

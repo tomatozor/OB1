@@ -14,6 +14,8 @@ const SCRIPT_PATHS = {
   entityWiki: path.join(REPO_ROOT, "recipes", "entity-wiki", "generate-wiki.mjs"),
   topicWiki: path.join(REPO_ROOT, "recipes", "wiki-synthesis", "scripts", "synthesize-wiki.mjs"),
   gmailWiki: path.join(REPO_ROOT, "recipes", "wiki-synthesis", "scripts", "backfill-gmail-wikis.mjs"),
+  wikiIndex: path.join(HERE, "build-index.mjs"),
+  wikiLint: path.join(HERE, "lint-wiki.mjs"),
 };
 
 function parseEnvFile(filePath) {
@@ -54,11 +56,16 @@ function defaultArgs() {
     bestEffort: false,
     mirrorSupersedes: false,
     semanticExpand: false,
+    // Incremental by default: only regenerate entity pages whose evidence
+    // moved since the last compile. Pass --full to force everything.
+    incremental: true,
     skipExtraction: false,
     skipEdges: false,
     skipEntityWiki: false,
     skipTopicWiki: false,
     skipGmailWiki: false,
+    skipIndex: false,
+    skipLint: false,
     requireExtraction: false,
     topics: [],
     scopes: [],
@@ -82,6 +89,10 @@ function parseArgs(argv) {
     else if (current === "--skip-entity-wiki") args.skipEntityWiki = true;
     else if (current === "--skip-topic-wiki") args.skipTopicWiki = true;
     else if (current === "--skip-gmail-wiki") args.skipGmailWiki = true;
+    else if (current === "--full") args.incremental = false;
+    else if (current === "--incremental") args.incremental = true;
+    else if (current === "--skip-index") args.skipIndex = true;
+    else if (current === "--skip-lint") args.skipLint = true;
     else if (current === "--require-extraction") args.requireExtraction = true;
     else if (current === "--topic") args.topics.push(next());
     else if (current === "--scope") args.scopes.push(next());
@@ -114,9 +125,11 @@ Core behavior:
   Runs the compiled wiki pipeline in phases:
   1. Trigger entity extraction worker (optional remote step)
   2. Classify typed reasoning edges into thought_edges
-  3. Batch-generate entity wiki pages
+  3. Batch-generate entity wiki pages (incremental by default)
   4. Generate topic wiki pages (defaults to autobiography)
   5. Optionally synthesize Gmail thread wiki pages
+  6. Rebuild the global INDEX.md (index-first navigation)
+  7. Run the lint pass (stale / orphan / missing pages, contradictions)
 
 Flags:
   --dry-run                    Preview where supported; skip writes when possible
@@ -134,6 +147,9 @@ Phase toggles:
   --skip-entity-wiki           Do not batch-generate entity pages
   --skip-topic-wiki            Do not run topic synthesis
   --skip-gmail-wiki            Skip Gmail wiki synthesis even if --gmail is set
+  --skip-index                 Do not rebuild the global INDEX.md
+  --skip-lint                  Do not run the wiki lint pass
+  --full                       Disable incremental mode; regenerate every candidate page
   --require-extraction         Fail instead of warn if extraction worker credentials are missing
 
 Entity extraction:
@@ -346,6 +362,7 @@ async function main() {
       "--output-mode", args.entityOutputMode,
       "--out-dir", entityOutDir,
     ];
+    if (args.incremental && args.entityOutputMode === "file") entityArgs.push("--incremental");
     if (args.semanticExpand) entityArgs.push("--semantic-expand");
     if (args.dryRun) entityArgs.push("--dry-run");
 
@@ -411,9 +428,60 @@ async function main() {
     );
   }
 
+  // Post-compile bookkeeping: index + lint are deterministic/report-only, so
+  // they never abort the run (forced best-effort) but are recorded in the
+  // manifest like every other phase.
+  if (!args.skipIndex && !args.dryRun) {
+    await runStep(
+      manifest,
+      "wiki-index",
+      async () => {
+        console.log(`[wiki-compiler] rebuilding global INDEX.md`);
+        await spawnNode(SCRIPT_PATHS.wikiIndex, ["--out-dir", args.outDir]);
+        return { out_dir: args.outDir };
+      },
+      true,
+    );
+  }
+
+  if (!args.skipLint && !args.dryRun) {
+    await runStep(
+      manifest,
+      "wiki-lint",
+      async () => {
+        console.log(`[wiki-compiler] running wiki lint pass`);
+        await spawnNode(SCRIPT_PATHS.wikiLint, [
+          "--out-dir", args.outDir,
+          "--min-linked", String(args.entityBatchMinLinked),
+        ]);
+        return { report: path.join(args.outDir, "lint-report.md") };
+      },
+      true,
+    );
+  }
+
   manifest.finished_at = new Date().toISOString();
   const manifestPath = writeManifest(manifest);
   console.log(`[wiki-compiler] manifest -> ${manifestPath}`);
+  appendRunLog(manifest);
+}
+
+// Append-only chronological log (Karpathy's log.md convention): one
+// grep-friendly line per compile run, `## [date] compile | summary`.
+function appendRunLog(manifest) {
+  const ok = manifest.steps.filter((s) => s.status === "ok").map((s) => s.name);
+  const failed = manifest.steps.filter((s) => s.status === "failed").map((s) => s.name);
+  const line =
+    `## [${manifest.finished_at}] compile | ` +
+    `ok: ${ok.length ? ok.join(", ") : "none"}` +
+    (failed.length ? ` | failed: ${failed.join(", ")}` : "") +
+    (manifest.dry_run ? " | dry-run" : "") +
+    "\n";
+  try {
+    fs.appendFileSync(path.join(manifest.out_dir, "log.md"), line, "utf8");
+  } catch (err) {
+    console.warn(`[wiki-compiler] could not append log.md: ${err.message}`);
+  }
 }
 
 main().catch((error) => {
