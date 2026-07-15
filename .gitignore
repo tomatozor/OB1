@@ -28,3 +28,18 @@ docs/walkthroughs/*/public/
 docs/assets/agent-memory/promotional/generated-backgrounds/**/result.json
 docs/assets/agent-memory/screenshots/**/.chrome-*/
 integrations/openclaw-agent-memory/dist/
+
+
+# === Couche locale Devlab — données personnelles, secrets, PI (NE JAMAIS publier) ===
+# Ce remote est un fork PUBLIC : ces dossiers contiennent dumps DB (cron_secrets en
+# clair), transcriptions vocales, recaps de sessions, wiki compilé (RH/clients/juridique)
+# et binaires >100 Mio. La PI (scripts cron, SCHEMA.md) est versionnée dans le repo privé
+# openbrain-ops, jamais ici.
+backups/
+cron/
+compiled-wiki/
+sources/
+models/
+SCHEMA.md
+AGENTS.md
+schemas/maintenance-*.sql
