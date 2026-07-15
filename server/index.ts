@@ -2359,15 +2359,48 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
       },
       inputSchema: {
         content: z.string().min(1).max(50_000),
+        // Overrides de métadonnées (parité v1 — les intégrations gmail/hermes/
+        // ios-shortcut typent leurs captures ; sans ces champs, tout retombe
+        // silencieusement en source=mcp, régression observée le 2026-07-14).
+        source: z.string().min(1).max(128).optional().describe(
+          "Origine de la capture : 'gmail', 'hermes', 'ios-shortcut', 'voice-memo', etc. Défaut : 'mcp'.",
+        ),
+        type: z.string().min(1).max(64).optional().describe(
+          "Type métier : 'email', 'meeting', 'note', 'decision', 'task', etc.",
+        ),
+        subject: z.string().min(1).max(512).optional(),
+        gmail_thread_id: z.string().min(1).max(256).optional(),
+        sender: z.string().min(1).max(256).optional(),
+        date: z.string().min(1).max(64).optional().describe("Date d'origine (ISO 8601)."),
+        participants: z.array(z.string().min(1).max(256)).max(50).optional(),
       },
     },
-    async ({ content }) => {
+    async (
+      { content, source, type, subject, gmail_thread_id, sender, date, participants },
+    ) => {
       try {
         const [embedding, metadata] = await Promise.all([
           getEmbedding(content),
           extractMetadata(content),
         ]);
-        const payload = { metadata: { ...metadata, source: "mcp" } };
+        // Les champs fournis par l'appelant priment sur l'extraction LLM.
+        const callerOverrides: JsonObject = {};
+        if (source !== undefined) callerOverrides.source = source;
+        if (type !== undefined) callerOverrides.type = type;
+        if (subject !== undefined) callerOverrides.subject = subject;
+        if (gmail_thread_id !== undefined) {
+          callerOverrides.gmail_thread_id = gmail_thread_id;
+        }
+        if (sender !== undefined) callerOverrides.sender = sender;
+        if (date !== undefined) {
+          callerOverrides.date = parseDateInput("date", date);
+        }
+        if (participants !== undefined && participants.length > 0) {
+          callerOverrides.participants = participants;
+        }
+        const payload = {
+          metadata: { ...metadata, source: "mcp", ...callerOverrides },
+        };
         const embeddingValue = `[${embedding.join(",")}]`;
         const atomicResult = await supabase.rpc("capture_thought_atomic", {
           p_content: content,
@@ -2384,7 +2417,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
             ...result,
             id: thoughtId,
             captured: true,
-            metadata,
+            metadata: payload.metadata,
             atomic: true,
             via: "capture_thought_atomic",
           });
@@ -2423,7 +2456,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
         return toolJson({
           id: thoughtId,
           captured: true,
-          metadata,
+          metadata: payload.metadata,
           atomic: false,
           via: "fallback_non_atomic",
         });

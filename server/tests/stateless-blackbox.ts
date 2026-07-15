@@ -513,7 +513,10 @@ globalThis.fetch = (async (
   }
   if (rpc === "capture_thought_atomic") {
     const payload = JSON.parse(rawBody);
-    if (payload.p_content === "atomic capture") {
+    if (
+      payload.p_content === "atomic capture" ||
+      payload.p_content === "email capture"
+    ) {
       return json(200, {
         id: ATOMIC_CAPTURE_ID,
         deduped: false,
@@ -2236,6 +2239,41 @@ assert(
     entry.url.includes("/rpc/upsert_thought") || entry.method === "PATCH"
   ),
   "successful atomic capture does not run legacy writes",
+);
+assert(
+  JSON.parse(atomicCaptureRpc!.body).p_payload.metadata.source === "mcp",
+  "capture without overrides defaults to source=mcp",
+);
+
+// Overrides de métadonnées (parité v1) : gmail/hermes/ios-shortcut typent
+// leurs captures ; les champs fournis priment sur l'extraction LLM.
+const beforeOverrideCapture = requests.length;
+const overrideCapture = await mcp("tools/call", {
+  name: "capture_thought",
+  arguments: {
+    content: "email capture",
+    source: "gmail",
+    type: "email",
+    sender: "client@example.pf",
+    gmail_thread_id: "thread-123",
+  },
+});
+const overrideCaptureResult = toolResult(overrideCapture.body!);
+const overrideRpc = requests.slice(beforeOverrideCapture).find((entry) =>
+  entry.url.includes("/rpc/capture_thought_atomic")
+);
+const overrideMetadata = JSON.parse(overrideRpc!.body).p_payload.metadata;
+assert(
+  overrideMetadata.source === "gmail" &&
+    overrideMetadata.type === "email" &&
+    overrideMetadata.sender === "client@example.pf" &&
+    overrideMetadata.gmail_thread_id === "thread-123",
+  "capture metadata overrides flow into the atomic RPC payload",
+);
+assert(
+  overrideCaptureResult.metadata?.source === "gmail" &&
+    overrideCaptureResult.metadata?.type === "email",
+  "capture response reflects the merged caller metadata",
 );
 
 const beforeFallbackCapture = requests.length;
