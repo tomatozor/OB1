@@ -3,7 +3,9 @@
 Dependency-free Node 22 ESM utilities for a PostgREST-backed Open Brain. They
 read credentials only at runtime from `OPEN_BRAIN_URL` and
 `OPEN_BRAIN_SERVICE_KEY`; `backfill-embeddings.mjs --apply` also needs
-`OPENROUTER_API_KEY` (or `LLM_API_KEY`).
+`OPENROUTER_API_KEY` (or `LLM_API_KEY`). `LLM_BASE_URL` may point directly to
+OpenAI; the script selects the provider-native model id automatically, and
+`EMBEDDING_MODEL` can override it explicitly.
 
 All backfills are dry-run by default. They never print thought content. Pass a
 simple local environment file with `--env-file path`; each non-comment line is

@@ -16,6 +16,11 @@ Options:
   Network requests time out after 10s (PostgREST) or 15s (embeddings)
   --help                  Show this help
 
+Environment:
+  LLM_BASE_URL            Embedding API base (default: OpenRouter)
+  EMBEDDING_MODEL         Model id override; OpenAI and OpenRouter defaults are
+                          selected automatically from LLM_BASE_URL
+
 Exit codes:
   0  Completed successfully
   1  Configuration, network/API, or apply failure`;
@@ -72,6 +77,11 @@ async function main() {
   let updated = 0; let failed = 0;
   if (options.apply) {
     const embeddingUrl = `${(process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "")}/embeddings`;
+    const embeddingHost = new URL(embeddingUrl).hostname;
+    const embeddingModel = process.env.EMBEDDING_MODEL ||
+      (embeddingHost === "api.openai.com"
+        ? "text-embedding-3-small"
+        : "openai/text-embedding-3-small");
     const apiKey = process.env.OPENROUTER_API_KEY || process.env.LLM_API_KEY;
     if (!apiKey) throw new Error("OPENROUTER_API_KEY or LLM_API_KEY must be configured for --apply");
     for (const row of eligible) {
@@ -81,7 +91,7 @@ async function main() {
         let vector;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
-            const response = await request(embeddingUrl, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: "openai/text-embedding-3-small", input: row.content.slice(0, 8000) }) }, 15_000);
+            const response = await request(embeddingUrl, { method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: embeddingModel, input: row.content.slice(0, 8000) }) }, 15_000);
             vector = (await response.json())?.data?.[0]?.embedding;
             if (!Array.isArray(vector) || vector.length !== 1536) throw new Error(`invalid embedding dimension: expected 1536, received ${Array.isArray(vector) ? vector.length : "non-array"}`);
             if (!vector.every(Number.isFinite)) throw new Error("invalid embedding: all 1536 components must be finite numbers");
