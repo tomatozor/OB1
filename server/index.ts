@@ -1048,23 +1048,37 @@ async function excludeSupersededThoughts(
   const ids = [...new Set(rows.map((row) => row.id).filter(Boolean))];
   if (!ids.length) return [];
 
-  const { data, error } = await supabase
-    .from("thought_edges")
-    .select("to_thought_id")
-    .eq("relation", "supersedes")
-    .is("valid_until", null)
-    .in("to_thought_id", ids);
-  if (error) {
-    if (isMissingDatabaseObjectError(error, "thought_edges")) return rows;
-    throw new Error(`supersedes filtering failed: ${error.message}`);
+  const superseded = new Set<string>();
+  for (const batch of batchRecallIds(ids)) {
+    const { data, error } = await supabase
+      .from("thought_edges")
+      .select("to_thought_id")
+      .eq("relation", "supersedes")
+      .is("valid_until", null)
+      .in("to_thought_id", batch);
+    if (error) {
+      if (isMissingDatabaseObjectError(error, "thought_edges")) return rows;
+      throw new Error(`supersedes filtering failed: ${error.message}`);
+    }
+    for (
+      const id of ((data ?? []) as Array<{ to_thought_id?: string | null }>)
+        .map((edge) => edge.to_thought_id)
+    ) {
+      if (typeof id === "string") superseded.add(id);
+    }
   }
-
-  const superseded = new Set(
-    ((data ?? []) as Array<{ to_thought_id?: string | null }>)
-      .map((edge) => edge.to_thought_id)
-      .filter((id): id is string => typeof id === "string"),
-  );
   return superseded.size ? rows.filter((row) => !superseded.has(row.id)) : rows;
+}
+
+export function batchRecallIds(ids: string[], size = 50): string[][] {
+  if (!Number.isInteger(size) || size < 1) {
+    throw new Error("recall batch size must be a positive integer");
+  }
+  const batches: string[][] = [];
+  for (let offset = 0; offset < ids.length; offset += size) {
+    batches.push(ids.slice(offset, offset + size));
+  }
+  return batches;
 }
 
 function searchFilterPayload(filters: SearchFilters): JsonObject {

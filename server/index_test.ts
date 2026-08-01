@@ -7,6 +7,7 @@ Deno.env.delete("MCP_ALLOWED_ORIGINS");
 
 const {
   authenticateRequest,
+  batchRecallIds,
   corsHeadersForOrigin,
   fuseRrf,
   isMissingDatabaseObjectError,
@@ -164,6 +165,19 @@ Deno.test("ambient recall caps session recaps and preserves other context", () =
     selected.some((row) => row.id === "decision") &&
       selected.some((row) => row.id === "meeting"),
     "ambient recall dropped diverse context",
+  );
+});
+
+Deno.test("recall supersedes ids are split into bounded PostgREST batches", () => {
+  const ids = Array.from({ length: 121 }, (_, index) => `id-${index}`);
+  const batches = batchRecallIds(ids);
+  assert(
+    batches.length === 3 && batches.every((batch) => batch.length <= 50),
+    "recall ids were not split into bounded batches",
+  );
+  assert(
+    batches.flat().join(",") === ids.join(","),
+    "recall id batching changed order or content",
   );
 });
 
