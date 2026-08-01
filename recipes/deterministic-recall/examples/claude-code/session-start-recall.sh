@@ -17,7 +17,7 @@ if [[ -z "${OPEN_BRAIN_MCP_URL:-}" || -z "${OPEN_BRAIN_ACCESS_KEY:-}" ]]; then
   exit 0
 fi
 
-payload='{"jsonrpc":"2.0","id":"recall-start","method":"tools/call","params":{"name":"recall_context","arguments":{"days":30,"limit":12,"min_importance":0}}}'
+payload='{"jsonrpc":"2.0","id":"recall-start","method":"tools/call","params":{"name":"recall_context","arguments":{"days":30,"limit":6,"min_importance":2}}}'
 curl_config="$(mktemp)"
 trap 'rm -f "$curl_config"' EXIT
 chmod 600 "$curl_config"

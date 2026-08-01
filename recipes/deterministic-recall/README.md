@@ -1,4 +1,4 @@
-# Deterministic Recall
+# Task-Aware Recall
 
 This recipe makes Open Brain context recall consistent across Claude Code,
 Codex CLI, ChatGPT, and any other MCP client. The client-specific integration
@@ -15,18 +15,20 @@ The problem is uneven continuity: Claude Code may inject Open Brain context
 from session hooks while Codex CLI has no equivalent instruction unless its
 agent configuration provides one. This recipe standardizes the behavior:
 
-1. **Start:** call `recall_context` with the common defaults.
+1. **Start:** call `search_thoughts` with a compact query derived from the task.
 2. **Work:** use the result as scoped evidence while doing the task.
 3. **End:** propose a compact session summary for human review. A governed
    write-back happens only after explicit validation.
 
-`recall_context` is deterministic SQL-only retrieval. With the same explicit
-parameters and unchanged data, it returns the same ordered result: importance
-descending, then `created_at` descending, then `id`.
+`search_thoughts` is the relevance path. `recall_context` remains a deterministic,
+SQL-only ambient fallback for clients that cannot provide a task query. It
+normalizes topic/person labels and diversifies result types and sources so one
+capture stream cannot monopolize the context window.
 
 ## Prerequisites
 
-- A working Open Brain MCP v2 deployment with `recall_context` and, for
+- A working Open Brain MCP v2 deployment with `search_thoughts`,
+  `recall_context`, and, for
   governed write-back, `memory_writeback` ([setup guide](../../docs/01-getting-started.md)).
 - A remote MCP HTTP URL and access key. Send the key in `x-brain-key` or
   `Authorization: Bearer ...`; never put it in a URL.
@@ -34,21 +36,24 @@ descending, then `created_at` descending, then `id`.
 
 ## Common Protocol
 
-All clients use these defaults unless the user explicitly requests a narrower
-scope:
+All query-capable clients use these defaults unless the user explicitly
+requests a narrower scope:
 
 ```json
 {
-  "days": 30,
-  "limit": 12,
-  "min_importance": 0
+  "query": "<4-12 discriminating words from the current task>",
+  "mode": "hybrid",
+  "limit": 6,
+  "threshold": 0.3
 }
 ```
 
-`scope_topics` and `scope_people` may be added when the task gives a clear
-scope. Keep them explicit and identical across retries or client adapters.
-Restricted and logically deleted thoughts remain excluded by the server's
-normal read policy; do not bypass that policy just to improve recall.
+Include known project, client, person, feature, and failure terms. Avoid generic
+query padding such as "context" or "memory". If `search_thoughts` is absent,
+call `recall_context(days=30, limit=6, min_importance=2)` and add
+`scope_topics`/`scope_people` when the task gives a clear scope. Scope labels
+are normalized and use OR semantics within each category. Restricted and
+logically deleted thoughts remain excluded by the server's normal read policy.
 
 ### Supersedes and contradictions
 
@@ -165,7 +170,7 @@ environment, and register them as `SessionStart` and `SessionEnd` hooks. The
 start script posts this exact request and prints the response for injection:
 
 ```json
-{"jsonrpc":"2.0","id":"recall-start","method":"tools/call","params":{"name":"recall_context","arguments":{"days":30,"limit":12,"min_importance":0}}}
+{"jsonrpc":"2.0","id":"recall-start","method":"tools/call","params":{"name":"recall_context","arguments":{"days":30,"limit":6,"min_importance":2}}}
 ```
 
 Example hook command entries (adapt the surrounding settings schema to the
@@ -218,8 +223,11 @@ Connect the same remote HTTP MCP endpoint and make this the client instruction
 or workflow preamble:
 
 ```text
-At session start, call recall_context with days=30, limit=12,
-min_importance=0. Use the returned memories as scoped evidence. At the end of
+At the first substantive task, call search_thoughts with a compact query built
+from the project, client, person, feature, and failure terms in the request;
+use mode=hybrid, limit=6, and threshold=0.3. Treat only relevant results as
+evidence. If search_thoughts is unavailable, call recall_context with days=30,
+limit=6, and min_importance=2 as ambient fallback. At the end of
 a significant session, propose a compact summary for human validation; never
 send it automatically. When a validated write-back is requested, prefer
 memory_writeback with generated provenance and an idempotency key so it starts
@@ -258,8 +266,10 @@ arguments can expose credentials; use `OPEN_BRAIN_ACCESS_KEY` or
 
 ## Expected Outcome
 
-Every client performs the same initial recall (`days=30`, `limit=12`,
-`min_importance=0`) and can explain which recalled items informed the work.
+Every query-capable client performs the same task-aware hybrid search
+(`limit=6`, `threshold=0.3`) and can explain which returned items informed the
+work. Queryless clients use the same compact ambient fallback
+(`days=30`, `limit=6`, `min_importance=2`).
 Significant sessions produce a human-reviewed proposal; validated governed
 write-backs become evidence-only pending records, while secrets and raw traces
 remain out of the brain.

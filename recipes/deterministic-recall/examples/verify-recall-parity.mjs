@@ -2,7 +2,7 @@
 
 import fs from "node:fs";
 
-const DEFAULTS = { days: 30, limit: 12, min_importance: 0 };
+const DEFAULTS = { days: 30, limit: 6, min_importance: 2 };
 
 function help() {
   console.log(`Usage: node examples/verify-recall-parity.mjs [options]

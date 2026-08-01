@@ -1,20 +1,20 @@
 {
-  "name": "Deterministic Recall",
-  "description": "Apply the same explicit Open Brain recall and session write-back protocol across Claude Code, Codex CLI, ChatGPT, and other MCP clients.",
+  "name": "Task-Aware Recall",
+  "description": "Use query-first Open Brain retrieval with a compact deterministic fallback and governed session write-back across MCP clients.",
   "category": "recipes",
   "author": {
     "name": "Thomas Verdenne",
     "github": "tomatozor"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "requires": {
     "open_brain": true,
     "services": ["Open Brain MCP v2"],
     "tools": ["Node.js 18+", "curl"]
   },
-  "tags": ["recall", "deterministic", "mcp", "claude-code", "codex", "agent-memory"],
+  "tags": ["recall", "retrieval", "deterministic", "mcp", "claude-code", "codex", "agent-memory"],
   "difficulty": "intermediate",
   "estimated_time": "20 minutes",
   "created": "2026-07-14",
-  "updated": "2026-07-14"
+  "updated": "2026-08-01"
 }

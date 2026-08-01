@@ -15,9 +15,12 @@ const {
   isHybridRecencySignatureError,
   isHybridThresholdSignatureError,
   isHybridWeightSignatureError,
+  matchesRecallScopes,
+  normalizeRecallLabel,
   parseAllowedOrigins,
   parseAuthConfig,
   retrieveHybrid,
+  selectDiverseRecallRows,
   timingSafeEqualStrings,
   validateEmbedding,
   validateRrfWeight,
@@ -120,6 +123,48 @@ Deno.test("RRF recency half-life promotes recent rows and is disabled by default
     }
     assert(rejected, `invalid recency half-life was accepted: ${invalid}`);
   }
+});
+
+Deno.test("recall scopes normalize spelling and use OR within each scope", () => {
+  assert(
+    normalizeRecallLabel("Open Brain") === normalizeRecallLabel("open-brain") &&
+      normalizeRecallLabel("openbrain") === normalizeRecallLabel("Open Brain"),
+    "Open Brain spelling variants did not normalize together",
+  );
+  const row = {
+    ...thought("scoped"),
+    metadata: { topics: ["Open Brain"], people: ["Thomás"] },
+  };
+  assert(
+    matchesRecallScopes(row, ["missing", "openbrain"], ["thomas"]),
+    "recall scopes did not match normalized OR values",
+  );
+  assert(
+    !matchesRecallScopes(row, ["openbrain"], ["someone else"]),
+    "recall scopes ignored the people constraint",
+  );
+});
+
+Deno.test("ambient recall caps session recaps and preserves other context", () => {
+  const rows = [
+    ...Array.from({ length: 6 }, (_, index) => ({
+      ...thought(`recap-${index}`),
+      type: "session_recap",
+      source_type: "claude-code-session",
+    })),
+    { ...thought("decision"), type: "decision", source_type: "mcp" },
+    { ...thought("meeting"), type: "meeting", source_type: "gmail" },
+  ];
+  const selected = selectDiverseRecallRows(rows, 6);
+  assert(
+    selected.filter((row) => row.type === "session_recap").length === 2,
+    "session recaps still monopolize ambient recall",
+  );
+  assert(
+    selected.some((row) => row.id === "decision") &&
+      selected.some((row) => row.id === "meeting"),
+    "ambient recall dropped diverse context",
+  );
 });
 
 Deno.test("hybrid retrieval calls RPC first then falls back only when absent", async () => {

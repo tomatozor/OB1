@@ -180,10 +180,14 @@ flag, or usage claim.
   Dates must be parseable by `Date.parse`.
   Pagination includes `has_more` when a page-plus-one read can determine it.
 - `recall_context(scope_topics?, scope_people?, days=30, limit=12, min_importance=0, include_restricted=false)`
-  performs deterministic SQL-only recall and excludes thoughts targeted by a
-  current `supersedes` edge (`valid_until IS NULL`). It over-reads a bounded
-  candidate set to fill the requested page after filtering; an empty or absent
-  `thought_edges` table preserves the legacy result behavior.
+  is a compact ambient fallback, not the task-relevance path. Use
+  `search_thoughts` with a task-derived query first. The fallback performs
+  deterministic SQL-only recall, normalizes topic/person scopes across case,
+  accents, spaces, and punctuation, applies OR semantics within each scope,
+  diversifies types and sources, and caps `session_recap` at two results. It
+  excludes thoughts targeted by a current `supersedes` edge
+  (`valid_until IS NULL`); an empty or absent `thought_edges` table preserves
+  the visible candidates.
 - `list_thoughts(limit=10, offset=0, type?, source_type?, min_importance?, topic?, person?, days?, include_restricted=false)`
   lists visible thoughts and returns pagination with `has_more`.
 - `thought_stats(since_days=3650, include_restricted=false)` returns the exact

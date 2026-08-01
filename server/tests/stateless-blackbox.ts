@@ -943,12 +943,12 @@ globalThis.fetch = (async (
         },
       ]);
     }
-    if (url.searchParams.get("metadata")?.includes("no-edges")) {
+    if (url.searchParams.get("importance") === "gte.1") {
       return json(200, [
         {
           id: "noedge-one",
           content: "no edge one",
-          metadata: {},
+          metadata: { topics: ["Open Brain"] },
           created_at: "2026-07-14T00:00:00.000Z",
           importance: 5,
           type: "idea",
@@ -956,7 +956,7 @@ globalThis.fetch = (async (
         {
           id: "noedge-two",
           content: "no edge two",
-          metadata: {},
+          metadata: { topics: ["open-brain"] },
           created_at: "2026-07-13T00:00:00.000Z",
           importance: 4,
           type: "idea",
@@ -1484,13 +1484,17 @@ assert(
 );
 const noEdges = await mcp("tools/call", {
   name: "recall_context",
-  arguments: { ...recallParams, scope_topics: ["no-edges"] },
+  arguments: {
+    ...recallParams,
+    min_importance: 1,
+    scope_topics: ["missing", "openbrain"],
+  },
 });
 assert(
   toolResult(noEdges.body!).results.map((row: { id: string }) => row.id).join(
     ",",
   ) === "noedge-one,noedge-two",
-  "recall_context preserves current behavior when thought_edges is absent",
+  "recall_context normalizes OR scopes and tolerates absent thought_edges",
 );
 
 const text = await mcp("tools/call", {

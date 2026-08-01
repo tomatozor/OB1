@@ -210,9 +210,67 @@ function rowType(row: ThoughtRecord): string | null {
 }
 
 function rowSourceType(row: ThoughtRecord): string | null {
-  const metadataSourceType = asMetadata(row.metadata).source;
+  const metadata = asMetadata(row.metadata);
+  const metadataSourceType = metadata.source_type ?? metadata.source;
   return row.source_type ??
     (typeof metadataSourceType === "string" ? metadataSourceType : null);
+}
+
+export function normalizeRecallLabel(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLocaleLowerCase("en")
+    .replace(/[^\p{Letter}\p{Number}]+/gu, "");
+}
+
+function recallMetadataValues(row: ThoughtRecord, key: "topics" | "people") {
+  const value = asMetadata(row.metadata)[key];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+export function matchesRecallScopes(
+  row: ThoughtRecord,
+  scopeTopics?: string[],
+  scopePeople?: string[],
+): boolean {
+  const matchesAny = (values: string[], scopes?: string[]) => {
+    if (!scopes?.length) return true;
+    const normalizedValues = new Set(values.map(normalizeRecallLabel));
+    return scopes.some((scope) =>
+      normalizedValues.has(normalizeRecallLabel(scope))
+    );
+  };
+
+  return matchesAny(recallMetadataValues(row, "topics"), scopeTopics) &&
+    matchesAny(recallMetadataValues(row, "people"), scopePeople);
+}
+
+export function selectDiverseRecallRows(
+  rows: ThoughtRecord[],
+  limit: number,
+): ThoughtRecord[] {
+  const selected: ThoughtRecord[] = [];
+  const typeCounts = new Map<string, number>();
+  const sourceCounts = new Map<string, number>();
+  const generalCap = Math.max(2, Math.ceil(limit / 2));
+
+  for (const row of rows) {
+    if (selected.length >= limit) break;
+    const type = rowType(row) ?? "unknown";
+    const source = rowSourceType(row);
+    const typeCap = type === "session_recap" ? Math.min(2, limit) : generalCap;
+    if ((typeCounts.get(type) ?? 0) >= typeCap) continue;
+    if (source && (sourceCounts.get(source) ?? 0) >= generalCap) continue;
+
+    selected.push(row);
+    typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
+    if (source) sourceCounts.set(source, (sourceCounts.get(source) ?? 0) + 1);
+  }
+
+  return selected;
 }
 
 function parseDateInput(name: string, value?: string): string | undefined {
@@ -2096,7 +2154,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
     {
       title: "Recall Context",
       description:
-        "Deterministically recall recent important context without embeddings or model calls.",
+        "Recall a compact, diverse recent-context fallback. For task relevance, call search_thoughts with a query first.",
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -2122,6 +2180,10 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
     }) => {
       logRecallInvocation(recallContext, "recall_context");
       try {
+        const hasScopes = Boolean(scope_topics?.length || scope_people?.length);
+        const candidateLimit = hasScopes
+          ? 1_000
+          : Math.min(Math.max(limit * 50, 250), 1_000);
         let query = supabase
           .from("thoughts")
           .select("id, content, type, importance, created_at, metadata")
@@ -2130,7 +2192,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
           .order("importance", { ascending: false, nullsFirst: false })
           .order("created_at", { ascending: false })
           .order("id", { ascending: true })
-          .limit(Math.min(limit * 2, 100));
+          .limit(candidateLimit);
         if (!include_restricted) {
           query = query.or(
             "sensitivity_tier.is.null,sensitivity_tier.neq.restricted",
@@ -2142,26 +2204,29 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
             new Date(Date.now() - days * 86_400_000).toISOString(),
           );
         }
-        if (scope_topics?.length) {
-          query = query.contains("metadata", { topics: scope_topics });
-        }
-        if (scope_people?.length) {
-          query = query.contains("metadata", { people: scope_people });
-        }
-
         const { data, error } = await query;
         if (error) throw new Error(error.message);
         const visibleRows = await excludeSupersededThoughts(
           (data ?? []) as ThoughtRecord[],
         );
-        const results = visibleRows.slice(0, limit).map((row) => ({
+        const scopedRows = visibleRows.filter((row) =>
+          matchesRecallScopes(row, scope_topics, scope_people)
+        );
+        const selectedRows = selectDiverseRecallRows(scopedRows, limit);
+        const results = selectedRows.map((row) => ({
           id: row.id,
           date: row.created_at,
           type: rowType(row),
+          source_type: rowSourceType(row),
           importance: rowImportance(row),
+          metadata: metadataExcerpt(row.metadata),
           summary: row.content.slice(0, 240),
         }));
-        return toolJson({ results });
+        return toolJson({
+          mode: hasScopes ? "scoped_ambient" : "ambient",
+          selection: "importance_recency_diversified",
+          results,
+        });
       } catch (error) {
         return internalToolError("recall_context", error);
       }
