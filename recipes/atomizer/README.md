@@ -252,7 +252,7 @@ The model returned prose, markdown fences, or a refusal instead of a JSON array.
 
 - Retry (transient prompt-drift is the most common cause).
 - Lower concurrency: `--concurrency 1` avoids rate-limit slicing.
-- Pick a more instruction-obedient model — on OpenRouter, `anthropic/claude-sonnet-4.5` works reliably; lighter models may drift into commentary.
+- Keep the default `deepseek/deepseek-v4-pro` for strict structured output; lighter models may drift into commentary.
 
 ### Atomization fires on low-signal content (marketing emails)
 

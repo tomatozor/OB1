@@ -165,13 +165,13 @@ The script uses a hybrid chunking strategy to turn notes into atomic thoughts:
 
 1. **Short notes** (under 500 words) become a single thought.
 2. **Notes with headings** are split at `##` (H2) boundaries — each section becomes one thought.
-3. **Long sections** (over 1000 words) are sent to an LLM (gpt-4o-mini via OpenRouter) which distills them into 1-3 standalone thoughts.
+3. **Long sections** (over 1000 words) are sent to DeepSeek V4 Pro via OpenRouter, which distills them into 1-3 standalone thoughts.
 
 Use `--no-llm` to skip step 3 if you want to avoid LLM costs. Heading-based splitting still works.
 
 ## Cost Estimate
 
-Costs depend on vault size and whether LLM chunking is enabled. Embeddings use `text-embedding-3-small` and LLM chunking uses `gpt-4o-mini`, both via OpenRouter.
+Costs depend on vault size and whether LLM chunking is enabled. Embeddings use `text-embedding-3-small` and LLM chunking uses `deepseek/deepseek-v4-pro`, both via OpenRouter.
 
 | Vault size | Embeddings only (`--no-llm`) | With LLM chunking |
 |------------|------------------------------|---------------------|

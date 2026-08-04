@@ -249,7 +249,7 @@ You'll land on the **"Publishable and secret API keys"** tab. Copy these into yo
 
 ![Step 4](https://img.shields.io/badge/Step_4-Get_an_OpenRouter_API_Key-43A047?style=for-the-badge)
 
-OpenRouter is a universal AI API gateway — one account gives you access to every major model. We're using it for embeddings and lightweight LLM metadata extraction.
+OpenRouter is a universal AI API gateway — one account gives you access to every major model. Open Brain uses `deepseek/deepseek-v4-pro` for generation and metadata extraction, while embeddings remain on `openai/text-embedding-3-small` to preserve the 1536-dimensional vector space.
 
 Why OpenRouter instead of OpenAI directly? One account, one key, one billing relationship — and it future-proofs you for Claude, Gemini, or any other model later.
 
@@ -912,7 +912,7 @@ The embedding is what makes retrieval powerful. "Sarah's thinking about leaving"
 
 ### Swapping Models Later
 
-Because you're using OpenRouter, you can swap models by editing the model strings in the Edge Function code and redeploying. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Just make sure embedding dimensions match (1536 for the current setup).
+Because you're using OpenRouter, you can override the generation model with the `OPENROUTER_CLASSIFIER_MODEL` Supabase secret and redeploy. The default is `deepseek/deepseek-v4-pro`. Embeddings are a separate concern: keep `openai/text-embedding-3-small` unless you intend to re-embed the full corpus with a compatible 1536-dimensional model.
 
 </details>
 

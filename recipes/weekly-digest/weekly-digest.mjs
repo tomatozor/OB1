@@ -15,7 +15,7 @@
  *   node weekly-digest.mjs --output=file           # write to ./digests/YYYY-MM-DD.md
  *   node weekly-digest.mjs --window=14             # last 14 days
  *   node weekly-digest.mjs --include-personal      # include sensitivity_tier=personal
- *   node weekly-digest.mjs --model=claude-haiku-4-5-20251001
+ *   node weekly-digest.mjs --model=deepseek/deepseek-v4-pro
  *   node weekly-digest.mjs --min-importance=3      # lower threshold
  *   node weekly-digest.mjs --dry-run               # synthesize + print, no delivery (implies --output=stdout)
  *
@@ -24,11 +24,11 @@
  *   SUPABASE_SERVICE_ROLE_KEY Supabase service role key (required; canonical)
  *   OPEN_BRAIN_URL            Legacy alias for SUPABASE_URL (deprecated)
  *   OPEN_BRAIN_SERVICE_KEY    Legacy alias for SUPABASE_SERVICE_ROLE_KEY (deprecated)
- *   ANTHROPIC_API_KEY         Direct Anthropic key (preferred)
- *   OPENROUTER_API_KEY        OpenRouter fallback (used if ANTHROPIC_API_KEY unset)
+ *   OPENROUTER_API_KEY        OpenRouter key (preferred; DeepSeek V4 Pro default)
+ *   ANTHROPIC_API_KEY         Direct Anthropic fallback for explicit Anthropic models
  *   TELEGRAM_BOT_TOKEN        Required for --output=telegram
  *   TELEGRAM_CHAT_ID          Required for --output=telegram
- *   DIGEST_MODEL              Override default model (default: claude-opus-4-7)
+ *   DIGEST_MODEL              Override default model (default: deepseek/deepseek-v4-pro)
  */
 
 import fs from "node:fs";
@@ -36,10 +36,13 @@ import path from "node:path";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = process.env.DIGEST_MODEL || "claude-opus-4-7";
+const DEFAULT_MODEL = process.env.DIGEST_MODEL || "deepseek/deepseek-v4-pro";
 
 // Friendly aliases you can pass to --model.
 const MODEL_ALIASES = {
+  deepseek: "deepseek/deepseek-v4-pro",
+  pro: "deepseek/deepseek-v4-pro",
+  flash: "deepseek/deepseek-v4-flash",
   opus: "claude-opus-4-7",
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5-20251001",
@@ -131,8 +134,8 @@ function printHelp() {
       "Options:",
       "  --window=<days>           Lookback window in days (default: 7)",
       "  --min-importance=<n>      Minimum importance threshold (default: 4)",
-      "  --model=<id|alias>        LLM model (default: claude-opus-4-7)",
-      "                            Aliases: opus, sonnet, haiku",
+      "  --model=<id|alias>        LLM model (default: deepseek/deepseek-v4-pro)",
+      "                            Aliases: deepseek, pro, flash, opus, sonnet, haiku",
       "  --output=<mode>           telegram | stdout | file (default: telegram)",
       "  --include-personal        Include sensitivity_tier=personal thoughts",
       "  --no-sensitivity-filter   UNSAFE: run without sensitivity_tier filter.",
@@ -188,8 +191,14 @@ function loadConfig(args) {
     );
   }
 
-  const llmProvider = anthropicKey ? "anthropic" : "openrouter";
-  const llmKey = anthropicKey || openrouterKey;
+  const llmProvider = openrouterKey ? "openrouter" : "anthropic";
+  const llmKey = openrouterKey || anthropicKey;
+  if (llmProvider === "anthropic" && args.model.startsWith("deepseek/")) {
+    throw new Error(
+      "The DeepSeek V4 default requires OPENROUTER_API_KEY. " +
+        "Set it, or pass an explicit Anthropic model with --model.",
+    );
+  }
 
   let telegramBotToken = null;
   let telegramChatId = null;
@@ -494,9 +503,9 @@ async function synthesizeAnthropic(cfg, model, systemPrompt, userPrompt) {
 }
 
 async function synthesizeOpenRouter(cfg, model, systemPrompt, userPrompt) {
-  // OpenRouter uses the OpenAI chat/completions shape. For Claude models we
-  // prefix "anthropic/" unless the caller already passed a slash-namespaced
-  // model id (e.g. "anthropic/claude-opus-4-7" or "openai/gpt-4o").
+  // OpenRouter uses the OpenAI chat/completions shape. Bare model names are
+  // retained as legacy Anthropic shorthand; provider-qualified ids such as
+  // deepseek/deepseek-v4-pro pass through unchanged.
   const namespacedModel = model.includes("/") ? model : `anthropic/${model}`;
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {

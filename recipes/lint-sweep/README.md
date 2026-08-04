@@ -126,7 +126,7 @@ All flags:
 | `--max-llm-calls=<N>`     | `5`                              | Hard cap on Tier 3 LLM calls (each audits ~20 thoughts) |
 | `--report=<path>`         | `./lint-report-YYYY-MM-DD.md`    | Where to write the markdown report |
 | `--days=<N>`              | `365`                            | Tier 3 recency window |
-| `--llm-model=<id>`        | `anthropic/claude-haiku-4-5`     | OpenRouter model for Tier 3 |
+| `--llm-model=<id>`        | `deepseek/deepseek-v4-pro`       | OpenRouter model for Tier 3 |
 | `--verbose` / `-v`        | off                              | Print progress per LLM call |
 | `--help` / `-h`           | —                                | Show usage |
 
@@ -195,7 +195,7 @@ On brains larger than these caps, Tier 1/2 counts represent a **slice**, not the
 
 - Sample size: **100** thoughts
 - LLM calls: **5** (cap: 5)
-- Model: `anthropic/claude-haiku-4-5`
+- Model: `deepseek/deepseek-v4-pro`
 
 ### Contradictions (2)
 
@@ -226,7 +226,7 @@ The report is designed to be triaged by hand: scan each section, follow up on an
 
 Tier 1 and Tier 2 are free — they only touch your Supabase project via PostgREST.
 
-Tier 3 is the only billed component. Using the default `anthropic/claude-haiku-4-5` model on OpenRouter, each call with ~20 thoughts (~6k input tokens + ~2k output tokens) runs about **$0.002 to $0.005** at current public pricing. The default cap of 5 calls covers 100 thoughts per sweep for **~$0.02**. Scaling up:
+Tier 3 is the only billed component. Using the default `deepseek/deepseek-v4-pro` model on OpenRouter, each call with ~20 thoughts (~6k input tokens + ~2k output tokens) runs about **$0.0044** at current public pricing. The default cap of 5 calls covers 100 thoughts per sweep for **~$0.02**. Scaling up:
 
 | `--sample-size` | `--max-llm-calls` | Approx. cost per run |
 | --------------- | ----------------- | -------------------- |
@@ -235,7 +235,7 @@ Tier 3 is the only billed component. Using the default `anthropic/claude-haiku-4
 | 500  | 25  | ~$0.10 |
 | 1000 | 50  | ~$0.20 |
 
-Pick a smaller, faster model (`anthropic/claude-haiku-4-5`) for cheap sweeps or a stronger one (`anthropic/claude-sonnet-4-5`) for weekly deep audits. The script does not retry on failure — a Tier 3 parse failure aborts the run before any report is written, so you get no file at all rather than silently burning credits on a flaky model. If you want Tier 1/2 output without any Tier 3 risk, run with `--max-llm-calls=0` (Tier 3 skips with a logged reason and the report is still written).
+Use `deepseek/deepseek-v4-flash` when latency matters more than maximum quality, or keep the V4 Pro default for weekly deep audits. The script does not retry on failure — a Tier 3 parse failure aborts the run before any report is written, so you get no file at all rather than silently burning credits on a flaky model. If you want Tier 1/2 output without any Tier 3 risk, run with `--max-llm-calls=0` (Tier 3 skips with a logged reason and the report is still written).
 
 Set `--max-llm-calls=0` to disable Tier 3 explicitly without needing to edit the tier flag, and omit the `OPENROUTER_API_KEY` entirely to make Tier 3 skip with a logged reason.
 
@@ -281,7 +281,7 @@ Solution: Your `OPENROUTER_API_KEY` is missing, wrong, or out of credit. Verify 
 Solution: Check the console output — one of the tiers likely short-circuited. Re-run with `--verbose` to see per-call progress. A small brain (<50 thoughts) will produce a short report, which is correct behavior.
 
 **Issue: LLM call produces unparseable JSON**
-Solution: Run with `--verbose` to see the raw response. Switch to a stronger model with `--llm-model=anthropic/claude-sonnet-4-5` if the default Haiku model struggles with your sample.
+Solution: Run with `--verbose` to see the raw response. Keep `--llm-model=deepseek/deepseek-v4-pro` and reduce the batch size if the response is truncated or malformed.
 
 ## Works Well With
 

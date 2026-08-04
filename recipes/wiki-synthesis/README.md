@@ -53,7 +53,7 @@ FROM YOUR OPEN BRAIN SETUP
 LLM PROVIDER
   LLM_BASE_URL:             ____________   (default: https://openrouter.ai/api/v1)
   LLM_API_KEY:              ____________
-  LLM_MODEL:                ____________   (default: anthropic/claude-haiku-4-5)
+  LLM_MODEL:                ____________   (default: deepseek/deepseek-v4-pro)
 
 OPTIONAL — TOPIC MODE
   SUBJECT_NAME:             ____________   (your name, for the autobiography voice)
@@ -86,7 +86,7 @@ OPEN_BRAIN_URL=https://YOUR_REF.supabase.co
 OPEN_BRAIN_SERVICE_KEY=YOUR_SERVICE_ROLE_KEY
 LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=YOUR_OPENROUTER_KEY
-LLM_MODEL=anthropic/claude-haiku-4-5
+LLM_MODEL=deepseek/deepseek-v4-pro
 SUBJECT_NAME=YourFirstName
 ```
 

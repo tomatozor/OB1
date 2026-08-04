@@ -16,6 +16,9 @@ const ALLOW_QUERY_KEY = Deno.env.get("MCP_ALLOW_QUERY_KEY") === "true";
 
 const OPENROUTER_BASE = Deno.env.get("OPENROUTER_BASE_URL") ||
   "https://openrouter.ai/api/v1";
+export const OPENROUTER_CLASSIFIER_MODEL =
+  Deno.env.get("OPENROUTER_CLASSIFIER_MODEL") ||
+  "deepseek/deepseek-v4-pro";
 const RRF_K = 60;
 // Seuil sémantique par défaut : 0.3, aligné sur les évaluations golden du
 // 2026-07-14 (hit@10 0,905 in-sample / 0,864 hors échantillon mesurés à 0,3 ;
@@ -388,7 +391,7 @@ async function extractMetadata(text: string): Promise<JsonObject> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: OPENROUTER_CLASSIFIER_MODEL,
       response_format: { type: "json_object" },
       messages: [
         {

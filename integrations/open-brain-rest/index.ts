@@ -9,6 +9,9 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY") || "";
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_CLASSIFIER_MODEL =
+  Deno.env.get("OPENROUTER_CLASSIFIER_MODEL") ||
+  "deepseek/deepseek-v4-pro";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -207,7 +210,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: OPENROUTER_CLASSIFIER_MODEL,
       response_format: { type: "json_object" },
       messages: [
         {

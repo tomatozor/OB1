@@ -291,8 +291,11 @@ server never substitutes core `thoughts` behavior or silently skips the write.
 - The Agent Memory REST interface returns at most 100 records per call; callers
   must paginate for larger result sets.
 
-OpenRouter embedding and metadata calls use a 15-second timeout. Embeddings
-retry twice, with bounded jitter, only for timeouts, HTTP 429, and HTTP 5xx;
+OpenRouter metadata extraction defaults to `deepseek/deepseek-v4-pro` and can
+be overridden with `OPENROUTER_CLASSIFIER_MODEL`. Embeddings remain on
+`openai/text-embedding-3-small` to preserve the existing 1536-dimensional
+vector space. OpenRouter embedding and metadata calls use a 15-second timeout.
+Embeddings retry twice, with bounded jitter, only for timeouts, HTTP 429, and HTTP 5xx;
 responses must contain exactly 1536 finite numbers. Supabase/PostgREST calls
 use a 10-second timeout through the client's custom fetch. Unexpected internal
 failures are logged server-side with a short correlation ID and return only a

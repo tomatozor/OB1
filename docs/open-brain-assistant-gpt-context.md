@@ -64,7 +64,7 @@ The core user journey is:
 The base Open Brain system has three layers:
 
 1. Storage: Supabase Postgres with pgvector. The primary table is `thoughts`.
-2. Intelligence: OpenRouter generates embeddings with `openai/text-embedding-3-small` and extracts simple metadata with `openai/gpt-4o-mini`.
+2. Intelligence: OpenRouter generates embeddings with `openai/text-embedding-3-small` and extracts metadata with `deepseek/deepseek-v4-pro`.
 3. Access: a Supabase Edge Function exposes MCP tools to AI clients.
 
 The core MCP server in `server/index.ts` exposes:
@@ -326,7 +326,7 @@ Capture decisions, preferences, people context, project context, recurring expla
 
 Why use OpenRouter?
 
-OpenRouter gives a simple AI gateway for embeddings and metadata extraction. The base guide uses `openai/text-embedding-3-small` for embeddings and `openai/gpt-4o-mini` for metadata extraction.
+OpenRouter gives a simple AI gateway for embeddings and metadata extraction. The base guide uses `openai/text-embedding-3-small` for embeddings and `deepseek/deepseek-v4-pro` for metadata extraction.
 
 Can users switch providers or models?
 

@@ -68,7 +68,7 @@ FROM YOUR OPEN BRAIN SETUP
 LLM PROVIDER
   LLM_BASE_URL (default: openrouter.ai): ____________
   LLM_API_KEY:                           ____________
-  LLM_MODEL (default: claude-haiku-4-5): ____________
+  LLM_MODEL (default: deepseek/deepseek-v4-pro): ____________
 
 REQUIRED WHEN --output-mode=thought OR --semantic-expand
   EMBEDDING_BASE_URL (default: openai):  ____________
@@ -107,7 +107,7 @@ OPEN_BRAIN_SERVICE_KEY=<service-role-key>
 LLM_API_KEY=<your-openrouter-or-openai-key>
 # Optional overrides:
 # LLM_BASE_URL=https://api.openai.com/v1
-# LLM_MODEL=gpt-4o-mini
+# LLM_MODEL=deepseek/deepseek-v4-pro
 # OB_WIKI_OUT_DIR=./wikis
 ```
 
@@ -192,7 +192,7 @@ node generate-wiki.mjs --entity "ExoCortex" --semantic-expand
 **Override the model per run:**
 
 ```bash
-node generate-wiki.mjs --entity "Alan" --model "openai/gpt-4o-mini"
+node generate-wiki.mjs --entity "Alan" --model "deepseek/deepseek-v4-pro"
 ```
 
 Run `node generate-wiki.mjs --help` for the full flag list.
@@ -218,7 +218,7 @@ Pick the mode that matches how you plan to consume the wikis. Each has its own c
 
 Each wiki is **one** LLM call. Input size scales with the number of linked + semantic snippets sent (capped at `--max-linked` + `--max-semantic`, default 25 + 15, each truncated to 300 chars). A typical page uses roughly 2–6k input tokens and produces up to 2048 output tokens.
 
-At OpenRouter pricing for `anthropic/claude-haiku-4-5` (~$0.80 per million input, ~$4 per million output), a single wiki costs roughly **$0.01–$0.02**. A batch of 25 entities runs around **$0.25–$0.50**. Substitute `openai/gpt-4o-mini` or a local Ollama model to drop that by 10x or more.
+At current OpenRouter pricing for `deepseek/deepseek-v4-pro` (~$0.435 per million input, ~$0.87 per million output), a single wiki typically costs well under one cent. Actual spend depends on source length; use a local Ollama model when zero cloud cost is the priority.
 
 Bounding behavior:
 
@@ -279,7 +279,7 @@ GRANT EXECUTE ON FUNCTION public.entities_with_min_links(int, int) TO service_ro
 </details>
 
 **Issue: LLM returns empty or malformed markdown**
-Some smaller models ignore structural instructions. Try a more capable model (`--model "anthropic/claude-haiku-4-5"` or `--model "openai/gpt-4o-mini"`). If you are running a local Ollama model, pick one with strong instruction-following (`llama3.1:70b`, `qwen2.5:32b`).
+Some smaller models ignore structural instructions. Keep the default `--model "deepseek/deepseek-v4-pro"` for the strictest hosted path. If you are running a local Ollama model, pick one with strong instruction-following (`llama3.1:70b`, `qwen2.5:32b`).
 
 **Issue: `LLM call failed: 401`**
 `LLM_API_KEY` is missing or wrong. For OpenRouter, the key starts with `sk-or-...`. For OpenAI, `sk-...`. For a local Ollama server, any non-empty string works and you should set `LLM_BASE_URL=http://localhost:11434/v1`.

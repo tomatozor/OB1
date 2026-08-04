@@ -25,7 +25,7 @@
  *   OPEN_BRAIN_SERVICE_KEY  (required — Supabase service role key)
  *   LLM_BASE_URL            (default: https://openrouter.ai/api/v1)
  *   LLM_API_KEY             (required)
- *   LLM_MODEL               (default: anthropic/claude-haiku-4-5)
+ *   LLM_MODEL               (default: deepseek/deepseek-v4-pro)
  *
  * Schema assumptions:
  *   - `public.thoughts` exists (core OB1 schema).
@@ -262,7 +262,7 @@ async function synthesizeWiki(threadGroup, env) {
   ].join("\n");
 
   const baseUrl = (env.LLM_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
-  const model = env.LLM_MODEL || "anthropic/claude-haiku-4-5";
+  const model = env.LLM_MODEL || "deepseek/deepseek-v4-pro";
 
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -437,7 +437,7 @@ async function main() {
   const sb = sbClient(env);
 
   const runId = `wiki-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-  console.log(`[backfill-wikis] run_id=${runId} model=${env.LLM_MODEL || "anthropic/claude-haiku-4-5"}`);
+  console.log(`[backfill-wikis] run_id=${runId} model=${env.LLM_MODEL || "deepseek/deepseek-v4-pro"}`);
 
   // 1. Fetch + group
   const thoughts = await fetchGmailThoughts(sb, args.threadId);

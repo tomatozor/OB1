@@ -211,7 +211,7 @@ async function extractMetadata(text: string) {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENROUTER_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "deepseek/deepseek-v4-pro",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: EXTRACTION_SYSTEM_PROMPT },
@@ -234,7 +234,7 @@ async function getEmbedding(text: string): Promise<number[]> {
 
 Key differences from OpenAI direct:
 - **Base URL:** `https://openrouter.ai/api/v1` instead of `https://api.openai.com/v1`
-- **Model strings:** `openai/gpt-4o-mini` and `openai/text-embedding-3-small` (prefixed with the provider)
+- **Model strings:** `deepseek/deepseek-v4-pro` for generation and `openai/text-embedding-3-small` for embeddings (both provider-prefixed)
 - **Same everything else:** Same `Authorization: Bearer` header pattern, same JSON shapes, same `response_format: { type: "json_object" }` support
 
 This is the exact same provider/config pair the core OB1 MCP server (`supabase/functions/open-brain-mcp/index.ts`) uses, so if you have OB1 running, these snippets reuse your existing setup.
@@ -327,7 +327,7 @@ You haven't run the SQL from Step 1 yet, or you ran it in the wrong Supabase pro
 
 The extraction prompt expects clear, explicit name mentions. Pronouns like "he" or "she" won't resolve to a person. Try rephrasing: instead of "She wants me to call her", say "Sarah wants me to call her". The LLM is instructed to only extract what's explicitly there.
 
-If you're consistently getting bad extractions, try upgrading your LLM model. `gpt-4o-mini` works well for this. Smaller or older models may struggle with the structured JSON output.
+If you're consistently getting bad extractions, keep `deepseek/deepseek-v4-pro` and inspect the prompt and raw response first. Smaller or older models may struggle with the structured JSON output.
 
 ### "Action items are being created for things other people asked me to do"
 

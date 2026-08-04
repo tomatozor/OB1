@@ -4,7 +4,7 @@
  * Open Brain — Retroactive Metadata Extraction
  *
  * Finds thoughts missing LLM-extracted metadata (type, topics, people, etc.)
- * and backfills them using the same gpt-4o-mini extraction prompt that
+ * and backfills them using the same DeepSeek V4 Pro extraction prompt that
  * capture_thought uses.
  *
  * Typical use: email-imported thoughts that were inserted via Supabase direct
@@ -72,7 +72,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "deepseek/deepseek-v4-pro",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: EXTRACT_PROMPT },

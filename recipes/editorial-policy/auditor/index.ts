@@ -278,7 +278,7 @@ async function callAuditor(
       "X-Title": "Open Brain Auditor",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "deepseek/deepseek-v4-pro",
       response_format: { type: "json_object" },
       temperature: 0.2,
       messages: [

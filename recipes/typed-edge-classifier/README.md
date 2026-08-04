@@ -53,11 +53,11 @@ COST CAP FOR FIRST RUN
    # Option A — OpenRouter (preferred; one key works across every OB1 recipe)
    export OPENROUTER_API_KEY="sk-or-v1-..."
 
-   # Option B — Anthropic direct (retained for back-compat)
+   # Option B — Anthropic direct (requires explicit Anthropic model flags)
    export ANTHROPIC_API_KEY="sk-ant-..."
    ```
 
-   When OpenRouter is used, the default Anthropic model names (`claude-haiku-4-5-20251001`, `claude-opus-4-7`) are auto-prefixed with `anthropic/` so OpenRouter routes correctly. Pass an already-prefixed string via `--filter-model` / `--classify-model` to override. If both keys are set, OpenRouter wins (matches the priority order in `entity-extraction-worker`).
+   When OpenRouter is used, both stages default to `deepseek/deepseek-v4-pro`. Pass explicit provider-qualified ids via `--filter-model` / `--classify-model` to override. If both keys are set, OpenRouter wins (matches the priority order in `entity-extraction-worker`).
 
 3. Run a **dry run** first with a small limit and a low cost cap:
 
@@ -70,7 +70,7 @@ COST CAP FOR FIRST RUN
 4. Review the output. Look for:
    - Pairs with `[dry] would_insert` lines — these are the inserts you'd be approving
    - Pairs with `[low] below_confidence` — the classifier was unsure; tune `--min-confidence` if needed
-   - `filter_rejected` — Haiku said "nothing interesting here"; this is usually correct
+   - `filter_rejected` — the filter said "nothing interesting here"; this is usually correct
 5. Once you're happy with the output, run without `--dry-run`:
 
    ```bash
@@ -90,21 +90,21 @@ COST CAP FOR FIRST RUN
 
 The default pipeline is two-stage:
 
-1. **Stage 1 — Haiku filter.** For each candidate pair, Haiku reads the two thoughts and answers a single strict-JSON question: "is there any meaningful relation here, yes or no?" This is ~10-20x cheaper than asking Opus to classify everything up front.
-2. **Stage 2 — Opus classify.** For pairs that pass the filter, Opus does the full classification with the six-label vocabulary + direction + confidence + optional temporal bounds.
+1. **Stage 1 — DeepSeek V4 Pro filter.** For each candidate pair, the model reads the two thoughts and answers a single strict-JSON question: "is there any meaningful relation here, yes or no?"
+2. **Stage 2 — DeepSeek V4 Pro classify.** For pairs that pass the filter, the model does the full classification with the six-label vocabulary + direction + confidence + optional temporal bounds.
 
-You can disable the hybrid and run a single model end-to-end with `--model <model>` (e.g., `--model claude-haiku-4-5-20251001` for a cheap pass).
+You can disable the hybrid and run a single model end-to-end with `--model <model>` (for example, `--model deepseek/deepseek-v4-flash` for a faster pass).
 
 ## Cost bound
 
-> **Pricing disclaimer.** The `--max-cost-usd` cap uses a hand-maintained `PRICING` map in `classify-edges.mjs` that is updated manually. Check [Anthropic's pricing page](https://www.anthropic.com/pricing) before large runs. If you run with a model that is NOT in the PRICING map, the classifier will **refuse to run** when `--max-cost-usd` is set, and will log `WARNING: no pricing info for model "X"` otherwise. Pass `--no-cost-cap` to explicitly acknowledge an uncapped run; see "Pricing-unknown guard" below.
+> **Pricing disclaimer.** The `--max-cost-usd` cap uses a hand-maintained `PRICING` map in `classify-edges.mjs` that is updated manually. Check the current OpenRouter model page before large runs. If you run with a model that is NOT in the PRICING map, the classifier will **refuse to run** when `--max-cost-usd` is set, and will log `WARNING: no pricing info for model "X"` otherwise. Pass `--no-cost-cap` to explicitly acknowledge an uncapped run; see "Pricing-unknown guard" below.
 
 | Stage | Rough tokens / pair | Model | Approx cost / pair |
 |---|---|---|---|
-| Haiku filter | 300 in / 100 out | `claude-haiku-4-5-20251001` | $0.0005 |
-| Opus classify | 800 in / 200 out | `claude-opus-4-7` | $0.018 |
+| V4 Pro filter | 300 in / 100 out | `deepseek/deepseek-v4-pro` | ~$0.00022 |
+| V4 Pro classify | 800 in / 200 out | `deepseek/deepseek-v4-pro` | ~$0.00052 |
 
-Typical filter pass rate: 20-40%. On 500 candidate pairs with a 30% pass rate, expect roughly `500 * $0.0005 + 150 * $0.018 = $2.95`.
+Typical filter pass rate: 20-40%. On 500 candidate pairs with a 30% pass rate, expect roughly `500 * $0.00022 + 150 * $0.00052 = $0.19`.
 
 ### Pricing-unknown guard
 
@@ -253,7 +253,7 @@ Solution: Either apply the `entity-extraction` schema (so this recipe has a pool
 **Issue: Classifier returns `filter_rejected` for most pairs**
 Solution: That's usually correct — most co-mentioning pairs don't have a reasoning relation. If you're sure there are real relations being missed, try `--no-hybrid` to send every pair to Opus directly. Be warned: cost goes up roughly 15-20x.
 
-**Issue: `Anthropic claude-opus-4-7: 429` or `OpenRouter anthropic/claude-opus-4-7: 429` (rate limit)**
+**Issue: `OpenRouter deepseek/deepseek-v4-pro: 429` (rate limit)**
 Solution: The classifier retries 429 and 5xx responses automatically with exponential backoff + jitter (base 1s, doubles each attempt, capped at 60s, up to 5 retries per call). You will see `[classify-edges] LLM ... 429: retry N/5 in Nms` lines on each retry. If retries still run out, drop `--parallelism` to 1 or 2; sustained 429s usually mean the account-level rate limit is saturated, not a transient burst.
 
 **Issue: Duplicate-key errors on insert**

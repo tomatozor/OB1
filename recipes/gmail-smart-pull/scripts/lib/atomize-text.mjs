@@ -30,7 +30,7 @@
  *     anthropicApiKey,     // required when provider='anthropic'
  *     anthropicModel,      // default 'claude-sonnet-4-6'
  *     openrouterApiKey,    // required when provider='openrouter'
- *     openrouterModel,     // default 'anthropic/claude-sonnet-4-6'
+ *     openrouterModel,     // default 'deepseek/deepseek-v4-pro'
  *   }) → Promise<string[]>
  *
  * The LLM receives `${prompt}\n\nINPUT:\n${text}\n\nOUTPUT (JSON array):`.
@@ -339,7 +339,7 @@ export async function atomizeText(text, opts = {}) {
     anthropicApiKey = process.env.ANTHROPIC_API_KEY,
     anthropicModel = "claude-sonnet-4-6",
     openrouterApiKey = process.env.OPENROUTER_API_KEY,
-    openrouterModel = "anthropic/claude-sonnet-4-6",
+    openrouterModel = "deepseek/deepseek-v4-pro",
   } = opts;
 
   if (typeof text !== "string" || text.trim().length === 0) {

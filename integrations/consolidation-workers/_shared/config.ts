@@ -15,7 +15,7 @@ export const MAX_CONTENT_LENGTH = 8000;
 // Order reversed from ExoCortex — OpenRouter is primary for OB1 deployments.
 
 /** OpenRouter model used as the primary classifier. */
-export const CLASSIFIER_MODEL_OPENROUTER = "anthropic/claude-haiku-4-5";
+export const CLASSIFIER_MODEL_OPENROUTER = "deepseek/deepseek-v4-pro";
 
 /** OpenAI model used as secondary classifier fallback. */
 export const CLASSIFIER_MODEL_OPENAI = "gpt-4o-mini";

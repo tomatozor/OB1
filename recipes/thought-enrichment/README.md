@@ -107,7 +107,7 @@ Scans thought content for patterns matching SSNs, credit cards, API keys, passwo
 
 ## Cost expectations
 
-The default OpenRouter model is `openai/gpt-4o-mini` at roughly $0.001--0.002 per thought. For 1,000 thoughts, expect approximately $1--2. The `backfill-type` and `backfill-sensitivity` scripts are free (no LLM calls -- they use local logic only).
+The default OpenRouter model is `deepseek/deepseek-v4-pro`. At current public pricing, actual cost depends mainly on thought length and generated metadata; use the script's call and token counters for the run you are planning. The `backfill-type` and `backfill-sensitivity` scripts are free (no LLM calls -- they use local logic only).
 
 ## Expected outcome
 

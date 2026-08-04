@@ -9,17 +9,16 @@
  * Strategy:
  *   1. Sample candidate thought pairs (either pairs that share an
  *      entity via `thought_entities`, or pairs explicitly passed in).
- *   2. Haiku does a fast, cheap candidate filter — "is there any
+ *   2. DeepSeek V4 Pro does the candidate filter — "is there any
  *      relation worth investigating here, yes or no?"
- *   3. For pairs that pass Haiku's filter, Opus does the final
+ *   3. For pairs that pass the filter, DeepSeek V4 Pro does the final
  *      classification with the full relation vocabulary.
  *   4. Insert the edge with confidence, classifier version, and
  *      temporal bounds if the model detected any.
  *
- * The hybrid filter+classify split is where the cost savings live:
- * Haiku is ~10-20x cheaper than Opus, and most candidate pairs have
- * no real relation beyond co-mention, so most of the work is
- * finished at the Haiku stage.
+ * The hybrid filter+classify split is where the cost savings live: most
+ * candidate pairs have no real relation beyond co-mention, so most of the
+ * work is finished before the longer final-classification prompt.
  *
  * COST BOUND
  *   - Haiku filter: ~300 in / 100 out tokens per pair. At Haiku 4.5
@@ -39,19 +38,18 @@
  *   OPEN_BRAIN_SERVICE_KEY    service_role key (server-side only!)
  *
  *   And ONE of (OpenRouter is preferred to match the rest of OB1's recipes):
- *     OPENROUTER_API_KEY      sk-or-v1-...   (routes to Anthropic models)
+ *     OPENROUTER_API_KEY      sk-or-v1-...   (DeepSeek V4 Pro default)
  *     ANTHROPIC_API_KEY       sk-ant-...     (direct, retained for back-compat)
  *
- *   When using OpenRouter, the default models (claude-haiku-4-5-20251001
- *   and claude-opus-4-7) are auto-prefixed with "anthropic/". Pass an
- *   already-prefixed string (e.g. "anthropic/claude-haiku-4-5") via
+ *   When using OpenRouter, both stages default to
+ *   deepseek/deepseek-v4-pro. Pass explicit model ids via
  *   --filter-model / --classify-model to override.
  *
  * USAGE
  *   node classify-edges.mjs --dry-run
  *   node classify-edges.mjs --limit 100 --max-cost-usd 2.00
  *   node classify-edges.mjs --pair <uuid-a>,<uuid-b>
- *   node classify-edges.mjs --model claude-opus-4-7 --no-hybrid
+ *   node classify-edges.mjs --model deepseek/deepseek-v4-flash --no-hybrid
  *   node classify-edges.mjs --mirror-supersedes  # optional, OFF by default
  */
 
@@ -75,6 +73,8 @@ const TYPED_RELATIONS = new Set([
 // Values are approximate and should be refreshed when Anthropic updates
 // their public pricing page.
 const PRICING = {
+  "deepseek/deepseek-v4-pro": { in: 0.435, out: 0.87 },
+  "deepseek/deepseek-v4-flash": { in: 0.14, out: 0.28 },
   "claude-haiku-4-5-20251001": { in: 1.0, out: 5.0 },
   "claude-haiku-4-5": { in: 1.0, out: 5.0 },
   "claude-opus-4-7": { in: 15.0, out: 75.0 },
@@ -183,8 +183,8 @@ function parseArgs(argv) {
     minConfidence: 0.75,
     parallelism: 3,
     pair: null, // explicit [uuid, uuid]
-    filterModel: "claude-haiku-4-5-20251001",
-    classifyModel: "claude-opus-4-7",
+    filterModel: "deepseek/deepseek-v4-pro",
+    classifyModel: "deepseek/deepseek-v4-pro",
     singleModel: null, // if set, skip hybrid and use this model end-to-end
     hybrid: true,
     maxCostUsd: 5.0,
@@ -231,9 +231,9 @@ function printHelp() {
       "",
       "Model selection:",
       "  --model MODEL            Use one model end-to-end; disables hybrid",
-      "  --filter-model MODEL     Haiku model for candidate filter (default claude-haiku-4-5-20251001)",
-      "  --classify-model MODEL   Opus model for final classification (default claude-opus-4-7)",
-      "  --no-hybrid              Skip Haiku filter; run --classify-model on every pair",
+      "  --filter-model MODEL     Candidate filter model (default deepseek/deepseek-v4-pro)",
+      "  --classify-model MODEL   Final classifier model (default deepseek/deepseek-v4-pro)",
+      "  --no-hybrid              Skip the filter; run --classify-model on every pair",
       "",
       "Cost / safety:",
       "  --max-cost-usd N         Hard cap on estimated spend (default 5.00)",
@@ -291,10 +291,8 @@ function loadEnv() {
 // keep that switch contained so callLlmOnce stays readable.
 
 /**
- * When the operator passes a bare Anthropic model name like
- * "claude-haiku-4-5-20251001" but the active provider is OpenRouter,
- * prefix it with "anthropic/" so OpenRouter routes correctly. Already-
- * prefixed names ("anthropic/...", "openai/...", etc.) pass through.
+ * Bare names remain legacy Anthropic shorthand. Provider-qualified names
+ * ("deepseek/...", "anthropic/...", "openai/...", etc.) pass through.
  */
 function resolveModel(model, provider) {
   if (provider !== "openrouter") return model;

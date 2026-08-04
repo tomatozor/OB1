@@ -1,6 +1,7 @@
 Deno.env.set("SUPABASE_URL", "http://127.0.0.1:54321");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key");
 Deno.env.set("OPENROUTER_API_KEY", "test-openrouter-key");
+Deno.env.delete("OPENROUTER_CLASSIFIER_MODEL");
 Deno.env.set("MCP_ACCESS_KEY", "test-mcp-key");
 Deno.env.delete("MCP_CLIENT_KEYS");
 Deno.env.delete("MCP_ALLOWED_ORIGINS");
@@ -17,6 +18,7 @@ const {
   isHybridWeightSignatureError,
   parseAllowedOrigins,
   parseAuthConfig,
+  OPENROUTER_CLASSIFIER_MODEL,
   retrieveHybrid,
   timingSafeEqualStrings,
   validateEmbedding,
@@ -26,6 +28,13 @@ const {
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
+
+Deno.test("DeepSeek V4 Pro is the default OpenRouter classifier", () => {
+  assert(
+    OPENROUTER_CLASSIFIER_MODEL === "deepseek/deepseek-v4-pro",
+    `unexpected classifier model: ${OPENROUTER_CLASSIFIER_MODEL}`,
+  );
+});
 
 function thought(id: string) {
   return {

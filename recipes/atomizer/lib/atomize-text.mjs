@@ -27,7 +27,7 @@
  *     anthropicApiKey, // required when provider='anthropic'
  *     anthropicModel,  // default 'claude-sonnet-4-5'
  *     openrouterApiKey,// required when provider='openrouter'
- *     openrouterModel, // default 'anthropic/claude-sonnet-4.5'
+ *     openrouterModel, // default 'deepseek/deepseek-v4-pro'
  *   }) → Promise<string[]>
  *
  * Responses must contain a valid JSON array of non-empty strings.
@@ -239,7 +239,7 @@ async function atomizeViaOpenRouter(text, { prompt, timeoutMs, openrouterApiKey,
  * @param {string} [opts.anthropicApiKey]
  * @param {string} [opts.anthropicModel="claude-sonnet-4-5"]
  * @param {string} [opts.openrouterApiKey]
- * @param {string} [opts.openrouterModel="anthropic/claude-sonnet-4.5"]
+ * @param {string} [opts.openrouterModel="deepseek/deepseek-v4-pro"]
  * @returns {Promise<string[]>}
  */
 export async function atomizeText(text, opts = {}) {
@@ -251,7 +251,7 @@ export async function atomizeText(text, opts = {}) {
     anthropicApiKey,
     anthropicModel = "claude-sonnet-4-5",
     openrouterApiKey,
-    openrouterModel = "anthropic/claude-sonnet-4.5",
+    openrouterModel = "deepseek/deepseek-v4-pro",
   } = opts;
 
   if (typeof text !== "string" || text.trim().length === 0) {

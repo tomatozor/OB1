@@ -1,6 +1,6 @@
 # Vercel + Neon + Telegram
 
-An alternative Open Brain architecture that replaces Cloudflare Workers with **Vercel serverless functions**, Supabase with **Neon Postgres** (pgvector), and Slack with **Telegram** for mobile capture. Uses the **Vercel AI SDK** with OpenAI directly — no OpenRouter required.
+An alternative Open Brain architecture that replaces Cloudflare Workers with **Vercel serverless functions**, Supabase with **Neon Postgres** (pgvector), and Slack with **Telegram** for mobile capture. Uses the **Vercel AI SDK**, OpenAI embeddings, and DeepSeek V4 Pro through OpenRouter.
 
 ## What It Does
 
@@ -11,14 +11,15 @@ Deploys a complete Open Brain on the Vercel + Neon stack with four capture chann
 - **HTTP API** — direct REST endpoint for scripts, shortcuts, and automation
 - **CLI function** — one-liner bash function for terminal capture
 
-All thoughts are embedded with `text-embedding-3-small`, classified by `gpt-4o-mini`, stored in Neon with pgvector, and searchable via cosine similarity.
+All thoughts are embedded with `text-embedding-3-small`, classified by `deepseek/deepseek-v4-pro`, stored in Neon with pgvector, and searchable via cosine similarity.
 
 ## Prerequisites
 
 - A working Open Brain setup (completed the [Getting Started guide](../../docs/01-getting-started.md))
 - A [Neon](https://neon.tech) account (free tier)
 - A [Vercel](https://vercel.com) account (free tier)
-- An [OpenAI](https://platform.openai.com) API key
+- An [OpenAI](https://platform.openai.com) API key for embeddings
+- An [OpenRouter](https://openrouter.ai) API key for DeepSeek V4 Pro
 - A [Telegram](https://telegram.org) account (for mobile capture — optional)
 - Node.js 18+
 
@@ -29,8 +30,8 @@ Telegram (phone)  ──→  Vercel Function  ──→  Neon Postgres (pgvector
 CLI (terminal)    ──→  /api/capture     ──→    thoughts table
 MCP clients       ──→  /api/mcp         ──→    match_thoughts()
                            ↓
-                     Vercel AI SDK  ──→  OpenAI API
-                     (embed + extract)   (text-embedding-3-small + gpt-4o-mini)
+                     Vercel AI SDK  ──→  OpenAI + OpenRouter
+                     (embed + extract)   (text-embedding-3-small + DeepSeek V4 Pro)
 ```
 
 **3 services total.** Monthly cost: ~$0.10–0.30 (API calls only, infrastructure on free tiers).
@@ -75,6 +76,7 @@ Fill in:
 |----------|----------------|
 | `DATABASE_URL` | Neon dashboard → Connection string |
 | `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `BRAIN_ACCESS_KEY` | Output from step 3 |
 | `TELEGRAM_BOT_TOKEN` | @BotFather on Telegram (optional) |
 | `TELEGRAM_WEBHOOK_SECRET` | Any alphanumeric string you choose (optional) |
@@ -103,6 +105,7 @@ After deployment, note your production URL (e.g., `https://your-project.vercel.a
 ```bash
 npx vercel env add DATABASE_URL
 npx vercel env add OPENAI_API_KEY
+npx vercel env add OPENROUTER_API_KEY
 npx vercel env add BRAIN_ACCESS_KEY
 ```
 
@@ -209,7 +212,7 @@ Each captured thought is automatically:
 |-----------|---------------|-------------|
 | Runtime | Cloudflare Workers | Vercel Serverless (Next.js App Router) |
 | Database | Supabase (pgvector) | Neon Postgres (pgvector) |
-| AI Provider | OpenAI via OpenRouter | OpenAI direct (Vercel AI SDK) |
+| AI Provider | OpenAI embeddings + DeepSeek V4 Pro via OpenRouter | Same models via Vercel AI SDK |
 | Mobile capture | Slack | Telegram (grammY) |
 | MCP transport | SSE | Streamable HTTP (2025-03-26 spec) |
 | Auth | Supabase auth + API keys | Static access key (timing-safe) |
@@ -265,7 +268,7 @@ Unit tests cover auth (key extraction from 3 sources, timing-safe validation), r
 
 - **Auth:** timing-safe key comparison on all write/read endpoints
 - **Rate limiting:** 30 captures per minute (prevents runaway AI agent loops)
-- **Input cap:** 10KB max per thought (prevents OpenAI cost abuse)
+- **Input cap:** 10KB max per thought (prevents unbounded model spend)
 - **Telegram:** webhook secret required — rejects requests when not configured
 - **Health endpoint:** intentionally public (no secrets exposed)
 

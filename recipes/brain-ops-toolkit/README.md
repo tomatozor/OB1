@@ -58,7 +58,7 @@ node recipes/brain-ops-toolkit/health-signal.mjs --env-file .env.ob
 
 ### Expected outcome
 
-The script uses the existing gpt-4o-mini extraction shape and accepts only the
+The script uses the existing structured extraction shape with DeepSeek V4 Pro and accepts only the
 strict database type enum. It shallow-merges `topics`, `people`, and
 `action_items` only when each metadata key is absent, never prints thought
 content, and exits non-zero if any applied row fails.

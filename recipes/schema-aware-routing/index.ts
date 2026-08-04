@@ -88,7 +88,7 @@ Only extract what is explicitly there.`;
  *
  * OpenRouter (canonical OB1 setup):
  *   POST https://openrouter.ai/api/v1/chat/completions
- *   model: "openai/gpt-4o-mini"
+ *   model: "deepseek/deepseek-v4-pro"
  *
  * Either way: send EXTRACTION_SYSTEM_PROMPT as system message,
  * text as user message, request JSON response format.

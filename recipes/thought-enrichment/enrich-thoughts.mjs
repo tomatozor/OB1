@@ -162,7 +162,7 @@ async function callOpenRouter(userInput, config) {
       max_tokens: 1024,
       temperature: 0.1,
       // Ask OpenRouter for JSON-only output where the model supports it.
-      // Most GPT-4/4o and most modern chat models accept this; models that
+      // DeepSeek V4 and most modern chat models accept this; models that
       // don't will ignore it gracefully, and the existing post-parse
       // validation still handles malformed output.
       response_format: { type: "json_object" },
@@ -793,7 +793,7 @@ function buildConfig(args, env) {
     anthropicModel: args.model || env.ANTHROPIC_CLASSIFIER_MODEL || "claude-3-5-haiku-20241022",
     // OpenRouter
     openRouterApiKey: env.OPENROUTER_API_KEY || "",
-    openRouterModel: args.model || env.OPENROUTER_CLASSIFIER_MODEL || "openai/gpt-4o-mini",
+    openRouterModel: args.model || env.OPENROUTER_CLASSIFIER_MODEL || "deepseek/deepseek-v4-pro",
     // Supabase
     supabaseUrl: env.SUPABASE_URL || "",
     supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY || "",

@@ -356,7 +356,7 @@ def _parse_extraction_response(raw_content, store_conversations=False):
     return extraction
 
 
-def summarize_openrouter(title, date_str, dialogue_text, message_count, model_slug, store_conversations=False, openrouter_model="openai/gpt-4o-mini", focus_instruction=""):
+def summarize_openrouter(title, date_str, dialogue_text, message_count, model_slug, store_conversations=False, openrouter_model="deepseek/deepseek-v4-pro", focus_instruction=""):
     """Extract knowledge from a conversation using OpenRouter."""
     if not OPENROUTER_API_KEY:
         print("Error: OPENROUTER_API_KEY environment variable required for extraction.")
@@ -734,7 +734,7 @@ Examples:
     parser.add_argument("--min-messages", type=int, default=0, help="Override minimum message count for filtering")
     parser.add_argument("--min-words", type=int, default=0, help="Override minimum word count for borderline filtering (default: 50)")
     parser.add_argument("--max-words", type=int, default=50000, help="Skip conversations exceeding this word count (default: 50000, ~$1+ per conversation with gpt-4o)")
-    parser.add_argument("--openrouter-model", default="openai/gpt-4o-mini", help="OpenRouter model for extraction (default: openai/gpt-4o-mini)")
+    parser.add_argument("--openrouter-model", default="deepseek/deepseek-v4-pro", help="OpenRouter model for extraction (default: deepseek/deepseek-v4-pro)")
     parser.add_argument("--focus", type=str, default=None, metavar="TOPICS", help="""\
 Focus extraction on specific topics. Accepts a preset name or custom description.
 
@@ -1108,13 +1108,13 @@ def main():
 
     # Cost estimation (updated for new pipeline)
     if not args.raw and processed > 0:
-        # gpt-4o-mini via OpenRouter: ~$0.15/1M input, ~$0.60/1M output
+        # DeepSeek V4 Pro via OpenRouter: ~$0.435/1M input, ~$0.87/1M output
         # avg 4000 tokens input per conv, 300 tokens output
         est_input_tokens = processed * 4000
         est_output_tokens = processed * 300
         if args.store_conversations:
             est_output_tokens += processed * 200  # Pyramid summaries
-        summarize_cost = (est_input_tokens * 0.15 / 1_000_000) + (est_output_tokens * 0.60 / 1_000_000)
+        summarize_cost = (est_input_tokens * 0.435 / 1_000_000) + (est_output_tokens * 0.87 / 1_000_000)
     else:
         summarize_cost = 0
 

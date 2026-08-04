@@ -282,7 +282,7 @@ async function summarizeDay(category, day, entries) {
       "Content-Type": "application/json",
     },
     {
-      model: "openai/gpt-4o-mini",
+      model: "deepseek/deepseek-v4-pro",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: SUMMARIZATION_PROMPT },
@@ -434,7 +434,7 @@ async function main() {
 
   // Display configuration
   const mode = config.dryRun ? "DRY RUN" : "LIVE";
-  const summarizeMode = config.raw ? "raw (no summarization)" : "openrouter (gpt-4o-mini)";
+  const summarizeMode = config.raw ? "raw (no summarization)" : "openrouter (DeepSeek V4 Pro)";
   console.log(`  Mode:        ${mode}`);
   console.log(`  Summarizer:  ${summarizeMode}`);
   if (config.after) console.log(`  After:       ${config.after}`);
@@ -596,10 +596,10 @@ async function main() {
   // Cost estimation
   let summarizeCost = 0;
   if (!config.raw && processedDays > 0) {
-    // gpt-4o-mini via OpenRouter: ~$0.15/1M input, ~$0.60/1M output
+    // DeepSeek V4 Pro via OpenRouter: ~$0.435/1M input, ~$0.87/1M output
     const estInputTokens = processedDays * 600;
     const estOutputTokens = processedDays * 150;
-    summarizeCost = (estInputTokens * 0.15 / 1_000_000) + (estOutputTokens * 0.60 / 1_000_000);
+    summarizeCost = (estInputTokens * 0.435 / 1_000_000) + (estOutputTokens * 0.87 / 1_000_000);
   }
   const embeddingCost = thoughtsGenerated * 100 * 0.02 / 1_000_000;
   const totalCost = summarizeCost + embeddingCost;

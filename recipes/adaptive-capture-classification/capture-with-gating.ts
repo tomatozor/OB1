@@ -23,7 +23,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 
-const DEFAULT_MODEL = "openai/gpt-4o-mini"; // swap for any OpenRouter model
+const DEFAULT_MODEL = "deepseek/deepseek-v4-pro"; // swap for any OpenRouter model
 const DEFAULT_THRESHOLD = 0.75;
 const THRESHOLD_MIN = 0.50;
 const THRESHOLD_MAX = 0.95;

@@ -107,7 +107,7 @@ function parseArgs(argv) {
     maxLlmCalls: 5,           // Tier 3 hard cap (each call audits ~20 thoughts)
     report: null,             // output file path (computed below if null)
     days: 365,                // Tier 3 recency window in days
-    llmModel: "anthropic/claude-haiku-4-5",
+    llmModel: "deepseek/deepseek-v4-pro",
     verbose: false,
   };
 
@@ -177,7 +177,7 @@ Options:
                           (default: ./lint-report-YYYY-MM-DD.md)
   --days=<N>              Tier 3 recency window in days (default: 365)
   --llm-model=<id>        OpenRouter model id
-                          (default: anthropic/claude-haiku-4-5)
+                          (default: deepseek/deepseek-v4-pro)
   --verbose, -v           Extra progress output
   --help, -h              Show this help
 

@@ -12,7 +12,7 @@
  *   EMBEDDING_MODEL - Model name for embeddings (default: text-embedding-3-small)
  *   CHAT_API_BASE - Base URL for OpenAI-compatible chat API (defaults to EMBEDDING_API_BASE)
  *   CHAT_API_KEY - API key for chat service (defaults to EMBEDDING_API_KEY)
- *   CHAT_MODEL - Model name for metadata extraction (default: gpt-4o-mini)
+ *   CHAT_MODEL - Model name for metadata extraction (default: DeepSeek V4 Pro)
  *   MCP_ACCESS_KEY - Authentication key for MCP endpoint
  *   OPEN_BRAIN_CITATION_BASE_URL - Optional base URL for search/fetch citation links
  */
@@ -37,7 +37,7 @@ const EMBEDDING_MODEL = Deno.env.get("EMBEDDING_MODEL") || "openai/text-embeddin
 
 const CHAT_API_BASE = Deno.env.get("CHAT_API_BASE") || EMBEDDING_API_BASE;
 const CHAT_API_KEY = Deno.env.get("CHAT_API_KEY") || EMBEDDING_API_KEY;
-const CHAT_MODEL = Deno.env.get("CHAT_MODEL") || "openai/gpt-4o-mini";
+const CHAT_MODEL = Deno.env.get("CHAT_MODEL") || "deepseek/deepseek-v4-pro";
 
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 

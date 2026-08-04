@@ -35,7 +35,7 @@ Three failure modes the policy + auditor pair catches that scattered prompt-tuni
 
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
 - Supabase Edge Functions enabled with `pg_cron` and `pg_net` extensions
-- OpenRouter API key (the auditor uses `gpt-4o-mini` by default — swap to `claude-haiku-4-5` if you want stricter compliance reasoning)
+- OpenRouter API key (the auditor uses `deepseek/deepseek-v4-pro` by default)
 - Slack workspace with a bot token (only required if you want critical findings posted automatically; otherwise the auditor still stores reports silently)
 
 ## Credential Tracker
@@ -174,7 +174,7 @@ Solution: with fewer than ~30 captured thoughts, the auditor has little to work 
 
 **Issue: Auditor cries wolf — too many "critical" findings**
 
-Solution: the default model is `gpt-4o-mini`. Switch to a stricter reasoner like `claude-haiku-4-5` in `auditor/index.ts` (search for `"model":` in the OpenRouter call). Also tighten R5 rules — the auditor inherits the policy's notion of severity, so if your policy is permissive, findings will be too.
+Solution: the default model is `deepseek/deepseek-v4-pro`. Tighten R5 rules and inspect the raw response before changing models — the auditor inherits the policy's notion of severity, so if your policy is permissive, findings will be too.
 
 **Issue: I don't want a Slack post, just the stored report**
 

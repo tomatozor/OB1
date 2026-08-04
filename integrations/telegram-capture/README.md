@@ -149,7 +149,7 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "deepseek/deepseek-v4-pro",
       response_format: { type: "json_object" },
       messages: [
         {

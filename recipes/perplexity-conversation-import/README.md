@@ -142,7 +142,7 @@ Summary:
 - Optional date range filtering (`--after`, `--before`)
 
 **Stage 2: Summarize (conversations only)**
-- Sends each query + answer to an LLM (gpt-4o-mini via OpenRouter by default)
+- Sends each query + answer to DeepSeek V4 Pro via OpenRouter by default
 - Prompt is tuned for Perplexity's Q&A format — focuses on decisions, lessons, and lasting context
 - Extracts 1-3 standalone thoughts per conversation
 - Memory entries skip this stage — they're already concise summaries from Perplexity
@@ -214,7 +214,7 @@ python import-perplexity.py export.xlsx --model ollama --ollama-model qwen3
 
 | Component | Cost per item | Notes |
 |-----------|--------------|-------|
-| Summarization | ~$0.0003 | gpt-4o-mini via OpenRouter, conversations only |
+| Summarization | ~$0.0005 | DeepSeek V4 Pro via OpenRouter, conversations only |
 | Embeddings | ~$0.000002 | text-embedding-3-small, all thoughts |
 
 For a typical export with 100 conversations and 50 memory entries, total cost is under $0.04.

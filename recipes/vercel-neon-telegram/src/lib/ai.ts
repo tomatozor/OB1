@@ -1,6 +1,15 @@
 import { embed, generateObject } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { createOpenAI } from "@ai-sdk/openai";
 import { metadataSchema, type ThoughtMetadata } from "./types";
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openrouter = createOpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: "https://openrouter.ai/api/v1",
+  name: "openrouter",
+});
+const classifierModel = process.env.OPENROUTER_CLASSIFIER_MODEL ??
+  "deepseek/deepseek-v4-pro";
 
 export async function generateEmbedding(text: string): Promise<number[]> {
   const { embedding } = await embed({
@@ -14,7 +23,7 @@ export async function extractMetadata(
   content: string,
 ): Promise<ThoughtMetadata> {
   const { object } = await generateObject({
-    model: openai("gpt-4o-mini"),
+    model: openrouter(classifierModel),
     schema: metadataSchema,
     prompt: `Extract structured metadata from this thought. Be concise.
 

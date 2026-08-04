@@ -116,7 +116,7 @@ After a full import, your `thoughts` table contains distilled knowledge from eve
 
 Results depend on export size, filtering, and model. Example from a real 2,300-conversation export:
 
-| Metric | gpt-4o-mini (default) | gpt-4o | With --focus |
+| Metric | DeepSeek V4 Pro (default) | Alternate model | With --focus |
 |--------|----------------------|--------|-------------|
 | Conversations scanned | 2,341 | 2,341 | 2,341 |
 | Filtered (single-turn, short) | ~1,000 (43%) | ~1,000 (43%) | ~1,000 (43%) |
@@ -171,7 +171,7 @@ Each thought also carries a `confidence` level: `firm` (clear conclusion), `tent
 - **Voice conversations**: Audio transcriptions are extracted from `multimodal_text` parts. Voice conversations are more substantive on average and are never auto-filtered
 - **Signal-based filtering**: Replaces regex title matching. Single-turn conversations are skipped. Conversations with 10+ messages are always processed. Borderline conversations (2-9 messages) are checked for word count and title presence, then the LLM decides
 
-**Stage 2: Knowledge Extraction** — Surviving conversations go to an LLM (gpt-4o-mini by default via OpenRouter) with a structured extraction prompt. The LLM returns 0-5 typed thoughts per conversation as JSON, each with content, type, topics, people, and confidence. For multi-day conversations, session boundaries are detected at 4h+ gaps and each session is extracted separately.
+**Stage 2: Knowledge Extraction** — Surviving conversations go to DeepSeek V4 Pro by default via OpenRouter with a structured extraction prompt. The model returns 0-5 typed thoughts per conversation as JSON, each with content, type, topics, people, and confidence. For multi-day conversations, session boundaries are detected at 4h+ gaps and each session is extracted separately.
 
 The LLM is instructed to:
 - Extract decisions with reasoning, including what was rejected and why
@@ -233,7 +233,7 @@ The pyramid summaries are generated in the same LLM call as the thought extracti
 | `--focus TOPICS` | Focus extraction on specific topics (preset or custom text — see below) | All topics |
 | `--store-conversations` | Also store conversation summaries with pyramid detail levels (requires `schema.sql`) | Off |
 | `--model openrouter` | LLM backend for extraction: `openrouter` or `ollama` | `openrouter` |
-| `--openrouter-model ID` | Which OpenRouter model to use | `openai/gpt-4o-mini` |
+| `--openrouter-model ID` | Which OpenRouter model to use | `deepseek/deepseek-v4-pro` |
 | `--ollama-model NAME` | Which Ollama model to use (requires `--model ollama`) | `qwen3` |
 | `--raw` | Skip LLM extraction, ingest user messages as-is | Off |
 | `--verbose` | Print full thought text during processing | Off |
@@ -302,7 +302,7 @@ All costs are via OpenRouter at current pricing. The v2 pipeline sends full dial
 
 | Component | Model | Cost |
 |-----------|-------|------|
-| Knowledge extraction | gpt-4o-mini | ~$0.15/1M input + $0.60/1M output |
+| Knowledge extraction | DeepSeek V4 Pro | ~$0.435/1M input + $0.87/1M output |
 | Embeddings | text-embedding-3-small | ~$0.02/1M tokens |
 
 **Typical costs by export size (~$0.001/conversation):**

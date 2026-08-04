@@ -30,7 +30,7 @@
  *
  * Optional env vars:
  *   LLM_BASE_URL            default: https://openrouter.ai/api/v1
- *   LLM_MODEL               default: anthropic/claude-haiku-4-5
+ *   LLM_MODEL               default: deepseek/deepseek-v4-pro
  *   OB_WIKI_OUT_DIR         default: ./wikis
  *   OB_WIKI_APP_NAME        OpenRouter X-Title / HTTP-Referer header value
  */
@@ -125,7 +125,7 @@ function printUsage() {
       "  --out-dir <path>              Directory for file mode (default: ./wikis).",
       "",
       "Tuning:",
-      "  --model <id>                  LLM model id (default: env LLM_MODEL or anthropic/claude-haiku-4-5).",
+      "  --model <id>                  LLM model id (default: env LLM_MODEL or deepseek/deepseek-v4-pro).",
       "  --max-linked <N>              Max linked thoughts sent to model (default: 25).",
       "  --max-semantic <N>            Max semantic matches sent to model (default: 15).",
       "  --semantic-expand             Enable semantic expansion (requires EMBEDDING_* env).",
@@ -812,7 +812,7 @@ async function generateForEntity(sb, env, entity, args) {
     args.maxLinked,
     args.maxSemantic,
   );
-  const model = args.model || env.LLM_MODEL || "anthropic/claude-haiku-4-5";
+  const model = args.model || env.LLM_MODEL || "deepseek/deepseek-v4-pro";
   const wiki = await synthesize(env, model, payload);
   const sourceCounts = { linked: linked.length, semantic: semantic.length };
   const provenance = [...payload.provenance.linked_ids, ...payload.provenance.semantic_ids];

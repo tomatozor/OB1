@@ -27,7 +27,7 @@
  *   OPEN_BRAIN_SERVICE_KEY  (required — Supabase service role key)
  *   LLM_BASE_URL            (default: https://openrouter.ai/api/v1)
  *   LLM_API_KEY             (required unless --dry-run)
- *   LLM_MODEL               (default: anthropic/claude-haiku-4-5)
+ *   LLM_MODEL               (default: deepseek/deepseek-v4-pro)
  *   SUBJECT_NAME            (default: "the subject" — your name, for
  *                            the autobiography synthesizer)
  *   SOURCE_TYPE_FILTER      (optional — e.g. "google_drive_import" to
@@ -191,7 +191,7 @@ async function main() {
       fileEnv.LLM_BASE_URL || process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
     LLM_API_KEY: fileEnv.LLM_API_KEY || process.env.LLM_API_KEY,
     LLM_MODEL:
-      fileEnv.LLM_MODEL || process.env.LLM_MODEL || "anthropic/claude-haiku-4-5",
+      fileEnv.LLM_MODEL || process.env.LLM_MODEL || "deepseek/deepseek-v4-pro",
     SUBJECT_NAME: fileEnv.SUBJECT_NAME || process.env.SUBJECT_NAME,
     SOURCE_TYPE_FILTER:
       fileEnv.SOURCE_TYPE_FILTER || process.env.SOURCE_TYPE_FILTER,

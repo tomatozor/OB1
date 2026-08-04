@@ -477,7 +477,7 @@ def summarize_openrouter(title, date_str, answer_text):
             "Content-Type": "application/json",
         },
         body={
-            "model": "openai/gpt-4o-mini",
+            "model": "deepseek/deepseek-v4-pro",
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": SUMMARIZATION_PROMPT},
@@ -1079,11 +1079,11 @@ def main():
         total_processed += mem_stats["processed"]
 
     if total_thoughts > 0:
-        # Summarization cost (conversations only): gpt-4o-mini via OpenRouter
-        # ~$0.15/1M input, ~$0.60/1M output, ~800 tokens in / 200 tokens out per conv
+        # Summarization cost (conversations only): DeepSeek V4 Pro via OpenRouter
+        # ~$0.435/1M input, ~$0.87/1M output, ~800 tokens in / 200 tokens out per conv
         conv_count = conv_stats["processed"] if conv_stats else 0
-        summarize_cost = (conv_count * 800 * 0.15 / 1_000_000) + (
-            conv_count * 200 * 0.60 / 1_000_000
+        summarize_cost = (conv_count * 800 * 0.435 / 1_000_000) + (
+            conv_count * 200 * 0.87 / 1_000_000
         )
 
         # Embedding cost: $0.02/1M tokens, ~100 tokens per thought

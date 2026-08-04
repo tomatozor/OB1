@@ -155,7 +155,7 @@ spec:
                   name: openbrain-secret
                   key: chat-api-key
             - name: CHAT_MODEL
-              value: "openai/gpt-4o-mini"
+              value: "deepseek/deepseek-v4-pro"
             - name: PORT
               value: "8000"
           readinessProbe:

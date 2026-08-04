@@ -26,8 +26,8 @@ This is a "consumption format" companion to your capture habit. Captures alone p
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
 - Node.js 18+ (uses the native `fetch` API)
 - An LLM credential — **one** of:
-  - `ANTHROPIC_API_KEY` (preferred — direct Anthropic API)
-  - `OPENROUTER_API_KEY` (fallback — routes through OpenRouter)
+  - `OPENROUTER_API_KEY` (preferred — DeepSeek V4 Pro through OpenRouter)
+  - `ANTHROPIC_API_KEY` (fallback for an explicitly selected Anthropic model)
 - **Optional:** a Telegram bot for delivery. If you don't have one, use `--output=stdout` or `--output=file` and skip the Telegram setup entirely.
 - **Required for the out-of-the-box safety guarantee:** a `sensitivity_tier TEXT` column on `public.thoughts`. No official Open Brain primitive ships this yet; if you haven't added the column, either install your own migration or wait for the sensitivity-tiers primitive to land upstream. On stock OB1, the recipe **fails closed** — it refuses to run and tells you how to proceed (see the Sensitivity section below). If you explicitly accept the data-leakage risk, pass `--no-sensitivity-filter` to run unfiltered.
 
@@ -65,7 +65,7 @@ TELEGRAM DELIVERY (optional)
 ```bash
 export SUPABASE_URL="https://your-project-ref.supabase.co"
 export SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
-export ANTHROPIC_API_KEY="sk-ant-..."          # or OPENROUTER_API_KEY
+export OPENROUTER_API_KEY="sk-or-v1-..."       # preferred DeepSeek route
 export TELEGRAM_BOT_TOKEN="123456:..."         # optional
 export TELEGRAM_CHAT_ID="987654321"            # optional
 ```
@@ -111,7 +111,7 @@ node weekly-digest.mjs --include-personal
 |------|---------|-------------|
 | `--window=<days>` | `7` | How many days back to look |
 | `--min-importance=<n>` | `4` | Threshold for the primary pool (widens if too few thoughts clear it) |
-| `--model=<id\|alias>` | `claude-opus-4-7` | Model id, or one of the aliases `opus`, `sonnet`, `haiku` |
+| `--model=<id\|alias>` | `deepseek/deepseek-v4-pro` | Model id, or one of the aliases `deepseek`, `pro`, `flash`, `opus`, `sonnet`, `haiku` |
 | `--output=<mode>` | `telegram` | `telegram`, `stdout`, or `file` |
 | `--include-personal` | off | Also include `sensitivity_tier=personal` thoughts |
 | `--dry-run` | off | Synthesize + print, deliver nothing |
@@ -187,7 +187,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: node recipes/weekly-digest/weekly-digest.mjs
@@ -201,11 +201,10 @@ A single run sends up to 80 thoughts (each trimmed to 280 chars) plus metadata t
 
 | Model | ~Input tokens / 80 thoughts | ~Output tokens | ~Cost / run | ~Cost / year (weekly) |
 |-------|------------------------------|----------------|-------------|------------------------|
-| `claude-opus-4-7` | ~8k | ~800 | ~$0.18 | **~$9** |
-| `claude-sonnet-4-6` | ~8k | ~800 | ~$0.03 | ~$1.60 |
-| `claude-haiku-4-5` | ~8k | ~800 | ~$0.008 | ~$0.40 |
+| `deepseek/deepseek-v4-pro` | ~8k | ~800 | ~$0.0042 | **~$0.22** |
+| `deepseek/deepseek-v4-flash` | ~8k | ~800 | ~$0.0013 | ~$0.07 |
 
-Opus is the default for a reason: in side-by-side runs it produces the kind of observation that makes a weekly ritual worth opening ("rescue impulse rooted in discomfort with being seen as unkind") versus Haiku's filler ("automation pays"). At roughly $9/year for Opus vs $0.40/year for Haiku, the Opus premium is small enough that most people will want it for the weekly cadence. Bulk or daily cadence changes that math — use `--model=haiku` there.
+DeepSeek V4 Pro is the default for maximum synthesis quality. Use `--model=flash` for bulk or daily cadence when lower latency and cost matter more than the last increment of reasoning quality.
 
 Telegram posts are free. File output is free. PostgREST reads are free (your Supabase plan).
 
@@ -214,7 +213,7 @@ Telegram posts are free. File output is free. PostgREST reads are free (your Sup
 Running `node weekly-digest.mjs --dry-run --output=stdout` against a brain with recent captures should print something like:
 
 ```
-[weekly-digest] window=7d min_importance=4 model=claude-opus-4-7 output=stdout include_personal=false
+[weekly-digest] window=7d min_importance=4 model=deepseek/deepseek-v4-pro output=stdout include_personal=false
 [weekly-digest] fetched 142 thoughts from window
 [weekly-digest] ranked pool: 37 thoughts
 [weekly-digest] synthesized 1247 chars

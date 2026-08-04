@@ -56,7 +56,7 @@ EMBEDDING_MODEL = "openai/text-embedding-3-small"
 EMBEDDING_DIMS = 1536
 
 # LLM model for chunking long sections
-LLM_MODEL = "openai/gpt-4o-mini"
+LLM_MODEL = "deepseek/deepseek-v4-pro"
 
 # API retry settings
 MAX_RETRIES = 3
