@@ -1,5 +1,9 @@
 # Wiki Synthesis
 
+The projection excludes thoughts marked `sensitivity_tier=restricted` at the
+PostgREST query boundary. Raw embeddings and secrets are never written to the
+generated Markdown.
+
 > Synthesize topic-scoped wiki articles and per-thread email wikis from atomic thoughts, using any OpenAI-compatible LLM.
 
 ## What It Does

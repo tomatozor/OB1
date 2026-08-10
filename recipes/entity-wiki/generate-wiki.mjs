@@ -219,7 +219,8 @@ async function fetchLinkedThoughts(sb, entityId, limit = 200) {
   // PostgREST embedded resources syntax.
   const query = [
     `entity_id=eq.${entityId}`,
-    `select=thought_id,mention_role,confidence,source,evidence,created_at,thoughts(id,content,metadata,created_at)`,
+    `select=thought_id,mention_role,confidence,source,evidence,created_at,thoughts!inner(id,content,metadata,created_at,sensitivity_tier)`,
+    `thoughts.or=(sensitivity_tier.is.null,sensitivity_tier.neq.restricted)`,
     `order=created_at.desc`,
     `limit=${limit}`,
   ].join("&");
@@ -371,13 +372,32 @@ async function semanticExpand(sb, env, entity) {
     match_count: 30,
     filter: {},
   });
-  return (rows || []).map((r) => ({
-    id: r.id,
-    content: r.content,
-    type: r.metadata?.type ?? null,
-    created_at: r.created_at,
-    similarity: r.similarity,
-  }));
+  const matches = rows || [];
+  if (matches.length === 0) return [];
+
+  // RPC results are candidates only. Re-read the canonical rows through the
+  // same visibility gate used by the regular wiki projection.
+  const ids = matches.map((row) => row.id).filter((id) => id != null);
+  const visibleRows = await sb.get(
+    "thoughts",
+    [
+      `id=in.(${ids.map((id) => encodeURIComponent(String(id))).join(",")})`,
+      "or=(sensitivity_tier.is.null,sensitivity_tier.neq.restricted)",
+      "select=id,content,metadata,created_at,sensitivity_tier",
+    ].join("&"),
+  );
+  const visibleById = new Map((visibleRows || []).map((row) => [String(row.id), row]));
+  return matches.flatMap((match) => {
+    const row = visibleById.get(String(match.id));
+    if (!row) return [];
+    return [{
+      id: row.id,
+      content: row.content,
+      type: row.metadata?.type ?? null,
+      created_at: row.created_at,
+      similarity: match.similarity,
+    }];
+  });
 }
 
 // ---------------------------------------------------------------

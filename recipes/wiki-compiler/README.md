@@ -1,5 +1,8 @@
 # Wiki Compiler
 
+Compiled pages are a one-way, read-only projection. Source generators exclude
+`restricted` thoughts by default; the output is not a second source of truth.
+
 > The compiled view on demand layer for Open Brain: a recipe that turns structured thoughts and graph data into regenerable wiki artifacts you can run daily, weekly, or on demand.
 
 ## What This Is

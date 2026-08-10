@@ -278,7 +278,8 @@ class BrainApi {
     for (let page = 0; page < pageLimit; page++) {
       const offset = page * PAGE_SIZE;
       let qs =
-        `thoughts?select=id,content,created_at,metadata,source_type` +
+        `thoughts?select=id,content,created_at,metadata,source_type,sensitivity_tier` +
+        `&or=(sensitivity_tier.is.null,sensitivity_tier.neq.restricted)` +
         `&order=id.asc&limit=${PAGE_SIZE}&offset=${offset}`;
       if (sourceType) qs += `&source_type=eq.${encodeURIComponent(sourceType)}`;
       const res = await fetch(`${this.base}/${qs}`, { headers: this.headers });
