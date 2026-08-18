@@ -6,6 +6,7 @@ Deno.env.delete("MCP_CLIENT_KEYS");
 Deno.env.delete("MCP_ALLOWED_ORIGINS");
 
 const {
+  applySearchTokenBudget,
   authenticateRequest,
   batchRecallIds,
   corsHeadersForOrigin,
@@ -578,4 +579,43 @@ Deno.test("base-schema and threshold-signature errors are narrowly classified", 
     }),
     "missing hybrid RPC was misclassified as a threshold mismatch",
   );
+});
+
+Deno.test("applySearchTokenBudget keeps everything under a large budget", () => {
+  const results = [
+    { id: "a", content: "x".repeat(400) },
+    { id: "b", content: "y".repeat(400) },
+  ];
+  const out = applySearchTokenBudget(results, 20_000);
+  assert(out.results.length === 2, "both results should fit");
+  assert(!out.truncated, "no truncation expected under a large budget");
+  assert(out.estimatedTokens > 0, "estimate should be positive");
+});
+
+Deno.test("applySearchTokenBudget truncates the overflowing result's content", () => {
+  const results = [
+    { id: "a", content: "x".repeat(1200) },
+    { id: "b", content: "y".repeat(4000) },
+  ];
+  const first = Math.ceil(JSON.stringify(results[0]).length / 4);
+  const out = applySearchTokenBudget(results, first + 200);
+  assert(out.results.length === 2, "second result should be kept truncated");
+  assert(out.truncated, "budget overflow must be flagged");
+  const second = out.results[1] as Record<string, unknown>;
+  assert(second.content_truncated === true, "clipped result must be marked");
+  assert(
+    typeof second.content === "string" && second.content.length < 4000,
+    "clipped content must be shorter than the original",
+  );
+});
+
+Deno.test("applySearchTokenBudget drops the overflow when too little room remains", () => {
+  const results = [
+    { id: "a", content: "x".repeat(1200) },
+    { id: "b", content: "y".repeat(4000) },
+  ];
+  const first = Math.ceil(JSON.stringify(results[0]).length / 4);
+  const out = applySearchTokenBudget(results, first + 10);
+  assert(out.results.length === 1, "second result should be dropped entirely");
+  assert(out.truncated, "budget overflow must be flagged");
 });

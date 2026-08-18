@@ -347,6 +347,41 @@ function serializeSearchRow(row: ThoughtRecord): JsonObject {
   return result;
 }
 
+export function applySearchTokenBudget(
+  results: JsonObject[],
+  maxTokens: number,
+): { results: JsonObject[]; truncated: boolean; estimatedTokens: number } {
+  const estimate = (r: JsonObject) => Math.ceil(JSON.stringify(r).length / 4);
+  const kept: JsonObject[] = [];
+  let used = 0;
+  let truncated = false;
+  for (const result of results) {
+    const cost = estimate(result);
+    if (used + cost <= maxTokens) {
+      kept.push(result);
+      used += cost;
+      continue;
+    }
+    // Le budget restant ne couvre pas ce résultat entier : tronquer son
+    // contenu si au moins ~200 chars utiles passent, sinon s'arrêter net.
+    const content = typeof result.content === "string" ? result.content : "";
+    const overhead = cost - Math.ceil(content.length / 4);
+    const availableChars = (maxTokens - used - overhead) * 4;
+    if (availableChars >= 200) {
+      const clipped: JsonObject = {
+        ...result,
+        content: content.slice(0, availableChars),
+        content_truncated: true,
+      };
+      kept.push(clipped);
+      used += estimate(clipped);
+    }
+    truncated = true;
+    break;
+  }
+  return { results: kept, truncated, estimatedTokens: used };
+}
+
 function toolJson(value: unknown) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value) }],
@@ -1102,6 +1137,8 @@ async function runSearch(params: {
   semanticWeight: number;
   textWeight: number;
   recencyHalfLifeDays?: number;
+  excludeSuperseded?: boolean;
+  maxTokens?: number;
   filters: SearchFilters;
 }): Promise<JsonObject> {
   const pageSize = params.limit + 1;
@@ -1162,11 +1199,14 @@ async function runSearch(params: {
   }
 
   rows = rows.filter((row) => matchesSearchFilters(row, params.filters));
+  if (params.excludeSuperseded !== false) {
+    rows = await excludeSupersededThoughts(rows);
+  }
   const page = rows.slice(0, params.limit);
-  return {
+  let results = page.map(serializeSearchRow);
+  const response: JsonObject = {
     mode: params.mode,
     source,
-    results: page.map(serializeSearchRow),
     pagination: {
       offset: params.offset,
       limit: params.limit,
@@ -1174,6 +1214,18 @@ async function runSearch(params: {
       has_more: rows.length > params.limit,
     },
   };
+  if (params.maxTokens !== undefined) {
+    const budget = applySearchTokenBudget(results, params.maxTokens);
+    results = budget.results;
+    (response.pagination as JsonObject).returned = results.length;
+    response.token_budget = {
+      max_tokens: params.maxTokens,
+      estimated_tokens: budget.estimatedTokens,
+      truncated: budget.truncated,
+    };
+  }
+  response.results = results;
+  return response;
 }
 
 async function fetchThoughtForChatGpt(
@@ -2078,7 +2130,7 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
     {
       title: "Search Thoughts v2",
       description:
-        "Filtered, paginated hybrid, semantic, or full-text retrieval. Hybrid mode tries the database RPC first and falls back to deterministic server-side RRF.",
+        "Filtered, paginated hybrid, semantic, or full-text retrieval. Hybrid mode tries the database RPC first and falls back to deterministic server-side RRF. Superseded thoughts are excluded by default (exclude_superseded=false to include them); max_tokens caps the response size with greedy fill and content truncation.",
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -2101,6 +2153,8 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
         semantic_weight: z.number().default(DEFAULT_SEMANTIC_WEIGHT).optional(),
         text_weight: z.number().default(DEFAULT_TEXT_WEIGHT).optional(),
         recency_half_life_days: z.number().optional(),
+        exclude_superseded: z.boolean().default(true).optional(),
+        max_tokens: z.number().int().min(256).max(20000).optional(),
       },
     },
     async ({
@@ -2118,6 +2172,8 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
       semantic_weight = DEFAULT_SEMANTIC_WEIGHT,
       text_weight = DEFAULT_TEXT_WEIGHT,
       recency_half_life_days,
+      exclude_superseded = true,
+      max_tokens,
     }) => {
       logRecallInvocation(recallContext, "search_thoughts");
       try {
@@ -2147,6 +2203,8 @@ function buildServer(recallContext: RecallRequestContext): McpServer {
             semanticWeight: normalizedSemanticWeight,
             textWeight: normalizedTextWeight,
             recencyHalfLifeDays: normalizedRecencyHalfLife,
+            excludeSuperseded: exclude_superseded,
+            maxTokens: max_tokens,
             filters: {
               type,
               source_type,
