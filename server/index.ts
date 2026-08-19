@@ -1614,7 +1614,9 @@ function registerAgentMemoryTools(
           );
         }
         const normalizedMemory = {
-          type: memory.type,
+          // La RPC canonique (schemas/agent-memory) lit `memory_type` ; l'entrée
+          // publique de l'outil reste `memory.type`.
+          memory_type: memory.type,
           summary: memory.summary,
           content: memory.content,
           visibility,
